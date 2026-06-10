@@ -1,0 +1,33 @@
+name: "反馈提交流程测试"
+description: "测试服务与反馈APP的反馈提交和验证流程"
+app_package: "com.tblenovo.center"
+app_name: "服务与反馈"
+
+steps:
+  - intent: "启动服务与反馈APP"
+    type: "launch_app"
+    app_package: "com.tblenovo.center"
+
+  - intent: "点击左侧导航栏的'反馈'选项"
+    type: "navigate_tab"
+    tab_name: "反馈"
+
+  - intent: "在右侧输入框中输入反馈内容"
+    type: "type_text"
+    text: "auto ai testing submit"
+
+  - intent: "点击提交按钮"
+    type: "click"
+    target: "提交"
+
+  - intent: "等待提交完成"
+    type: "wait"
+    seconds: 2
+
+  - intent: "检查反馈列表中是否存在刚提交的反馈"
+    type: "assert"
+    text: "auto ai testing submit"
+
+verification:
+  - "反馈列表中可以看到包含 'auto ai testing submit' 的记录"
+  - "页面无报错信息"

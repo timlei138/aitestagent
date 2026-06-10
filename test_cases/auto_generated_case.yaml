@@ -1,0 +1,22 @@
+name: WLAN连接测试
+description: 测试设置APP中WLAN的连接功能
+app_package: com.android.settings
+app_name: setting
+steps:
+- intent: 启动设置APP
+  type: launch_app
+  app_package: com.android.settings
+- intent: 点击WLAN项
+  type: click
+  target: WLAN
+- intent: 点击右侧WLAN选项
+  type: click
+  target: WLAN开关
+- intent: 等待10秒
+  type: wait
+  seconds: 10
+- intent: 检查WIFI是否连接成功
+  type: assert
+  text: 已连接
+verification:
+- WLAN状态显示已连接
