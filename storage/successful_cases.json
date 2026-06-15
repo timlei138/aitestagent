@@ -1,9 +1,0 @@
-[
-  {
-    "case_file": "test_cases\\auto_generated_case.yaml",
-    "name": "WLAN连接测试",
-    "app_package": "com.android.settings",
-    "app_name": "setting",
-    "last_success_at": "2026-06-09T10:56:24"
-  }
-]

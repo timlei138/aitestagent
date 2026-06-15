@@ -1,52 +1,46 @@
 # AI 自动化测试 Agent 配置文件
-# 环境变量: OPENAI_API_KEY / OPENAI_BASE_URL / VISION_API_KEY / VISION_BASE_URL / ANDROID_SERIAL
+# 环境变量: OPENAI_API_KEY / OPENAI_BASE_URL / ZHIPU_API_KEY
 
-# ── Chat 模型（纯文本：Agent 推理 / Intent 解析）──
-llm_provider: "openai"   # 可选: openai / zhipu
+# ── 默认 LLM（Planner / Reporter 及未覆盖时的回退）──
+llm_provider: "openai"
 model: "deepseek-v4-pro"
-api_key: sk-296391b7a893487881d45f2726db67b6          # 留空从 OPENAI_API_KEY 读取
-base_url: https://api.deepseek.com         # 留空从 OPENAI_BASE_URL 读取
+api_key: "sk-296391b7a893487881d45f2726db67b6"
+base_url: "https://api.deepseek.com"
 
-# ── Vision 模型（多模态：SmartPerceiver 截图分析）──
-vision_provider: "zhipu"  # 可选: openai / zhipu
+# ── 各 Agent 独立模型（留空 = 使用上面的默认值）──
+planner_model: ""          # 规划→需要强推理
+planner_provider: ""
+
+executor_model: ""         # 执行→可以更快更便宜
+executor_provider: ""
+
+reviewer_model: ""         # 审查→需要判断力
+reviewer_provider: ""
+
+# ── Vision 模型（SmartPerceiver 截图分析）──
+vision_provider: "zhipu"
 vision_model: "glm-4.6v-flash"
-vision_api_key: 054dc70864266b6e40df256f7cf3d01a.PFY3duz6Hu1KDJu7   # 留空先取 VISION_API_KEY 环境变量，再回退到 api_key
-vision_base_url: null # 留空先取 VISION_BASE_URL 环境变量，再回退到 base_url
+vision_api_key: "054dc70864266b6e40df256f7cf3d01a.PFY3duz6Hu1KDJu7"
+vision_base_url: null
 
-# ── Embedding 模型（RAG 向量化）──
+# ── Embedding（RAG 向量化）──
 embedding_model: "text-embedding-3-small"
 
-# 设备配置
-device_serial: null    # 留空自动连接，或从 ANDROID_SERIAL 读取
-launch_activity: ".SplashActivity"   # 可选：指定主启动 Activity，避免误入 LeakLauncherActivity
-
-# 感知配置
+# ── 感知 ──
 enable_vision: true
 auto_switch_perception: true
 stuck_threshold: 2
 
-# RAG 知识库
+# ── RAG ──
 enable_rag: false
 rag_persist_dir: "storage/knowledge"
 
-# 存储路径
-baseline_dir: "storage/baselines"
+# ── 存储 ──
 screenshot_dir: "storage/screenshots"
-result_dir: "storage/results"
 report_dir: "reports"
 
-# 遍历限制
-traversal_max_depth: 5
-traversal_max_pages: 50
-traversal_max_clicks: 300
-
-# 异常检测阈值
-white_screen_threshold: 0.95
-black_screen_threshold: 0.95
-incomplete_display_ratio: 0.5
-critical_incomplete_ratio: 0.3
-phash_distance_low: 15
-phash_distance_medium: 20
-
-# 安全等级: strict(禁止所有危险操作) / normal(需确认) / manual(仅执行明确步骤)
+# ── 安全 ──
 safety_level: "strict"
+
+# ── 测试计划持久化目录 ──
+case_dir: "test_cases"

@@ -2,18 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from api.device_routes import router as device_router
 from api.device_routes import set_runner as set_device_runner
+from api.device_routes import _get_device as _api_get_device
 from api.websocket_manager import WebSocketManager
 from config import TestConfig
-from core.chat_runner import ChatRunner
+from data import create_vector_store, create_relational_db
+from device.controller import DeviceController, DeviceUnavailableError
+from agents.graph import set_relational_db
+from data.knowledge import KnowledgeBase
+from llm.clients import create_vlm_client
+from agents.orchestrator import TestOrchestrator
+from device.perceiver import PerceptionMode, SmartPerceiver
+from tools.context import ToolContext
+from tools import set_tool_context
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -22,259 +33,343 @@ INDEX_FILE = FRONTEND_DIST_DIR / "index.html"
 
 app = FastAPI(title="AI 自动化测试 Agent")
 config = TestConfig.from_yaml("config.yaml")
-runner = ChatRunner(config)
-set_device_runner(runner)
 ws_manager = WebSocketManager()
-pending_intents: dict[str, dict] = {}
+
+# ── 初始化工具上下文 ──
+_device: DeviceController | None = None
+_perceiver: SmartPerceiver | None = None
+_kb: KnowledgeBase | None = None
+
+# 1) 设备连接
+try:
+    _device = DeviceController()
+    logging.getLogger(__name__).info("Android device connected")
+except DeviceUnavailableError as exc:
+    logging.getLogger(__name__).warning("Android device NOT connected: %s", exc)
+
+# 2) 感知器（设备在线时才创建）
+if _device is not None:
+    try:
+        vlm = create_vlm_client(
+            provider=config.vision_provider, model=config.vision_model,
+            api_key=config.vision_api_key, base_url=config.vision_base_url,
+        )
+        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=PerceptionMode.HYBRID)
+        logging.getLogger(__name__).info("SmartPerceiver initialized (mode=%s)", _perceiver.mode)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("SmartPerceiver init failed: %s", exc)
+
+# 3) 知识库（始终可用）
+_kb = KnowledgeBase(create_vector_store(config))
+
+_ctx = ToolContext(device=_device, perceiver=_perceiver, knowledge_base=_kb, safety_level=config.safety_level)
+set_tool_context(_ctx)
+
+
+def _get_relational_db():
+    """获取关系型数据库实例。"""
+    from agents.graph import _relational_db
+    return _relational_db
+
+
+def _rebuild_tool_context() -> None:
+    """重新构建 ToolContext 并更新全局引用。"""
+    global _ctx
+    _ctx = ToolContext(device=_device, perceiver=_perceiver, knowledge_base=_kb, safety_level=config.safety_level)
+    set_tool_context(_ctx)
+
+
+def reconnect_device() -> dict:
+    """尝试重连设备并重建感知器，返回状态字典。"""
+    global _device, _perceiver
+    try:
+        _device = DeviceController()
+        logging.getLogger(__name__).info("Device reconnected")
+    except DeviceUnavailableError as exc:
+        _device = None
+        _perceiver = None
+        _rebuild_tool_context()
+        return {"connected": False, "detail": str(exc)}
+
+    try:
+        vlm = create_vlm_client(
+            provider=config.vision_provider, model=config.vision_model,
+            api_key=config.vision_api_key, base_url=config.vision_base_url,
+        )
+        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=PerceptionMode.HYBRID)
+        logging.getLogger(__name__).info("SmartPerceiver reinitialized (mode=%s)", _perceiver.mode)
+    except Exception as exc:
+        _perceiver = None
+        logging.getLogger(__name__).warning("SmartPerceiver init failed during reconnect: %s", exc)
+
+    _rebuild_tool_context()
+    return {"connected": True, "detail": "设备重连成功"}
+
+# ── 编排器 ──
+orchestrator = TestOrchestrator(config)
+set_device_runner(orchestrator)
+
+# ── 关系型数据库 ──
+_db = create_relational_db(config)
+set_relational_db(_db)
+
+# ── 事件广播 ──
+orchestrator.set_event_callback(
+    lambda event_type, payload: ws_manager.broadcast_sync(event_type, payload)
+)
+
 app.include_router(device_router)
 
-# 将 WebSocket 广播能力注入 ChatRunner，实现执行过程实时推送
-runner.set_event_callback(lambda event_type, payload: ws_manager.broadcast_sync(event_type, payload))
 
-
-class ParseRequest(BaseModel):
+class RunRequest(BaseModel):
     message: str
     session_id: str = "default"
 
 
-class ConfirmRequest(BaseModel):
-    session_id: str = "default"
-    intent: dict
-    confirmed: bool = True
+class HumanDecisionRequest(BaseModel):
+    thread_id: str
+    decision: Any
 
 
-class CaseContentRequest(BaseModel):
-    case_file: str
-    content: str
+class IdentityConfirmRequest(BaseModel):
+    identities: list[dict]  # [{target, resource_id, class_name, role, ...}]
 
 
-@app.post("/api/parse")
-async def parse_intent(request: ParseRequest):
-    intent = runner.parse(request.message)
-    pending_intents[request.session_id] = intent
-    return {
-        "status": "pending_confirmation",
-        "intent": intent,
-        "editable_fields": editable_fields(),
-    }
-
-
-@app.post("/api/confirm")
-async def confirm_intent(request: ConfirmRequest):
+@app.post("/api/run")
+async def run_test(request: RunRequest):
+    """一步式执行（自动解析意图 + 执行）。"""
+    # 设备连接前置检查
+    if _device is None:
+        return {"status": "device_offline", "message": "Android 设备未连接，请检查 USB/ADB 连接后重试"}
     ws_manager.bind_loop(asyncio.get_running_loop())
-    if not request.confirmed:
-        pending_intents.pop(request.session_id, None)
-        return {"status": "cancelled", "message": "已取消"}
 
-    # 推送执行开始事件
-    await ws_manager.broadcast({"type": "status", "content": "开始执行..."})
+    # 解析 app_package
+    app_package, app_name = _quick_resolve_app(request.message)
 
-    result = await asyncio.to_thread(runner.run_with_intent, request.intent)
-    pending_intents.pop(request.session_id, None)
-
-    return {
-        "status": result.get("status", "error"),
-        "message": result.get("conclusion") or result.get("message", ""),
-        "data": result,
-    }
-
-
-@app.post("/api/chat")
-async def chat(request: ParseRequest):
-    await ws_manager.broadcast({"type": "status", "content": "开始执行..."})
-    result = runner.run(request.message)
+    result = await asyncio.to_thread(
+        orchestrator.start,
+        user_request=request.message,
+        app_package=app_package,
+        app_name=app_name,
+    )
     return {"status": result.get("status", "error"), "data": result}
+
+
+@app.post("/api/run/stream")
+async def run_test_stream(request: RunRequest):
+    """流式执行 — Server-Sent Events。"""
+    if _device is None:
+        async def offline_stream():
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Android 设备未连接，请检查 USB/ADB 连接后重试'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(offline_stream(), media_type="text/event-stream")
+    ws_manager.bind_loop(asyncio.get_running_loop())
+    app_package, app_name = _quick_resolve_app(request.message)
+
+    async def event_generator():
+        async for event in orchestrator.start_stream(
+            user_request=request.message, app_package=app_package, app_name=app_name,
+        ):
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/api/human_decision")
+async def human_decision(request: HumanDecisionRequest):
+    """人工确认后恢复执行。"""
+    ws_manager.bind_loop(asyncio.get_running_loop())
+    if not request.thread_id:
+        return {"status": "error", "message": "缺少 thread_id"}
+
+    result = await asyncio.to_thread(
+        orchestrator.resume, thread_id=request.thread_id, decision=request.decision,
+    )
+    return {"status": result.get("status", "error"), "data": result}
+
+
+@app.post("/api/element_identities/confirm")
+async def confirm_element_identities(request: IdentityConfirmRequest):
+    """确认 Level2 元素身份映射，写入 SQLite。"""
+    from data import create_relational_db
+    from agents.graph import set_relational_db, _relational_db
+    db = _relational_db
+    if not db:
+        from config import TestConfig
+        db = create_relational_db(TestConfig())
+    count = 0
+    for ident in request.identities:
+        try:
+            db.save_element_identity(
+                app_package=ident.get("app_package", ""),
+                page_signature=ident.get("page_signature", ""),
+                alias=ident.get("target", ""),
+                resource_id=ident.get("resource_id", ""),
+                class_name=ident.get("class_name", ""),
+                role=ident.get("role", ""),
+                candidates_count=ident.get("candidates_count", 2),
+            )
+            count += 1
+        except Exception:
+            pass
+    return {"status": "success", "confirmed": count}
 
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
+    """WebSocket: 接收 run / human_decision 消息。"""
     ws_manager.bind_loop(asyncio.get_running_loop())
     await ws_manager.connect(websocket)
-    session_id = str(id(websocket))
     try:
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type", "")
 
-            if msg_type == "parse":
-                # 解析意图
+            if msg_type == "run":
                 user_input = data.get("message", "")
-                await ws_manager.send(
-                    websocket,
-                    {"type": "status", "content": f"正在解析: {user_input}"},
-                )
-                intent = runner.parse(user_input)
-                pending_intents[session_id] = intent
-                await ws_manager.send(
-                    websocket,
-                    {
-                        "type": "intent",
-                        "content": intent,
-                        "editable_fields": editable_fields(),
-                    },
-                )
-
-            elif msg_type == "confirm":
-                confirmed = data.get("confirmed", False)
-                if not confirmed:
-                    pending_intents.pop(session_id, None)
-                    await ws_manager.send(
-                        websocket, {"type": "cancelled", "content": "已取消"}
-                    )
+                # 设备连接前置检查
+                if _device is None:
+                    await ws_manager.send(websocket, {
+                        "type": "error",
+                        "content": "Android 设备未连接，请检查 USB/ADB 连接后重试",
+                    })
                     continue
-
-                await ws_manager.send(
-                    websocket, {"type": "status", "content": "开始执行..."}
-                )
-
-                # 执行过程中，ReportBuilder 会通过 event_callback 自动广播
-                # step_start / step_end / anomaly / snapshot / result 事件
+                app_package, app_name = _quick_resolve_app(user_input)
                 result = await asyncio.to_thread(
-                    runner.run_with_intent, data.get("intent", {})
+                    orchestrator.start,
+                    user_request=user_input,
+                    app_package=app_package,
+                    app_name=app_name,
                 )
-                pending_intents.pop(session_id, None)
-
-                # 最终结果也推一次，确保客户端收到
-                await ws_manager.send(
-                    websocket,
-                    {
-                        "type": "result",
-                        "content": {
-                            "status": result.get("status"),
-                            "mode": result.get("mode"),
-                            "conclusion": result.get("conclusion"),
-                            "report_path": result.get("report_path"),
-                            "message": result.get("message", ""),
-                            "case_file": result.get("case_file", ""),
-                            "intent": result.get("intent", {}),
-                        },
+                await ws_manager.send(websocket, {
+                    "type": "result",
+                    "content": {
+                        "status": result.get("status"),
+                        "conclusion": result.get("conclusion"),
+                        "steps": result.get("steps", []),
+                        "thread_id": result.get("thread_id", ""),
+                        "interrupt": result.get("interrupt"),
+                        "pending_identities": result.get("pending_identities", []),
                     },
+                })
+
+            elif msg_type == "human_decision":
+                thread_id = data.get("thread_id", "")
+                decision = data.get("decision", "跳过")
+                result = await asyncio.to_thread(
+                    orchestrator.resume, thread_id=thread_id, decision=decision,
                 )
+                await ws_manager.send(websocket, {
+                    "type": "result",
+                    "content": {
+                        "status": result.get("status"),
+                        "conclusion": result.get("conclusion"),
+                        "thread_id": thread_id,
+                        "interrupt": result.get("interrupt"),
+                    },
+                })
 
     except WebSocketDisconnect:
-        pending_intents.pop(session_id, None)
         ws_manager.disconnect(websocket)
 
 
-def editable_fields():
-    return {
-        "intent": {
-            "label": "模式",
-            "type": "select",
-            "options": ["traverse", "run", "replay", "run_case", "generate_case"],
-        },
-        "app_name": {"label": "应用名称", "type": "text"},
-        "app_package": {"label": "包名", "type": "text"},
-        "task_description": {"label": "任务描述", "type": "textarea"},
-        "case_file": {"label": "用例文件", "type": "text"},
-        "traversal_max_depth": {"label": "扫描深度", "type": "number"},
-        "traversal_max_pages": {"label": "最大页面", "type": "number"},
-    }
+# ── 报告 API ──
+
+@app.get("/api/reports/list")
+async def list_reports(limit: int = 30):
+    db = _get_relational_db()
+    if db:
+        try:
+            items = db.list_test_runs(limit)
+            return {"status": "success", "items": items}
+        except Exception:
+            pass
+    return {"status": "success", "items": []}
 
 
-def _safe_resolve_under(base: Path, raw_path: str) -> Path:
-    raw = str(raw_path or "").strip().replace("/", "\\")
-    if not raw:
-        raise ValueError("路径为空")
-    path = Path(raw)
-    if not path.is_absolute():
-        path = (BASE_DIR / path).resolve()
-    else:
-        path = path.resolve()
-    base_resolved = base.resolve()
-    try:
-        path.relative_to(base_resolved)
-    except ValueError as exc:
-        raise ValueError("路径不在允许目录内") from exc
-    return path
+@app.get("/api/reports/{run_id}")
+async def get_report(run_id: str):
+    db = _get_relational_db()
+    if db:
+        try:
+            report = db.get_test_run(run_id)
+            if report:
+                return {"status": "success", "report": report}
+        except Exception:
+            pass
+    return {"status": "error", "message": f"报告不存在: {run_id}"}
+
+
+# ── 用例 API ──
+
+@app.get("/api/cases/list")
+async def list_cases():
+    case_base = BASE_DIR / "test_cases"
+    case_base.mkdir(parents=True, exist_ok=True)
+    items: list[dict] = []
+    for p in sorted(case_base.glob("*.yaml"), key=lambda x: x.stat().st_mtime, reverse=True)[:50]:
+        items.append({"name": p.stem, "file": str(p.relative_to(BASE_DIR)).replace("/", "\\")})
+    for p in sorted(case_base.glob("*.yml"), key=lambda x: x.stat().st_mtime, reverse=True)[:50]:
+        items.append({"name": p.stem, "file": str(p.relative_to(BASE_DIR)).replace("/", "\\")})
+    return {"status": "success", "items": items[:50]}
 
 
 @app.get("/api/cases/content")
 async def get_case_content(case_file: str):
     case_base = BASE_DIR / "test_cases"
-    try:
-        target = _safe_resolve_under(case_base, case_file)
-        if not target.exists():
-            return {"status": "error", "message": f"用例不存在: {case_file}"}
-        return {
-            "status": "success",
-            "case_file": str(target.relative_to(BASE_DIR)).replace("/", "\\"),
-            "content": target.read_text(encoding="utf-8"),
-        }
-    except Exception as exc:
-        return {"status": "error", "message": f"读取用例失败: {exc}"}
+    target = _safe_resolve_under(case_base, case_file)
+    if not target or not target.exists():
+        return {"status": "error", "message": f"用例不存在: {case_file}"}
+    return {"status": "success", "case_file": str(target.relative_to(BASE_DIR)).replace("/", "\\"),
+            "content": target.read_text(encoding="utf-8")}
 
 
-@app.post("/api/cases/content")
-async def save_case_content(request: CaseContentRequest):
-    case_base = BASE_DIR / "test_cases"
-    try:
-        target = _safe_resolve_under(case_base, request.case_file)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(str(request.content or ""), encoding="utf-8")
-        return {
-            "status": "success",
-            "case_file": str(target.relative_to(BASE_DIR)).replace("/", "\\"),
-        }
-    except Exception as exc:
-        return {"status": "error", "message": f"保存用例失败: {exc}"}
-
-
-@app.get("/api/reports/list")
-async def list_reports(limit: int = 30):
-    report_base = BASE_DIR / "reports"
-    report_base.mkdir(parents=True, exist_ok=True)
-    rows: list[dict] = []
-    for item in sorted(
-        report_base.glob("report_*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )[: max(1, min(limit, 200))]:
-        try:
-            data = json.loads(item.read_text(encoding="utf-8"))
-            rows.append(
-                {
-                    "name": data.get("name") or item.stem,
-                    "mode": data.get("mode", ""),
-                    "status": data.get("status", ""),
-                    "app_package": data.get("app_package", ""),
-                    "created_at": data.get("created_at", ""),
-                    "duration_seconds": round(float(data.get("duration_seconds", 0) or 0), 2),
-                    "report_path": str(item.relative_to(BASE_DIR)).replace("/", "\\"),
-                }
-            )
-        except Exception:
-            continue
-    return {"status": "success", "items": rows}
-
-
-@app.get("/api/reports/content")
-async def get_report_content(report_path: str):
-    report_base = BASE_DIR / "reports"
-    try:
-        target = _safe_resolve_under(report_base, report_path)
-        if not target.exists():
-            return {"status": "error", "message": f"报告不存在: {report_path}"}
-        data = json.loads(target.read_text(encoding="utf-8"))
-        return {
-            "status": "success",
-            "report_path": str(target.relative_to(BASE_DIR)).replace("/", "\\"),
-            "report": data,
-        }
-    except Exception as exc:
-        return {"status": "error", "message": f"读取报告失败: {exc}"}
-
+# ── 静态文件 ──
 
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
 @app.get("/")
 async def index():
-    return FileResponse(
-        str(INDEX_FILE),
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        },
-    )
+    return FileResponse(str(INDEX_FILE), headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache", "Expires": "0",
+    })
+
+
+# ── 辅助 ──
+
+APP_NAME_MAP = {
+    "settings": "com.android.settings", "setting": "com.android.settings",
+    "设置": "com.android.settings", "联系人": "com.android.contacts",
+    "相机": "com.android.camera", "电话": "com.android.dialer",
+    "浏览器": "com.android.browser", "时钟": "com.android.deskclock",
+    "计算器": "com.android.calculator2", "日历": "com.android.calendar",
+    "服务与反馈": "com.tblenovo.center",
+}
+
+
+def _quick_resolve_app(text: str) -> tuple[str, str]:
+    lowered = text.lower()
+    for name, package in APP_NAME_MAP.items():
+        if name.lower() in lowered:
+            return package, name
+    match = re.search(r"\b[a-zA-Z][\w]*(?:\.[\w]+){2,}\b", text)
+    if match:
+        return match.group(0), ""
+    return "", ""
+
+
+def _safe_resolve_under(base: Path, raw_path: str) -> Path | None:
+    raw = str(raw_path or "").strip().replace("/", "\\")
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = (BASE_DIR / path).resolve()
+    else:
+        path = path.resolve()
+    try:
+        path.relative_to(base.resolve())
+    except ValueError:
+        return None
+    return path if path.exists() else None

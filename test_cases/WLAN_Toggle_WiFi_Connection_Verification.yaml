@@ -1,0 +1,31 @@
+name: WLAN Toggle & WiFi Connection Verification
+description: WLAN开关切换及WiFi连接状态与可用列表验证
+app_package: com.android.settings
+app_name: Settings
+steps:
+- index: 1
+  intent: 在左侧导航栏中找到并点击"WLAN"项
+  action_type: click
+  target: WLAN
+  alternatives: []
+  expected: 右侧内容区显示 WLAN 设置界面，包含 WLAN 开关和网络列表
+- index: 2
+  intent: 在右侧 WLAN 界面中点击 WLAN 开关 (当前为 OFF 状态)
+  action_type: click
+  target: WLAN 开关
+  alternatives: []
+  expected: 开关状态切换为 ON，设备开始扫描可用 WiFi 网络
+- index: 3
+  intent: 等待 10 秒
+  action_type: wait
+  target: 10s
+  alternatives: []
+  expected: 系统完成 WiFi 扫描和自动连接流程
+verification:
+- 开关状态变为 on
+- 至少 1 个网络显示 Connected
+- 已连接网络显示满格信号图标
+- 至少显示 1 个可用WiFi网络
+- 每个网络条目包含SSID、信号强度、加密类型、频段信息
+- 包含开放和加密网络，以及2.4G和5G频段
+created_at: '2026-06-12T14:23:05.688068'

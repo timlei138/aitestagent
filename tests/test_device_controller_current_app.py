@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from core.device_controller import DeviceController
+from device.controller import DeviceController
 
 
 class _ShellResult:

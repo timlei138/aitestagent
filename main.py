@@ -2,69 +2,95 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 
 from config import TestConfig
-from core.chat_runner import ChatRunner
+from data import create_vector_store, create_relational_db
+from agents.graph import set_relational_db
+from agents.orchestrator import TestOrchestrator
+from tools.context import ToolContext
+from tools import set_tool_context
+from device.controller import DeviceController, DeviceUnavailableError
+from device.perceiver import PerceptionMode, SmartPerceiver
+from llm.clients import create_vlm_client
+from data.knowledge import KnowledgeBase
 
 
 def main():
     parser = argparse.ArgumentParser(description="AI 自动化测试 Agent")
     sub = parser.add_subparsers(dest="mode")
 
-    scan = sub.add_parser("traverse", help="语义路径扫描")
-    scan.add_argument("--package", required=True)
-    scan.add_argument("--name", default="")
-    scan.add_argument("--depth", type=int, default=None)
-    scan.add_argument("--pages", type=int, default=None)
-    scan.add_argument("--config", default="config.yaml")
+    run_parser = sub.add_parser("run", help="自然语言执行测试")
+    run_parser.add_argument("message", nargs="+", help="测试需求描述")
+    run_parser.add_argument("--config", default="config.yaml")
 
-    run = sub.add_parser("chat", help="自然语言执行")
-    run.add_argument("message")
-    run.add_argument("--config", default="config.yaml")
-
-    case = sub.add_parser("run_case", help="执行 YAML 用例")
-    case.add_argument("--case", required=True)
-    case.add_argument("--config", default="config.yaml")
-
-    replay = sub.add_parser("replay", help="回放 YAML 用例")
-    replay.add_argument("--case", required=True)
-    replay.add_argument("--config", default="config.yaml")
-
-    server = sub.add_parser("server", help="启动 Web 服务")
-    server.add_argument("--config", default="config.yaml")
-    server.add_argument("--host", default="0.0.0.0")
-    server.add_argument("--port", type=int, default=8080)
+    server_parser = sub.add_parser("server", help="启动 Web 服务")
+    server_parser.add_argument("--config", default="config.yaml")
+    server_parser.add_argument("--host", default="0.0.0.0")
+    server_parser.add_argument("--port", type=int, default=8080)
 
     args = parser.parse_args()
+
     if args.mode == "server":
         import uvicorn
-
         uvicorn.run("api.server:app", host=args.host, port=args.port, reload=False)
         return
 
-    config = TestConfig.from_yaml(getattr(args, "config", "config.yaml"))
-    runner = ChatRunner(config)
-    if args.mode == "traverse":
-        intent = {
-            "intent": "traverse",
-            "app_package": args.package,
-            "app_name": args.name,
-            "task_description": f"语义路径扫描 {args.name or args.package}",
-            "traversal_max_depth": args.depth or config.traversal_max_depth,
-            "traversal_max_pages": args.pages or config.traversal_max_pages,
-            "safety_level": config.safety_level,
-        }
-        result = runner.run_with_intent(intent)
-    elif args.mode in {"run_case", "replay"}:
-        result = runner.run_with_intent({"intent": "run_case", "case_file": args.case})
-    elif args.mode == "chat":
-        result = runner.run(args.message)
-    else:
-        parser.print_help()
+    if args.mode == "run":
+        config = TestConfig.from_yaml(getattr(args, "config", "config.yaml"))
+        user_request = " ".join(args.message)
+
+        _init_tool_context(config)
+        set_relational_db(create_relational_db(config))
+        orchestrator = TestOrchestrator(config)
+
+        app_package, app_name = _quick_resolve_app(user_request)
+        result = orchestrator.start(
+            user_request=user_request,
+            app_package=app_package,
+            app_name=app_name,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+    parser.print_help()
+
+
+def _init_tool_context(config: TestConfig) -> None:
+    try:
+        device = DeviceController()
+        vlm = create_vlm_client(
+            provider=config.vision_provider, model=config.vision_model,
+            api_key=config.vision_api_key, base_url=config.vision_base_url,
+        )
+        perceiver = SmartPerceiver(device, llm_client=vlm, mode=PerceptionMode.HYBRID)
+        kb = None
+        if config.enable_rag or True:  # MemoryBackend 始终可用
+            kb = KnowledgeBase(create_vector_store(config))
+        ctx = ToolContext(device=device, perceiver=perceiver, knowledge_base=kb, safety_level=config.safety_level)
+        set_tool_context(ctx)
+    except DeviceUnavailableError:
+        logging.warning("设备不可用，部分功能受限")
+
+
+_APP_MAP = {
+    "settings": ("com.android.settings", "Settings"),
+    "设置": ("com.android.settings", "Settings"),
+    "服务与反馈": ("com.tblenovo.center", "服务与反馈"),
+}
+
+
+def _quick_resolve_app(text: str) -> tuple[str, str]:
+    import re
+    lowered = text.lower()
+    for name, (pkg, label) in _APP_MAP.items():
+        if name.lower() in lowered:
+            return pkg, label
+    match = re.search(r"\b[a-zA-Z][\w]*(?:\.[\w]+){2,}\b", text)
+    if match:
+        return match.group(0), ""
+    return "", ""
 
 
 if __name__ == "__main__":
     main()
-

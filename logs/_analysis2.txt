@@ -1,0 +1,65 @@
+============================================================
+PHASE TIMELINE
+============================================================
+  planner                 84.01s ####################################################################################
+  plan_review              0.00s 
+  executor                13.04s #############
+  reviewer                 8.47s ########
+  executor                15.53s ###############
+  reviewer                23.61s #######################
+  executor                84.71s ####################################################################################
+  reviewer                18.61s ##################
+  executor                13.03s #############
+  reviewer                 7.83s #######
+  executor                13.96s #############
+  reviewer                22.60s ######################
+  executor                92.83s ############################################################################################
+  reviewer                12.00s ############
+  reporter                 2.76s ##
+
+Total phases: 15
+
+============================================================
+HUMAN INTERRUPT POINTS
+  L463: "GraphInterrupt((Interrupt(value={'type': 'plan_review', 'plan': [{'index': 1, 'intent': '打开 Settings APP', 'action_type': 'launch_app', 'target': 'com.android.settings', 'alternatives': [], 'expected
+       -> [chain/end] [chain:LangGraph] [84.02s] Exiting Chain run with output:
+
+============================================================
+TOOL CALLS PER EXECUTOR PHASE
+  Executor phase 1: 0 tool calls
+  Executor phase 2: 0 tool calls
+  Executor phase 3: 0 tool calls
+  Executor phase 4: 0 tool calls
+  Executor phase 5: 0 tool calls
+  Executor phase 6: 0 tool calls
+  Executor phase 7: 0 tool calls
+  Executor phase 8: 0 tool calls
+  Executor phase 9: 0 tool calls
+  Executor phase 10: 0 tool calls
+  Executor phase 11: 0 tool calls
+  Executor phase 12: 0 tool calls
+  Executor phase 13: 0 tool calls
+  Executor phase 14: 0 tool calls
+  Executor phase 15: 0 tool calls
+  Executor phase 16: 0 tool calls
+  Executor phase 17: 0 tool calls
+  Executor phase 18: 0 tool calls
+  Executor phase 19: 0 tool calls
+  Executor phase 20: 0 tool calls
+  Executor phase 21: 0 tool calls
+
+============================================================
+LLM CALLS PER REVIEWER PHASE
+  Reviewer phase 1: 2 LLM calls
+  Reviewer phase 2: 1 LLM calls
+  Reviewer phase 3: 2 LLM calls
+  Reviewer phase 4: 2 LLM calls
+  Reviewer phase 5: 2 LLM calls
+  Reviewer phase 6: 1 LLM calls
+  Reviewer phase 7: 2 LLM calls
+  Reviewer phase 8: 1 LLM calls
+
+============================================================
+TEST PLAN
+
+DONE
