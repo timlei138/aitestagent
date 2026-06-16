@@ -4,16 +4,16 @@ import argparse
 import json
 import logging
 
-from config import TestConfig
+from config import TestConfig, resolve_perception_mode
 from data import create_vector_store, create_relational_db
 from agents.graph import set_relational_db
 from agents.orchestrator import TestOrchestrator
 from tools.context import ToolContext
 from tools import set_tool_context
 from device.controller import DeviceController, DeviceUnavailableError
-from device.perceiver import PerceptionMode, SmartPerceiver
-from llm.clients import create_vlm_client
+from device.perceiver import SmartPerceiver
 from data.knowledge import KnowledgeBase
+from api.apps_routes import resolve_app as _resolve_app_from_yaml
 
 
 def main():
@@ -59,37 +59,17 @@ def main():
 def _init_tool_context(config: TestConfig) -> None:
     try:
         device = DeviceController()
-        vlm = create_vlm_client(
-            provider=config.vision_provider, model=config.vision_model,
-            api_key=config.vision_api_key, base_url=config.vision_base_url,
-        )
-        perceiver = SmartPerceiver(device, llm_client=vlm, mode=PerceptionMode.HYBRID)
-        kb = None
-        if config.enable_rag or True:  # MemoryBackend 始终可用
-            kb = KnowledgeBase(create_vector_store(config))
+        mode, auto_switch, vlm = resolve_perception_mode(config)
+        perceiver = SmartPerceiver(device, llm_client=vlm, mode=mode, auto_switch=auto_switch)
+        kb = KnowledgeBase(create_vector_store(config))
         ctx = ToolContext(device=device, perceiver=perceiver, knowledge_base=kb, safety_level=config.safety_level)
         set_tool_context(ctx)
     except DeviceUnavailableError:
         logging.warning("设备不可用，部分功能受限")
 
 
-_APP_MAP = {
-    "settings": ("com.android.settings", "Settings"),
-    "设置": ("com.android.settings", "Settings"),
-    "服务与反馈": ("com.tblenovo.center", "服务与反馈"),
-}
-
-
 def _quick_resolve_app(text: str) -> tuple[str, str]:
-    import re
-    lowered = text.lower()
-    for name, (pkg, label) in _APP_MAP.items():
-        if name.lower() in lowered:
-            return pkg, label
-    match = re.search(r"\b[a-zA-Z][\w]*(?:\.[\w]+){2,}\b", text)
-    if match:
-        return match.group(0), ""
-    return "", ""
+    return _resolve_app_from_yaml(text)
 
 
 if __name__ == "__main__":

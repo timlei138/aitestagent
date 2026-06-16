@@ -1,0 +1,43 @@
+# 应用管理配置 - 由 APP管理 页面维护
+# 字段说明:
+#   name: 应用显示名称
+#   package: Android 包名
+#   keywords: 触发关键词（用户输入含任意关键词即可匹配该应用）
+
+apps:
+- name: Settings
+  package: com.android.settings
+  keywords:
+  - settings
+  - setting
+  - 设置
+- name: 联系人
+  package: com.android.contacts
+  keywords:
+  - 联系人
+  - contacts
+- name: 时钟
+  package: com.android.deskclock
+  keywords:
+  - 时钟
+  - 闹钟
+  - clock
+- name: 计算器
+  package: com.android.calculator2
+  keywords:
+  - 计算器
+  - calculator
+- name: 日历
+  package: com.android.calendar
+  keywords:
+  - 日历
+  - calendar
+- name: 服务与反馈
+  package: com.tblenovo.center
+  keywords:
+  - 服务与反馈
+  - tblenovo
+- name: 联想计算器
+  package: com.zui.calculator
+  keywords:
+  - 联想计算器

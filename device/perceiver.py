@@ -59,6 +59,7 @@ class PageUnderstanding:
     summary: str
     package: str = ""
     activity: str = ""
+    page_title: str = ""  # 从 UI 树 Toolbar/标题栏提取的页面标题
     width: int = 0
     height: int = 0
     regions: list[dict[str, Any]] = field(default_factory=list)
@@ -104,33 +105,47 @@ class SmartPerceiver:
         self._vision_calls: int = 0
         self.last_vision_log: dict[str, Any] = {}
         self.logger = logging.getLogger(__name__)
-        # 短时缓存：同页面 3 秒内复用，避免重复 VLM 调用
+        # 短时缓存：同页面 3 秒内复用
         self._cache_sig: str = ""
         self._cache_ts: float = 0.0
         self._cache_result: PageUnderstanding | None = None
+        # VLM 专用缓存：截图不变时不重复调用 VLM（VLM 耗时 10-40s）
+        self._vision_cache_img_hash: str = ""
+        self._vision_cache_text: str = ""
 
     def perceive(self) -> PageUnderstanding:
         # 短时缓存：相同页面+相同mode + 3秒内直接返回
         xml = self.device.dump_hierarchy()
         sig = hashlib.md5(f"{xml}|{self.mode}".encode()).hexdigest()
         now = time.monotonic()
-        if sig == self._cache_sig and (now - self._cache_ts) < 3.0 and self._cache_result is not None:
+        if sig == self._cache_sig and (now - self._cache_ts) < 5.0 and self._cache_result is not None:
             self.logger.debug("Perceive cache hit sig=%s", sig[:8])
             return self._cache_result
         elements = self.parse_elements(xml)
+        page_title = self._extract_page_title(xml)
         snapshot = self.device.snapshot()
         understanding = self._heuristic_understand(
             elements=elements,
             package=snapshot.package,
             activity=snapshot.activity,
+            page_title=page_title,
             width=snapshot.width,
             height=snapshot.height,
         )
         if self.mode in {PerceptionMode.VISION, PerceptionMode.HYBRID} and self.vlm:
-            self._vision_calls += 1
-            understanding.raw_vision = self._vision_describe(
-                snapshot.image_base64, understanding
-            )
+            # VLM 缓存：截图不变时复用上次 VLM 结果（图像 hash）
+            import hashlib as _hashlib
+            img_hash = _hashlib.md5(snapshot.image_base64.encode()).hexdigest() if snapshot.image_base64 else ""
+            if img_hash and img_hash == self._vision_cache_img_hash and self._vision_cache_text:
+                self.logger.info("VLM cache hit (img sig=%s)", img_hash[:8])
+                understanding.raw_vision = self._vision_cache_text
+            else:
+                self._vision_calls += 1
+                understanding.raw_vision = self._vision_describe(
+                    snapshot.image_base64, understanding
+                )
+                self._vision_cache_img_hash = img_hash
+                self._vision_cache_text = understanding.raw_vision
 
         # 检测是否卡在相同页面，自动切换模式
         if self.auto_switch and self.mode != PerceptionMode.VISION:
@@ -254,11 +269,73 @@ class SmartPerceiver:
         )
         return elements
 
+    def _extract_page_title(self, xml: str) -> str:
+        """从 UI 树中提取页面标题。
+
+        策略:
+        1. 找 Toolbar/ActionBar 内的 TextView 文本
+        2. 找 resource_id 包含 'title' 的元素
+        3. 兜底: 屏幕顶部区域的第一个有文本的非导航元素
+        """
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return ""
+
+        # 策略 1: Toolbar 内的 TextView
+        for node in root.iter():
+            cls = (node.get("class", "") or "").lower()
+            if "toolbar" in cls or "actionbar" in cls or "action_bar" in cls:
+                texts = []
+                for child in node.iter():
+                    child_cls = (child.get("class", "") or "").lower()
+                    if "textview" in child_cls or "edittext" in child_cls:
+                        t = (child.get("text", "") or "").strip()
+                        if t and len(t) < 50:
+                            texts.append(t)
+                if texts:
+                    return texts[0]  # 第一个文本通常是标题
+
+        # 策略 2: resource_id 含 title
+        for node in root.iter():
+            rid = (node.get("resource_id", "") or "")
+            if "title" in rid.lower() and not rid.endswith("_title"):
+                continue
+            if "title" in rid.lower():
+                t = (node.get("text", "") or "").strip()
+                if t and 2 <= len(t) <= 40:
+                    return t
+
+        # 策略 3: 顶部区域有文本的非导航元素
+        top_texts = []
+        for node in root.iter():
+            bounds_str = (node.get("bounds", "") or "")
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str)
+            if not m:
+                continue
+            y1 = int(m.group(2))
+            y2 = int(m.group(4))
+            # 屏幕顶部 20% 区域
+            if y1 < 400 and y2 < 700:
+                t = (node.get("text", "") or "").strip()
+                cls = (node.get("class", "") or "").lower()
+                if t and 2 <= len(t) <= 40 and "textview" in cls:
+                    rid = (node.get("resource_id", "") or "")
+                    # 排除导航按钮
+                    if "back" not in rid.lower() and "home" not in rid.lower():
+                        top_texts.append((y1, t))
+        if top_texts:
+            top_texts.sort()
+            return top_texts[0][1]
+
+        return ""
+
     def _heuristic_understand(
         self,
         elements: list[UIElement],
         package: str,
         activity: str,
+        page_title: str,
         width: int,
         height: int,
     ) -> PageUnderstanding:
@@ -328,11 +405,16 @@ class SmartPerceiver:
         primary.sort(
             key=lambda item: (item.priority, item.bounds[1], item.bounds[0], item.label)
         )
+        # 构建带页面标题的 summary
+        title_part = f"「{page_title}」" if page_title else ""
+        act_short = activity.split(".")[-1] if activity else ""
+        breadcrumb = f"{title_part}" if title_part else act_short
         return PageUnderstanding(
             layout=layout,
-            summary=f"{layout} 页面，识别到 {len(primary)} 个主要路径入口",
+            summary=f"{breadcrumb} — {layout} 页面，识别到 {len(primary)} 个主要路径入口" if breadcrumb else f"{layout} 页面，识别到 {len(primary)} 个主要路径入口",
             package=package,
             activity=activity,
+            page_title=page_title,
             width=width,
             height=height,
             regions=regions,
@@ -539,6 +621,18 @@ class SmartPerceiver:
         2. 向上一层（祖父节点）继续找
         """
         switch_bounds = self._parse_bounds(switch_node.get("bounds", ""))
+
+        # 策略 0: 子节点中的文本（列表项常用: LinearLayout > TextView）
+        for child in switch_node.iter():
+            if child is switch_node:
+                continue
+            text = child.get("text", "") or ""
+            desc = child.get("content-desc", "") or ""
+            label = text or desc
+            if label and len(label) >= 2:
+                cls = (child.get("class", "") or "").lower()
+                if "textview" in cls or "edittext" in cls:
+                    return label
 
         # 策略 1: 直接兄弟
         parent = parent_map.get(switch_node)

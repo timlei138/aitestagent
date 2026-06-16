@@ -1,0 +1,37 @@
+user_request: 点击左侧通用设置后点击 日期和时间 后设置点击时区 设置时区格式为mm-dd-yyyy；dd-mm-yyyy的国家或者区域。检查日期和时间是否按所设置显示
+app_package: com.android.settings
+app_name: Settings
+status: fail
+conclusion: "FAIL \n未能完成测试需求：导航到“通用设置”后，未找到“日期和时间”选项，无法进入时区设置并验证日期格式显示，步骤2、3均失败，导致用例无法执行。"
+generated_at: '2026-06-16T11:04:20.320159'
+steps:
+- index: 1
+  intent: 启动设置应用
+  action_type: launch_app
+  target: com.android.settings
+  alternatives: []
+  expected: 进入应用首页
+  _last_status: success
+  _last_observation: 'OK: 已成功启动 com.android.settings 设置应用，进入首页，无弹窗干扰。'
+- index: 2
+  intent: 导航到通用设置
+  action_type: navigate_tab
+  target: 通用设置
+  alternatives: []
+  expected: 通用设置操作成功
+  _last_status: fail
+  _last_observation: 当前页面信息已获取，点击展开查看详情
+- index: 3
+  intent: 点击日期和时间
+  action_type: click
+  target: 日期和时间
+  alternatives: []
+  expected: 日期和时间操作成功
+  _last_status: fail
+  _last_observation: 左侧导航中看到"通用设置"，但"日期和时间"不直接可见。很可能"日期和时间"在"通用设置"子菜单中。先进入"通用设置"。
+- index: 4
+  intent: 点击时区设置
+  action_type: click
+  target: 时区
+  alternatives: []
+  expected: 时区操作成功

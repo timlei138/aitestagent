@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import logging
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,27 +15,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TestConfig:
-    # ── 默认 LLM（Planner / Reporter 及未覆盖时的回退）──
+    # ── LLM ──
     llm_provider: str = "openai"
     model: str = "gpt-4o"
     api_key: str | None = None
     base_url: str | None = None
-
-    # ── 各 Agent 独立模型（空字符串 = 使用默认 model / provider）──
-    planner_model: str = ""
-    planner_provider: str = ""
-    planner_api_key: str | None = None
-    planner_base_url: str | None = None
-
-    executor_model: str = ""
-    executor_provider: str = ""
-    executor_api_key: str | None = None
-    executor_base_url: str | None = None
-
-    reviewer_model: str = ""
-    reviewer_provider: str = ""
-    reviewer_api_key: str | None = None
-    reviewer_base_url: str | None = None
 
     # ── Vision 模型（SmartPerceiver 截图分析）──
     vision_model: str = "gpt-4o"
@@ -48,54 +32,23 @@ class TestConfig:
     zhipu_base_url: str | None = None
 
     # ── Embedding ──
-    embedding_model: str = "text-embedding-3-small"
+    embedding_provider: str = "huggingface"
+    embedding_model: str = "BAAI/bge-large-zh-v1.5"
+    embedding_api_key: str | None = None
+    embedding_base_url: str | None = None
 
-    # ── 设备 ──
-
-    # ── 感知 ──
-    enable_vision: bool = True
-    auto_switch_perception: bool = True
-    stuck_threshold: int = 2
+    # ── 感知模式: "hybrid" | "ui_tree" | "vision" ──
+    perception_mode: str = "hybrid"
 
     # ── RAG ──
-    enable_rag: bool = False
     rag_persist_dir: str = "storage/knowledge"
 
     # ── 存储 ──
-    screenshot_dir: str = "storage/screenshots"
-    report_dir: str = "reports"
     db_path: str = "storage/test_history.db"
 
     # ── 安全 / Debug ──
     safety_level: str = "strict"
     langchain_debug: bool = True
-
-    # ── 测试计划持久化 ──
-    case_dir: str = "test_cases"
-
-    # ── 内部缓存 ──
-    _agent_configs: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
-
-    # ──────────────── Agent 配置解析 ────────────────
-
-    def agent_config(self, role: str) -> dict[str, Any]:
-        """返回指定 Agent 角色的 (provider, model, api_key, base_url)。"""
-        if role in self._agent_configs:
-            return self._agent_configs[role]
-
-        provider = (getattr(self, f"{role}_provider", "") or "").strip()
-        model = (getattr(self, f"{role}_model", "") or "").strip()
-        api_key = getattr(self, f"{role}_api_key", None)
-        base_url = getattr(self, f"{role}_base_url", None)
-
-        cfg = {
-            "provider": provider or self.llm_provider,
-            "model": model or self.model,
-            "api_key": api_key or self.api_key,
-            "base_url": base_url or self.base_url,
-        }
-        self._agent_configs[role] = cfg
-        return cfg
 
     # ──────────────── YAML 加载 ────────────────
 
@@ -106,6 +59,18 @@ class TestConfig:
                 level=logging.INFO,
                 format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
             )
+        # ── 文件日志：每次启动生成新文件 ──
+        _log_dir = Path("logs")
+        _log_dir.mkdir(exist_ok=True)
+        _log_file = _log_dir / f"app_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        _fh = logging.FileHandler(_log_file, encoding="utf-8")
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+        ))
+        logging.getLogger().addHandler(_fh)
+        logger.info("Log file: %s", _log_file)
+
         data: dict[str, Any] = {}
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -210,16 +175,12 @@ class TestConfig:
 
     @classmethod
     def _log_provider_summary(cls, config: "TestConfig") -> None:
-        for role in ("planner", "executor", "reviewer"):
-            cfg = config.agent_config(role)
-            logger.info(
-                "[%s] provider=%s model=%s base_url=%s api_key=%s",
-                role,
-                cfg["provider"],
-                cfg["model"],
-                cfg["base_url"] or "<default>",
-                cls._mask_secret(cfg["api_key"]),
-            )
+        logger.info(
+            "[llm] provider=%s model=%s base_url=%s api_key=%s",
+            config.llm_provider, config.model,
+            config.base_url or "<default>",
+            cls._mask_secret(config.api_key),
+        )
         logger.info(
             "[vision] provider=%s model=%s base_url=%s api_key=%s",
             config.vision_provider,
@@ -227,3 +188,28 @@ class TestConfig:
             config.vision_base_url or "<default>",
             cls._mask_secret(config.vision_api_key),
         )
+
+
+def resolve_perception_mode(config: TestConfig) -> tuple[str, bool, Any]:
+    """根据 perception_mode 配置解析 Perceiver 参数。
+
+    Returns: (mode, auto_switch, vlm_client_or_none)
+    """
+    from device.perceiver import PerceptionMode
+    from llm.clients import create_vlm_client
+
+    mode = config.perception_mode.lower()
+    if mode == "ui_tree":
+        return (PerceptionMode.UI_TREE, False, None)
+    elif mode == "vision":
+        vlm = create_vlm_client(
+            provider=config.vision_provider, model=config.vision_model,
+            api_key=config.vision_api_key, base_url=config.vision_base_url,
+        )
+        return (PerceptionMode.VISION, False, vlm)
+    else:  # hybrid (default)
+        vlm = create_vlm_client(
+            provider=config.vision_provider, model=config.vision_model,
+            api_key=config.vision_api_key, base_url=config.vision_base_url,
+        )
+        return (PerceptionMode.HYBRID, True, vlm)

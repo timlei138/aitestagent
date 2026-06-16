@@ -14,15 +14,18 @@ from pydantic import BaseModel
 from api.device_routes import router as device_router
 from api.device_routes import set_runner as set_device_runner
 from api.device_routes import _get_device as _api_get_device
+from api.apps_routes import router as apps_router
+from api.apps_routes import resolve_app as _resolve_app_from_yaml
+from api.knowledge_routes import router as knowledge_router
+from api.knowledge_routes import set_knowledge_base as _set_kb_for_routes
 from api.websocket_manager import WebSocketManager
-from config import TestConfig
+from config import TestConfig, resolve_perception_mode
 from data import create_vector_store, create_relational_db
 from device.controller import DeviceController, DeviceUnavailableError
 from agents.graph import set_relational_db
 from data.knowledge import KnowledgeBase
-from llm.clients import create_vlm_client
 from agents.orchestrator import TestOrchestrator
-from device.perceiver import PerceptionMode, SmartPerceiver
+from device.perceiver import SmartPerceiver
 from tools.context import ToolContext
 from tools import set_tool_context
 
@@ -44,17 +47,14 @@ _kb: KnowledgeBase | None = None
 try:
     _device = DeviceController()
     logging.getLogger(__name__).info("Android device connected")
-except DeviceUnavailableError as exc:
+except (DeviceUnavailableError, Exception) as exc:
     logging.getLogger(__name__).warning("Android device NOT connected: %s", exc)
 
 # 2) 感知器（设备在线时才创建）
 if _device is not None:
     try:
-        vlm = create_vlm_client(
-            provider=config.vision_provider, model=config.vision_model,
-            api_key=config.vision_api_key, base_url=config.vision_base_url,
-        )
-        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=PerceptionMode.HYBRID)
+        mode, auto_switch, vlm = resolve_perception_mode(config)
+        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=mode, auto_switch=auto_switch)
         logging.getLogger(__name__).info("SmartPerceiver initialized (mode=%s)", _perceiver.mode)
     except Exception as exc:
         logging.getLogger(__name__).warning("SmartPerceiver init failed: %s", exc)
@@ -92,11 +92,8 @@ def reconnect_device() -> dict:
         return {"connected": False, "detail": str(exc)}
 
     try:
-        vlm = create_vlm_client(
-            provider=config.vision_provider, model=config.vision_model,
-            api_key=config.vision_api_key, base_url=config.vision_base_url,
-        )
-        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=PerceptionMode.HYBRID)
+        mode, auto_switch, vlm = resolve_perception_mode(config)
+        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=mode, auto_switch=auto_switch)
         logging.getLogger(__name__).info("SmartPerceiver reinitialized (mode=%s)", _perceiver.mode)
     except Exception as exc:
         _perceiver = None
@@ -119,6 +116,9 @@ orchestrator.set_event_callback(
 )
 
 app.include_router(device_router)
+app.include_router(apps_router)
+app.include_router(knowledge_router)
+_set_kb_for_routes(_kb)
 
 
 class RunRequest(BaseModel):
@@ -240,17 +240,20 @@ async def websocket_chat(websocket: WebSocket):
                     app_package=app_package,
                     app_name=app_name,
                 )
-                await ws_manager.send(websocket, {
-                    "type": "result",
-                    "content": {
-                        "status": result.get("status"),
-                        "conclusion": result.get("conclusion"),
-                        "steps": result.get("steps", []),
-                        "thread_id": result.get("thread_id", ""),
-                        "interrupt": result.get("interrupt"),
-                        "pending_identities": result.get("pending_identities", []),
-                    },
-                })
+                try:
+                    await ws_manager.send(websocket, {
+                        "type": "result",
+                        "content": {
+                            "status": result.get("status"),
+                            "conclusion": result.get("conclusion"),
+                            "steps": result.get("steps", []),
+                            "thread_id": result.get("thread_id", ""),
+                            "interrupt": result.get("interrupt"),
+                            "pending_identities": result.get("pending_identities", []),
+                        },
+                    })
+                except RuntimeError:
+                    pass  # client disconnected during execution
 
             elif msg_type == "human_decision":
                 thread_id = data.get("thread_id", "")
@@ -258,15 +261,18 @@ async def websocket_chat(websocket: WebSocket):
                 result = await asyncio.to_thread(
                     orchestrator.resume, thread_id=thread_id, decision=decision,
                 )
-                await ws_manager.send(websocket, {
-                    "type": "result",
-                    "content": {
-                        "status": result.get("status"),
-                        "conclusion": result.get("conclusion"),
-                        "thread_id": thread_id,
-                        "interrupt": result.get("interrupt"),
-                    },
-                })
+                try:
+                    await ws_manager.send(websocket, {
+                        "type": "result",
+                        "content": {
+                            "status": result.get("status"),
+                            "conclusion": result.get("conclusion"),
+                            "thread_id": thread_id,
+                            "interrupt": result.get("interrupt"),
+                        },
+                    })
+                except RuntimeError:
+                    pass  # client disconnected during execution
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
@@ -338,25 +344,9 @@ async def index():
 
 # ── 辅助 ──
 
-APP_NAME_MAP = {
-    "settings": "com.android.settings", "setting": "com.android.settings",
-    "设置": "com.android.settings", "联系人": "com.android.contacts",
-    "相机": "com.android.camera", "电话": "com.android.dialer",
-    "浏览器": "com.android.browser", "时钟": "com.android.deskclock",
-    "计算器": "com.android.calculator2", "日历": "com.android.calendar",
-    "服务与反馈": "com.tblenovo.center",
-}
-
-
 def _quick_resolve_app(text: str) -> tuple[str, str]:
-    lowered = text.lower()
-    for name, package in APP_NAME_MAP.items():
-        if name.lower() in lowered:
-            return package, name
-    match = re.search(r"\b[a-zA-Z][\w]*(?:\.[\w]+){2,}\b", text)
-    if match:
-        return match.group(0), ""
-    return "", ""
+    """从用户输入中解析 (package, name)，优先读取 storage/apps.yaml。"""
+    return _resolve_app_from_yaml(text)
 
 
 def _safe_resolve_under(base: Path, raw_path: str) -> Path | None:

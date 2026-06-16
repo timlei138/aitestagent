@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStoreBackend(ABC):
@@ -76,19 +79,33 @@ class MemoryBackend(VectorStoreBackend):
 
 
 class ChromaBackend(VectorStoreBackend):
-    """ChromaDB 向量存储实现。"""
+    """ChromaDB 向量存储实现。支持 HuggingFace 本地 embedding 和 OpenAI 远程 embedding。"""
 
     def __init__(
         self,
         persist_dir: str = "storage/knowledge",
-        embedding_model: str = "text-embedding-3-small",
+        embedding_provider: str = "huggingface",   # huggingface | openai
+        embedding_model: str = "BAAI/bge-large-zh-v1.5",
         api_key: str | None = None,
         base_url: str | None = None,
     ):
         from langchain_chroma import Chroma
-        from langchain_openai import OpenAIEmbeddings
 
-        embeddings = OpenAIEmbeddings(model=embedding_model, api_key=api_key, base_url=base_url)
+        if embedding_provider == "huggingface":
+            # 本地 HuggingFace embedding: 无需 API Key, 中文支持优秀
+            from langchain_huggingface import HuggingFaceEmbeddings
+            embeddings = HuggingFaceEmbeddings(
+                model_name=embedding_model,
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"normalize_embeddings": True},
+            )
+        else:
+            # OpenAI 远程 embedding: 需要 API Key
+            from langchain_openai import OpenAIEmbeddings
+            embeddings = OpenAIEmbeddings(
+                model=embedding_model, api_key=api_key, base_url=base_url
+            )
+
         self._store = Chroma(
             collection_name="app_knowledge",
             embedding_function=embeddings,

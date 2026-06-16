@@ -24,7 +24,11 @@ class WebSocketManager:
         self.connections.discard(websocket)
 
     async def send(self, websocket: WebSocket, message: dict) -> None:
-        await websocket.send_json(message)
+        try:
+            await websocket.send_json(message)
+        except RuntimeError:
+            # WebSocket already closed (e.g. client disconnected mid-execution)
+            self.disconnect(websocket)
 
     async def broadcast(self, message: dict) -> None:
         stale: list[WebSocket] = []

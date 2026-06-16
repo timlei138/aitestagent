@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import json
 import os
@@ -103,6 +104,23 @@ class SqliteBackend(RelationalBackend):
             );
         """)
         self._conn.commit()
+        # ── V2: 新增列（兼容已有数据库） ──
+        self._migrate_v2_columns()
+
+    def _migrate_v2_columns(self) -> None:
+        """V2 迁移：为 element_identities 新增 screen_width/screen_height/bounds_json 列。"""
+        for col, typedef in [
+            ("screen_width", "INTEGER DEFAULT 0"),
+            ("screen_height", "INTEGER DEFAULT 0"),
+            ("bounds_json", "TEXT DEFAULT ''"),
+        ]:
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE element_identities ADD COLUMN {col} {typedef}"
+                )
+            except sqlite3.OperationalError:
+                pass  # 列已存在
+        self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
         return self._conn.execute(sql, params)
@@ -187,8 +205,8 @@ class SqliteBackend(RelationalBackend):
         for row in rows:
             d = dict(row)
             steps = json.loads(d.pop("steps_json", "[]") or "[]")
-            pass_count = sum(1 for s in steps if s.get("status") == "success")
-            fail_count = len(steps) - pass_count
+            pass_count = sum(1 for s in steps if s.get("status") in ("success", "continue"))
+            fail_count = sum(1 for s in steps if s.get("status") == "fail")
             d["pass_count"] = pass_count
             d["fail_count"] = fail_count
             d["total_steps"] = len(steps)
@@ -206,10 +224,11 @@ class SqliteBackend(RelationalBackend):
             return None
         d = dict(row)
         steps = json.loads(d.pop("steps_json", "[]") or "[]")
-        pass_count = sum(1 for s in steps if s.get("status") == "success")
+        pass_count = sum(1 for s in steps if s.get("status") in ("success", "continue"))
+        fail_count = sum(1 for s in steps if s.get("status") == "fail")
         d["steps"] = steps
         d["pass_count"] = pass_count
-        d["fail_count"] = len(steps) - pass_count
+        d["fail_count"] = fail_count
         d["total_steps"] = len(steps)
         return d
 
@@ -218,6 +237,8 @@ class SqliteBackend(RelationalBackend):
     def save_element_identity(self, app_package: str, page_signature: str,
                               alias: str, resource_id: str = "", class_name: str = "",
                               role: str = "", region: str = "", text_hint: str = "",
+                              bounds_json: str = "", screen_width: int = 0,
+                              screen_height: int = 0,
                               candidates_count: int = 1) -> None:
         """保存或更新元素身份映射。click_count 递增。"""
         existing = self.select("element_identities", {
@@ -233,6 +254,9 @@ class SqliteBackend(RelationalBackend):
                 "role": role or row.get("role", ""),
                 "region": region or row.get("region", ""),
                 "text_hint": text_hint or row.get("text_hint", ""),
+                "bounds_json": bounds_json or row.get("bounds_json", ""),
+                "screen_width": screen_width or row.get("screen_width", 0),
+                "screen_height": screen_height or row.get("screen_height", 0),
                 "candidates_count": candidates_count,
                 "click_count": int(row.get("click_count", 0)) + 1,
                 "last_used_at": now,
@@ -244,21 +268,40 @@ class SqliteBackend(RelationalBackend):
                 "app_package": app_package, "page_signature": page_signature, "alias": alias,
                 "resource_id": resource_id, "class_name": class_name,
                 "role": role, "region": region, "text_hint": text_hint,
+                "bounds_json": bounds_json, "screen_width": screen_width,
+                "screen_height": screen_height,
                 "candidates_count": candidates_count, "click_count": 1,
                 "last_used_at": now, "created_at": now, "updated_at": now,
             })
 
     def query_element_identity(self, app_package: str, alias: str,
-                               page_signature: str = "") -> list[dict[str, Any]]:
-        """查询元素身份映射。可限定页面签名。"""
+                               page_signature: str = "",
+                               target_screen: tuple[int, int] = (0, 0)
+                               ) -> list[dict[str, Any]]:
+        """查询元素身份映射。如果提供 target_screen, 自动将历史 bounds 换算为当前屏幕坐标。"""
         if page_signature:
             rows = self.select("element_identities", {
                 "app_package": app_package, "page_signature": page_signature, "alias": alias,
             }, limit=1)
-            if rows: return rows
-        return self.select("element_identities", {
+            if rows:
+                return [_convert_bounds(r, target_screen) for r in self._apply_expiry(rows)]
+        rows = self.select("element_identities", {
             "app_package": app_package, "alias": alias,
         }, order_by="click_count DESC", limit=3)
+        return [_convert_bounds(r, target_screen) for r in self._apply_expiry(rows)]
+
+    def _apply_expiry(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """过期降权：>30天的记录 click_count 视为 1。"""
+        for row in rows:
+            updated = row.get("updated_at", "")
+            if updated:
+                try:
+                    days_old = (datetime.now() - datetime.fromisoformat(updated)).days
+                    if days_old > 30:
+                        row["click_count"] = min(row.get("click_count", 1), 1)
+                except Exception:
+                    pass
+        return rows
 
     def list_element_identities(self, app_package: str = "",
                                 limit: int = 50) -> list[dict[str, Any]]:
@@ -268,6 +311,98 @@ class SqliteBackend(RelationalBackend):
                               order_by="click_count DESC", limit=limit)
         return self.select("element_identities", order_by="click_count DESC", limit=limit)
 
-    def list_test_runs(self, limit: int = 30) -> list[dict[str, Any]]:
-        """列出最近测试执行记录。"""
-        return self.select("test_runs", order_by="created_at DESC", limit=limit)
+    def find_successful_plan(self, app_package: str, user_request: str) -> dict[str, Any] | None:
+        """查找最近一次有成功步骤的测试执行, 返回其结果。
+        用于 replay_mode: 全量回归时复用历史计划（从第 1 步开始）。
+        匹配时对 user_request 规范化，提高命中率。
+        """
+        normalized = _normalize_request(user_request)
+        # 先精确匹配原始文本
+        sql = ("SELECT id, status, steps_json, created_at "
+               "FROM test_runs WHERE app_package = ? AND user_request = ? "
+               "ORDER BY created_at DESC LIMIT 10")
+        rows = self._conn.execute(sql, (app_package, user_request)).fetchall()
+        # 精确匹配失败时，用规范化后的文本模糊匹配
+        if not rows:
+            all_runs = self._conn.execute(
+                "SELECT id, status, steps_json, created_at, user_request "
+                "FROM test_runs WHERE app_package = ? "
+                "ORDER BY created_at DESC LIMIT 50",
+                (app_package,)
+            ).fetchall()
+            rows = [r for r in all_runs
+                    if _normalize_request(dict(r).get("user_request", "")) == normalized]
+        if not rows:
+            return None
+        # 找最近的有最多成功步骤的记录
+        best = None
+        best_success = -1
+        for row in rows:
+            d = dict(row)
+            steps = json.loads(d.get("steps_json", "[]") or "[]")
+            success_count = sum(1 for s in steps if s.get("status") == "success")
+            if success_count > best_success:
+                best_success = success_count
+                best = {"run_id": d["id"], "steps": steps,
+                        "success_count": success_count,
+                        "total_count": len(steps)}
+        return best
+
+
+# ── 模块级辅助函数 ──
+
+def _normalize_request(text: str) -> str:
+    """规范化 user_request，提高精确匹配命中率。
+    处理：去标点、统一空格、去前后缀冗余词、小写。
+    例: '打开WLAN设置， 开启开关' -> '打开wlan设置 开启开关'
+    """
+    # 去标点符号
+    text = re.sub(r'[\uff0c\u3002\uff01\uff1f\u3001,.!?;\uff1b]', ' ', text)
+    # 统一空格 + strip
+    text = re.sub(r'\s+', ' ', text).strip()
+    # 去掉常见前缀冗余词
+    text = re.sub(r'^(请|帮我|帮忙)', '', text).strip()
+    return text.lower()
+
+
+def _convert_bounds(row: dict[str, Any], target_screen: tuple[int, int]) -> dict[str, Any]:
+    """将历史 bounds 按百分比换算到目标屏幕尺寸。
+
+    注意：Android 布局不是简单等比缩放，状态栏/导航栏高度不同会导致线性换算偏差。
+    因此百分比 bounds 只作为第 3 优先级 fallback，并在输出中标记置信度。
+    """
+    result = dict(row)
+    bounds_json = result.get("bounds_json", "")
+    src_w = result.get("screen_width", 0)
+    src_h = result.get("screen_height", 0)
+    tgt_w, tgt_h = target_screen
+
+    if bounds_json and src_w > 0 and src_h > 0 and tgt_w > 0 and tgt_h > 0:
+        try:
+            b = json.loads(bounds_json)
+            # 计算百分比
+            pct = {
+                "x1_pct": round(b["x1"] / src_w * 100, 2),
+                "y1_pct": round(b["y1"] / src_h * 100, 2),
+                "x2_pct": round(b["x2"] / src_w * 100, 2),
+                "y2_pct": round(b["y2"] / src_h * 100, 2),
+            }
+            # 换算到目标屏幕
+            converted = {
+                "x1": int(pct["x1_pct"] / 100 * tgt_w),
+                "y1": int(pct["y1_pct"] / 100 * tgt_h),
+                "x2": int(pct["x2_pct"] / 100 * tgt_w),
+                "y2": int(pct["y2_pct"] / 100 * tgt_h),
+            }
+            # 置信度评估：屏幕比例差异越大，置信度越低
+            aspect_src = src_w / src_h
+            aspect_tgt = tgt_w / tgt_h
+            confidence = "high" if abs(aspect_src - aspect_tgt) < 0.1 else (
+                "medium" if abs(aspect_src - aspect_tgt) < 0.3 else "low"
+            )
+            result["bounds_pct"] = pct
+            result["bounds_converted"] = converted
+            result["bounds_confidence"] = confidence
+        except Exception:
+            pass
+    return result

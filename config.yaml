@@ -1,21 +1,11 @@
 # AI 自动化测试 Agent 配置文件
 # 环境变量: OPENAI_API_KEY / OPENAI_BASE_URL / ZHIPU_API_KEY
 
-# ── 默认 LLM（Planner / Reporter 及未覆盖时的回退）──
+# ── LLM ──
 llm_provider: "openai"
 model: "deepseek-v4-pro"
 api_key: "sk-296391b7a893487881d45f2726db67b6"
 base_url: "https://api.deepseek.com"
-
-# ── 各 Agent 独立模型（留空 = 使用上面的默认值）──
-planner_model: ""          # 规划→需要强推理
-planner_provider: ""
-
-executor_model: ""         # 执行→可以更快更便宜
-executor_provider: ""
-
-reviewer_model: ""         # 审查→需要判断力
-reviewer_provider: ""
 
 # ── Vision 模型（SmartPerceiver 截图分析）──
 vision_provider: "zhipu"
@@ -24,23 +14,16 @@ vision_api_key: "054dc70864266b6e40df256f7cf3d01a.PFY3duz6Hu1KDJu7"
 vision_base_url: null
 
 # ── Embedding（RAG 向量化）──
-embedding_model: "text-embedding-3-small"
+embedding_provider: "huggingface"
+embedding_model: "BAAI/bge-large-zh-v1.5"
+embedding_api_key: ""
+embedding_base_url: ""
 
-# ── 感知 ──
-enable_vision: true
-auto_switch_perception: true
-stuck_threshold: 2
+# ── 感知模式: hybrid(自动切换) | ui_tree(最快) | vision(截图分析) ──
+perception_mode: "ui_tree"
 
 # ── RAG ──
-enable_rag: false
 rag_persist_dir: "storage/knowledge"
-
-# ── 存储 ──
-screenshot_dir: "storage/screenshots"
-report_dir: "reports"
 
 # ── 安全 ──
 safety_level: "strict"
-
-# ── 测试计划持久化目录 ──
-case_dir: "test_cases"

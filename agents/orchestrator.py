@@ -63,11 +63,9 @@ class TestOrchestrator:
 
         initial_state: TestState = {
             "user_request": user_request, "app_package": app_package,
-            "app_name": app_name, "test_plan": [], "current_step_index": 0,
-            "last_action": "", "last_observation": "", "step_history": [],
-            "anomalies": [], "reviewer_decision": "", "human_question": "",
-            "retry_count": 0, "conclusion": "", "report_path": "", "status": "",
-            "pending_identities": [],
+            "app_name": app_name, "goal_description": {},
+            "step_history": [], "messages": [],
+            "conclusion": "", "status": "",
         }
 
         config_ctx = {"configurable": {"thread_id": thread_id, "test_config": self.config}}
@@ -105,11 +103,9 @@ class TestOrchestrator:
 
         initial_state: TestState = {
             "user_request": user_request, "app_package": app_package,
-            "app_name": app_name, "test_plan": [], "current_step_index": 0,
-            "last_action": "", "last_observation": "", "step_history": [],
-            "anomalies": [], "reviewer_decision": "", "human_question": "",
-            "retry_count": 0, "conclusion": "", "report_path": "", "status": "",
-            "pending_identities": [],
+            "app_name": app_name, "goal_description": {},
+            "step_history": [], "messages": [],
+            "conclusion": "", "status": "",
         }
 
         config_ctx = {"configurable": {"thread_id": thread_id, "test_config": self.config}}
@@ -143,8 +139,9 @@ class TestOrchestrator:
 
                 elif kind == "on_chain_end" and "planner" in str(event.get("name", "")):
                     output = event.get("data", {}).get("output", {})
-                    if isinstance(output, dict) and output.get("test_plan"):
-                        yield {"type": "plan_ready", "content": {"steps": len(output["test_plan"])}}
+                    goal = output.get("goal_description", {})
+                    if isinstance(goal, dict) and goal:
+                        yield {"type": "plan_ready", "content": {"goal": goal.get("goal", ""), "pages": goal.get("target_pages", [])}}
 
             # 获取最终状态
             final_state = self.graph.get_state(config_ctx)
@@ -255,8 +252,7 @@ class TestOrchestrator:
             "mode": "run",
             "conclusion": state.get("conclusion", ""),
             "steps": state.get("step_history", []),
-            "test_plan": state.get("test_plan", []),
-            "pending_identities": state.get("pending_identities", []),
+            "goal_description": state.get("goal_description", {}),
         }
         return result
 

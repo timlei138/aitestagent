@@ -219,3 +219,7 @@ __marimo__/
 storage/baselines/
 frontend/spa/node_modules/
 reports/
+logs/
+storage/case
+storage/screenshots/
+

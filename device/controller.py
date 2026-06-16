@@ -38,7 +38,10 @@ class DeviceController:
                 "uiautomator2 未安装，请先安装 requirements.txt"
             ) from exc
 
-        self.device = u2.connect(serial) if serial else u2.connect()
+        try:
+            self.device = u2.connect(serial) if serial else u2.connect()
+        except Exception as exc:
+            raise DeviceUnavailableError(f"ADB 设备未连接: {exc}") from exc
         logger.info("Connected to device: %s", self.device)
 
         if auto_init:
@@ -47,7 +50,9 @@ class DeviceController:
         try:
             _ = self.device.info
         except Exception as exc:
-            logger.warning("Device info call failed (device may still be usable): %s", exc)
+            logger.warning(
+                "Device info call failed (device may still be usable): %s", exc
+            )
         self._last_current_app: dict[str, str] = {"package": "", "activity": ""}
         self._last_current_app_ts: float = 0.0
         self._last_current_app_log_sig: str = ""
@@ -59,7 +64,9 @@ class DeviceController:
         """检测 ATX 服务是否运行，未安装则自动初始化。"""
         # 轻量探活：检查 atx-agent 是否在监听
         try:
-            result = self.device.shell("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7912/version 2>/dev/null || echo 000")
+            result = self.device.shell(
+                "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7912/version 2>/dev/null || echo 000"
+            )
             if "200" in str(result.output):
                 logger.info("ATX agent is running (HTTP 200)")
                 return
@@ -68,7 +75,9 @@ class DeviceController:
 
         # 备选探活：ps 检查 atx-agent 进程
         try:
-            result = self.device.shell("ps -A 2>/dev/null | grep atx-agent || ps 2>/dev/null | grep atx-agent || echo NOT_FOUND")
+            result = self.device.shell(
+                "ps -A 2>/dev/null | grep atx-agent || ps 2>/dev/null | grep atx-agent || echo NOT_FOUND"
+            )
             if "atx-agent" in str(getattr(result, "output", result)):
                 logger.info("ATX agent process found")
                 return
@@ -79,12 +88,17 @@ class DeviceController:
         try:
             subprocess.run(
                 [sys.executable, "-m", "uiautomator2", "init"],
-                capture_output=True, text=True, timeout=120,
+                capture_output=True,
+                text=True,
+                timeout=120,
             )
             logger.info("ATX init completed — waiting for agent to start...")
             time.sleep(3)
         except Exception as exc:
-            logger.warning("ATX auto-init failed: %s — device may still work if ATX is already present", exc)
+            logger.warning(
+                "ATX auto-init failed: %s — device may still work if ATX is already present",
+                exc,
+            )
 
     def app_start(
         self,
@@ -232,16 +246,11 @@ class DeviceController:
         package = ""
         activity = ""
         try:
-            current = self.device.app_current() or {}
-            package = str(current.get("package", "") or "").strip()
-            activity = str(current.get("activity", "") or "").strip()
-        except Exception as exc:
-            logger.warning("current_app app_current failed: %s", exc)
-
-        if not package:
             result = self._current_app_from_dumpsys()
             package = str(result.get("package", "") or "").strip()
             activity = str(result.get("activity", "") or "").strip()
+        except Exception as exc:
+            logger.warning("current_app app_current failed: %s", exc)
 
         current_app = {"package": package, "activity": activity}
         self._last_current_app = current_app

@@ -142,6 +142,85 @@ class KnowledgeBase:
             return ""
         return "\n".join(f"- {r['content']}" for r in results)
 
+    # ── 元素身份知识 (ChromaDB) ──
+
+    def save_element_knowledge(self, app_package: str, page: str,
+                               alias: str, role: str = "", region: str = "",
+                               resource_id: str = "", strategy: str = "",
+                               detail: str = "") -> None:
+        """保存确认过的元素身份到向量库, 供 Planner RAG 检索。
+        只存设备无关属性(resource_id/role/region), 不存 bounds 坐标。
+        """
+        parts = [f"{app_package} 的 {page} 页面中, '{alias}' 是 {role or '未知'} 类型"]
+        if region:
+            parts.append(f"位于 {region} 区域")
+        if resource_id:
+            parts.append(f"resource_id={resource_id}")
+        if strategy:
+            parts.append(f"推荐策略: {strategy}")
+        content = ", ".join(parts) + "。" + (detail or "")
+        self.save_knowledge(UIKnowledge(
+            app_package=app_package,
+            knowledge_type="element_identity",
+            content=content,
+            metadata={
+                "page": page, "alias": alias, "role": role,
+                "region": region, "resource_id": resource_id,
+                "strategy": strategy,
+                "timestamp": datetime.now().isoformat(),
+            },
+        ))
+
+    def query_element_knowledge(self, app_package: str, query: str,
+                                top_k: int = 5) -> list[dict[str, Any]]:
+        """查询元素身份知识。"""
+        return self.query(
+            query, app_package=app_package,
+            knowledge_type="element_identity", top_k=top_k,
+        )
+
+    # ── 验证计划 (ChromaDB) ──
+
+    def save_verified_plan(self, app_package: str, user_request: str,
+                           plan: list[dict[str, Any]],
+                           results: list[dict[str, Any]]) -> None:
+        """保存验证计划到向量库, 供下次 Planner RAG 检索。"""
+        success_targets = [s.get("target", "") for s in results if s.get("status") == "success"]
+        fail_targets = [s.get("target", "") for s in results if s.get("status") != "success"]
+        steps_desc = "; ".join(
+            f"步骤{s.get('index')}: {s.get('intent')}({s.get('action_type')}->{s.get('target')})"
+            for s in plan
+        )
+        content = (
+            f"{app_package} 测试 '{user_request[:50]}' 的计划: "
+            f"共 {len(plan)} 步, "
+            f"已验证成功: {', '.join(success_targets) or '无'}, "
+            f"待验证: {', '.join(fail_targets) or '无'}. "
+            f"步骤: {steps_desc}"
+        )
+        self.save_knowledge(UIKnowledge(
+            app_package=app_package,
+            knowledge_type="verified_plan",
+            content=content,
+            metadata={
+                "user_request_hash": str(hash(user_request))[:16],
+                "total_steps": len(plan),
+                "success_count": len(success_targets),
+                "fail_count": len(fail_targets),
+                "timestamp": datetime.now().isoformat(),
+            },
+        ))
+
+    def query_verified_plan(self, app_package: str, user_request: str,
+                            top_k: int = 1) -> list[dict[str, Any]]:
+        """查询向量库中的验证计划。"""
+        return self.query(
+            f"{user_request[:50]} 测试计划",
+            app_package=app_package,
+            knowledge_type="verified_plan",
+            top_k=top_k,
+        )
+
     @property
     def count(self) -> int:
         return self.backend.count()
