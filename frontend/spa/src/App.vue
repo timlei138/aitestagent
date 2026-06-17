@@ -651,6 +651,7 @@ const kbTypes = [
   { value: 'test_experience', label: '测试经验' },
   { value: 'element_identity', label: '元素身份' },
   { value: 'verified_plan', label: '验证计划' },
+  { value: 'app_precondition', label: 'App前提条件' },
 ];
 const kbTypeColorMap = {
   page_structure: 'info',
@@ -658,6 +659,7 @@ const kbTypeColorMap = {
   test_experience: 'warning',
   element_identity: 'primary',
   verified_plan: 'danger',
+  app_precondition: 'danger',
 };
 function kbTypeLabel(type) {
   const t = kbTypes.find(x => x.value === type);

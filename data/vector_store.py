@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import logging
+import os as _os
 from abc import ABC, abstractmethod
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ═══ 模块加载时检测本地缓存，避免每次启动 ~40 次 HTTP HEAD 验证 ═══
+_cache_dir = _os.path.join(
+    _os.path.expanduser("~"), ".cache", "huggingface", "hub",
+    "models--BAAI--bge-large-zh-v1.5"
+)
+if _os.path.isdir(_cache_dir):
+    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    logger.info("HF model cached locally, network checks disabled")
 
 
 class VectorStoreBackend(ABC):
@@ -92,7 +102,6 @@ class ChromaBackend(VectorStoreBackend):
         from langchain_chroma import Chroma
 
         if embedding_provider == "huggingface":
-            # 本地 HuggingFace embedding: 无需 API Key, 中文支持优秀
             from langchain_huggingface import HuggingFaceEmbeddings
             embeddings = HuggingFaceEmbeddings(
                 model_name=embedding_model,
@@ -116,10 +125,16 @@ class ChromaBackend(VectorStoreBackend):
         from langchain_core.documents import Document
         self._store.add_documents([Document(page_content=content, metadata=metadata)])
 
+    def _to_chroma_filter(self, filter: dict[str, str]) -> dict[str, Any]:
+        """将多 key 简单过滤转为 ChromaDB 兼容的 $and 格式。"""
+        if len(filter) <= 1:
+            return filter
+        return {"$and": [{k: v} for k, v in filter.items()]}
+
     def search(self, query: str, filter: dict[str, str] | None = None, top_k: int = 5) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {"k": top_k}
         if filter:
-            kwargs["filter"] = filter
+            kwargs["filter"] = self._to_chroma_filter(filter)
         results = self._store.similarity_search_with_score(query, **kwargs)
         return [
             {"content": doc.page_content, "metadata": doc.metadata, "score": round(float(score), 4)}
@@ -127,7 +142,8 @@ class ChromaBackend(VectorStoreBackend):
         ]
 
     def delete(self, filter: dict[str, str]) -> int:
-        ids = self._store.get(where=filter).get("ids", [])
+        where = self._to_chroma_filter(filter)
+        ids = self._store.get(where=where).get("ids", [])
         if ids:
             self._store.delete(ids=ids)
         return len(ids)

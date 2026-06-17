@@ -152,9 +152,12 @@ class TestConfig:
         sys.stdout = _Tee(_orig_stdout, _stdout_log)
 
         # logging 模块也加上 langchain / langgraph 的 handler（捕获少数走 logger 的消息）
-        for name in ("langchain", "langchain_core", "langgraph"):
+        for name in ("langchain", "langgraph"):
             lg = logging.getLogger(name)
             lg.setLevel(logging.DEBUG)
+        # langchain_core callbacks 会产生 KeyError('input') 冗余警告，抑制到 ERROR
+        logging.getLogger("langchain_core.callbacks.manager").setLevel(logging.ERROR)
+        logging.getLogger("langchain_core").setLevel(logging.INFO)
 
         try:
             from langchain_core.globals import set_debug, set_verbose

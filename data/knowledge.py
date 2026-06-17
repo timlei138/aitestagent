@@ -98,15 +98,25 @@ class KnowledgeBase:
         count = 0
         visited: set[str] = set()
         for entry in execution_log:
-            page = entry.get("page", "未知页面")
+            page = entry.get("page", "") or "未知页面"
             action = entry.get("action", "?")
             observation = entry.get("observation", "")
             step_ok = entry.get("result") == "success"
+
+            # 从 agent_node 源头的 post_page 字段读取真实跳转页面
+            to_page = entry.get("post_page", "")
+            if page and to_page and to_page != page:
+                self.save_navigation_path(app_package, page, to_page, action)
+                count += 1
+
+            # page_structure: 有标签才写入（不再写空列表）
             if page not in visited:
                 visited.add(page)
-                self.save_page_structure(app_package, page, [])
-            if step_ok:
-                self.save_navigation_path(app_package, page, "下一页面", action)
+                labels = _extract_labels_from_observation(observation)
+                if labels:
+                    self.save_page_structure(app_package, page, [{"label": l} for l in labels])
+                    count += 1
+
             self.save_test_experience(
                 app_package, page, action,
                 "成功" if step_ok else "失败",
@@ -115,78 +125,18 @@ class KnowledgeBase:
             count += 1
         return count
 
-    def get_app_context(self, app_package: str) -> str:
-        results = self.query(app_package, app_package=app_package, top_k=10)
-        if not results:
-            return ""
-        lines = [f"### {app_package} 历史知识"]
-        lines.extend(f"- {r['content']}" for r in results)
-        return "\n".join(lines)
-
-    # ── Memory 接口 ──
-
-    def as_retriever_memory(self):
-        """返回 LangChain VectorStoreRetrieverMemory（仅 Chroma 后端支持）。"""
-        if hasattr(self.backend, "store"):
-            try:
-                from langchain.memory import VectorStoreRetrieverMemory
-                retriever = self.backend.store.as_retriever(search_kwargs={"k": 5})
-                return VectorStoreRetrieverMemory(retriever=retriever, memory_key="rag_context")
-            except Exception:
-                pass
-        return None
-
-    def load_memory_context(self, query: str, app_package: str = "") -> str:
-        results = self.query(query, app_package=app_package, top_k=5)
-        if not results:
-            return ""
-        return "\n".join(f"- {r['content']}" for r in results)
-
-    # ── 元素身份知识 (ChromaDB) ──
-
-    def save_element_knowledge(self, app_package: str, page: str,
-                               alias: str, role: str = "", region: str = "",
-                               resource_id: str = "", strategy: str = "",
-                               detail: str = "") -> None:
-        """保存确认过的元素身份到向量库, 供 Planner RAG 检索。
-        只存设备无关属性(resource_id/role/region), 不存 bounds 坐标。
-        """
-        parts = [f"{app_package} 的 {page} 页面中, '{alias}' 是 {role or '未知'} 类型"]
-        if region:
-            parts.append(f"位于 {region} 区域")
-        if resource_id:
-            parts.append(f"resource_id={resource_id}")
-        if strategy:
-            parts.append(f"推荐策略: {strategy}")
-        content = ", ".join(parts) + "。" + (detail or "")
-        self.save_knowledge(UIKnowledge(
-            app_package=app_package,
-            knowledge_type="element_identity",
-            content=content,
-            metadata={
-                "page": page, "alias": alias, "role": role,
-                "region": region, "resource_id": resource_id,
-                "strategy": strategy,
-                "timestamp": datetime.now().isoformat(),
-            },
-        ))
-
-    def query_element_knowledge(self, app_package: str, query: str,
-                                top_k: int = 5) -> list[dict[str, Any]]:
-        """查询元素身份知识。"""
-        return self.query(
-            query, app_package=app_package,
-            knowledge_type="element_identity", top_k=top_k,
-        )
-
     # ── 验证计划 (ChromaDB) ──
 
     def save_verified_plan(self, app_package: str, user_request: str,
                            plan: list[dict[str, Any]],
                            results: list[dict[str, Any]]) -> None:
         """保存验证计划到向量库, 供下次 Planner RAG 检索。"""
-        success_targets = [s.get("target", "") for s in results if s.get("status") == "success"]
-        fail_targets = [s.get("target", "") for s in results if s.get("status") != "success"]
+        # P6.1 去重：已有相似计划则跳过
+        existing = self.query_verified_plan(app_package, user_request, top_k=1)
+        if existing:
+            return
+        success_targets = [s.get("intent", "")[:30] for s in results if s.get("status") == "success"]
+        fail_targets = [s.get("intent", "")[:30] for s in results if s.get("status") != "success"]
         steps_desc = "; ".join(
             f"步骤{s.get('index')}: {s.get('intent')}({s.get('action_type')}->{s.get('target')})"
             for s in plan
@@ -221,14 +171,42 @@ class KnowledgeBase:
             top_k=top_k,
         )
 
+    # ── App 前提条件 (app_precondition) ──
+
+    def save_precondition(self, app_package: str, rule: str) -> None:
+        """保存 App 特定的操作前提条件，如'计算器需先清空输入区'。"""
+        existing = self.query("", app_package=app_package,
+                            knowledge_type="app_precondition", top_k=5)
+        if any(e.get("content", "") == rule for e in existing):
+            return  # P6.1 去重：已有相同规则则跳过
+        self.save_knowledge(UIKnowledge(
+            app_package=app_package,
+            knowledge_type="app_precondition",
+            content=rule,
+            metadata={"timestamp": datetime.now().isoformat()},
+        ))
+
+    def query_preconditions(self, app_package: str, top_k: int = 3) -> str:
+        """查询 App 的操作前提条件，返回拼接后的规则文本。"""
+        results = self.query("", app_package=app_package,
+                           knowledge_type="app_precondition", top_k=top_k)
+        if not results:
+            return ""
+        return "\n".join(f"- {r['content']}" for r in results)
+
     @property
     def count(self) -> int:
         return self.backend.count()
 
 
-def build_rag_enhanced_prompt(base_prompt: str, knowledge_base: KnowledgeBase,
-                              app_package: str) -> str:
-    context = knowledge_base.get_app_context(app_package)
-    if not context:
-        return base_prompt
-    return f"{base_prompt}\n\n## 已有 APP 知识\n{context}\n\n以当前页面实际状态为准。"
+def _extract_labels_from_observation(observation: str) -> list[str]:
+    """从 observation 文本中提取元素标签。"""
+    labels: list[str] = []
+    for line in observation.split("\n"):
+        for m in __import__("re").finditer(r"label='([^']+)'", line):
+            labels.append(m.group(1))
+        for m in __import__("re").finditer(r'click\("([^"]+)"\)', line):
+            labels.append(m.group(1))
+    return list(dict.fromkeys(labels))[:20]
+
+

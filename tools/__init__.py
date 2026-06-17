@@ -466,7 +466,11 @@ def query_app_knowledge(query: str, app_package: str = "") -> str:
     if not ctx.knowledge_base:
         return "未启用知识库"
     package = app_package or ctx.device.current_app().get("package", "")
-    return str(ctx.knowledge_base.query(query, app_package=package))
+    results = ctx.knowledge_base.query(query, app_package=package)
+    if not results:
+        return f"未找到 '{query}' 的相关知识"
+    lines = [f"[{r.get('metadata',{}).get('knowledge_type','')}] {r['content']}" for r in results]
+    return "\n".join(lines)
 
 
 @tool
@@ -479,12 +483,19 @@ def query_element_identity(alias: str, app_package: str = "") -> str:
         sig = ctx.perceiver.screen_signature()[:16] if ctx.perceiver else ""
     except Exception:
         pass
-    from data import create_relational_db
-    from config import TestConfig
+    # P6.3: 延迟导入避免循环依赖 (tools -> graph -> tools)
+    db = None
+    try:
+        from agents.graph import _relational_db as _gdb
+        db = _gdb
+    except ImportError:
+        pass
+    if db is None:
+        from data import create_relational_db
+        from config import TestConfig
+        db = create_relational_db(TestConfig())
 
     try:
-        cfg = TestConfig()
-        db = create_relational_db(cfg)
         rows = db.query_element_identity(package, alias, sig)
         if not rows:
             return f"No known identity for '{alias}' on {package}"
@@ -523,8 +534,9 @@ def click(label: str, alternatives: str = "") -> str:
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
 
-    # 记录点击前页面状态（用于 KB 页面流转记录）
+    # 记录点击前页面标题（用于操作后状态对比）
     _pre_page = _capture_page_id(ctx)
+    _pre_title = _pre_page  # 保存给 _post_click_snapshot 用
 
     # 收集所有待搜索的目标（label + alternatives 逗号分隔）
     alt_list = [a.strip() for a in (alternatives or "").split(",") if a.strip()]
@@ -535,6 +547,9 @@ def click(label: str, alternatives: str = "") -> str:
     if ctx.perceiver is not None:
         try:
             understanding = ctx.perceiver.perceive()
+            # 更新 _pre_title 为更精确的页面标识
+            act = understanding.activity.split(".")[-1] if understanding.activity else "?"
+            _pre_title = act + "「" + (understanding.page_title or "") + "」" if understanding.page_title else act
         except Exception as exc:
             logger.warning("click: perceive failed | %s", exc)
             understanding = None
@@ -553,38 +568,42 @@ def click(label: str, alternatives: str = "") -> str:
             except Exception as exc:
                 logger.warning("click: search failed for %r | %s", target, exc)
 
+    def _with_snapshot(base_result: str) -> str:
+        """为成功的点击结果追加操作后页面状态。"""
+        snap = _post_click_snapshot(ctx, _pre_title, label)
+        return f"{base_result} | {snap}" if snap else base_result
+
     if best_el is not None:
         role = getattr(best_el, "role", "")
         # 开关类控件直接用 bounds 点击（避免 click_text 误点到导航项）
         if role in ("switch", "switch_row"):
             old_checked = getattr(best_el, "checked", None)
             ctx.device.click_bounds(best_el.bounds)
-            # 点击后等待短暂时间再验证开关状态
             time.sleep(1.0)
             new_checked = _check_switch_state(ctx, best_el)
             if new_checked is not None:
                 state_cn = "开启" if new_checked else "关闭"
                 result = _format_click_log(matched_label, best_el, strategy="bounds") + f" | 开关状态: {state_cn}"
-                _record_page_transition(ctx, _pre_page, label)
-                return result
+            else:
+                result = _format_click_log(matched_label, best_el, strategy="bounds")
             _record_page_transition(ctx, _pre_page, label)
-            return _format_click_log(matched_label, best_el, strategy="bounds")
+            return _with_snapshot(result)
         # 其他可点击元素 — resource_id > text > bounds（rid 唯一稳定，优先）
         if best_el.resource_id and ctx.device.click_resource_id(best_el.resource_id):
             _record_page_transition(ctx, _pre_page, label)
-            return _format_click_log(matched_label, best_el, strategy="resource_id")
+            return _with_snapshot(_format_click_log(matched_label, best_el, strategy="resource_id"))
         if best_el.text and ctx.device.click_text(best_el.text):
             _record_page_transition(ctx, _pre_page, label)
-            return _format_click_log(matched_label, best_el, strategy="text")
+            return _with_snapshot(_format_click_log(matched_label, best_el, strategy="text"))
         if best_el.bounds != (0, 0, 0, 0):
             ctx.device.click_bounds(best_el.bounds)
             _record_page_transition(ctx, _pre_page, label)
-            return _format_click_log(matched_label, best_el, strategy="bounds")
+            return _with_snapshot(_format_click_log(matched_label, best_el, strategy="bounds"))
 
     # 兜底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):
         _record_page_transition(ctx, _pre_page, label)
-        return f"已点击: {label} (strategy=text-fallback)"
+        return _with_snapshot(f"已点击: {label} (strategy=text-fallback)")
     # 历史身份兜底
     if not known_ids:
         known_ids = _query_known_identities(label)
@@ -593,7 +612,7 @@ def click(label: str, alternatives: str = "") -> str:
         if rid and ctx.device.click_resource_id(rid):
             _clicked = True
             _record_page_transition(ctx, _pre_page, label)
-            return f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)"
+            return _with_snapshot(f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)")
     # 百分比 bounds 兜底
     for known in known_ids:
         converted = known.get("bounds_converted")
@@ -609,12 +628,13 @@ def click(label: str, alternatives: str = "") -> str:
                 ctx.device.click_bounds(bounds)
                 _clicked = True
                 _record_page_transition(ctx, _pre_page, label)
-                return (f"已点击历史坐标: {label} "
-                        f"bounds=({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) "
-                        f"(strategy=pct-bounds-fallback)")
+                return _with_snapshot(
+                    f"已点击历史坐标: {label} "
+                    f"bounds=({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) "
+                    f"(strategy=pct-bounds-fallback)")
     if ctx.device.click_resource_id(label):
         _record_page_transition(ctx, _pre_page, label)
-        return f"已点击资源: {label} (strategy=rid-fallback)"
+        return _with_snapshot(f"已点击资源: {label} (strategy=rid-fallback)")
     return f"未找到可点击元素: {label}"
 
 
@@ -682,6 +702,39 @@ def _capture_page_id(ctx: Any) -> str:
             title = getattr(understanding, "page_title", "") or ""
             return f"{act}「{title}」" if title else act
         return act
+    except Exception:
+        return ""
+
+
+def _post_click_snapshot(ctx: Any, pre_title: str, label: str) -> str:
+    """点击后快速感知页面变化，返回简洁状态变化描述。"""
+    if ctx.perceiver is None:
+        return ""
+    try:
+        # 短暂等待让 UI 刷新完成
+        time.sleep(0.3)
+        u = ctx.perceiver.perceive()
+        act = u.activity.split(".")[-1] if u.activity else "?"
+        post_title = act + "「" + (u.page_title or "") + "」" if u.page_title else act
+        lines = [f"操作后页面: {post_title}"]
+        if pre_title and post_title != pre_title:
+            lines.append(f"页面变化: {pre_title} → {post_title}")
+        # 收集可点击元素 + 含数字的叶子节点（计算器显示、设置值等）
+        clickables = [e for e in u.elements if e.clickable and e.label]
+        text_leaves = [e for e in u.elements
+                       if not e.clickable and e.text
+                       and any(c.isdigit() for c in (e.text or ""))
+                       and e.role not in ("container", "text")
+                       and len(e.text or "") < 20]
+        nearby = (clickables + text_leaves)[:15]
+        value_hints = []
+        for e in nearby:
+            txt = e.text or ""
+            if txt and any(c.isdigit() for c in txt) and len(txt) < 20:
+                value_hints.append(f"{e.label or ''}:{txt}".strip(":"))
+        if value_hints:
+            lines.append(f"关键值: {', '.join(value_hints[:5])}")
+        return " | ".join(lines)
     except Exception:
         return ""
 

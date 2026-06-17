@@ -41,3 +41,8 @@ apps:
   package: com.zui.calculator
   keywords:
   - 联想计算器
+- name: 谷歌计算器
+  package: com.google.android.calculator
+  keywords:
+  - google计算器
+  - ROW计算器
