@@ -416,7 +416,7 @@
   <el-dialog v-model="kbDialogVisible" title="新增知识" width="560px" :close-on-click-modal="false">
     <el-form :model="kbForm" label-width="90px" style="padding-right:12px">
       <el-form-item label="应用包名" required>
-        <el-input v-model="kbForm.app_package" placeholder="如: com.android.settings" />
+        <el-input v-model="kbForm.app_package" :placeholder="kbForm.knowledge_type === 'curated_rule' ? '留空表示全局知识' : '如: com.android.settings'" />
       </el-form-item>
       <el-form-item label="知识类型" required>
         <el-select v-model="kbForm.knowledge_type" style="width:100%" placeholder="请选择">
@@ -644,29 +644,33 @@ const kbDialogVisible = ref(false);
 const kbDetailVisible = ref(false);
 const kbDetailRow = ref(null);
 const kbSaving = ref(false);
-const kbForm = ref({ app_package: '', knowledge_type: 'test_experience', content: '' });
+const kbForm = ref({ app_package: '', knowledge_type: 'experience', content: '' });
 const kbTypes = [
-  { value: 'page_structure', label: '页面结构' },
-  { value: 'navigation_path', label: '导航路径' },
-  { value: 'test_experience', label: '测试经验' },
-  { value: 'element_identity', label: '元素身份' },
+  { value: 'experience', label: '操作经验' },
   { value: 'verified_plan', label: '验证计划' },
-  { value: 'app_precondition', label: 'App前提条件' },
+  { value: 'curated_rule', label: '人工知识' },
 ];
 const kbTypeColorMap = {
-  page_structure: 'info',
-  navigation_path: 'success',
-  test_experience: 'warning',
-  element_identity: 'primary',
+  experience: 'warning',
   verified_plan: 'danger',
-  app_precondition: 'danger',
+  curated_rule: 'success',
+};
+// 旧类型兼容映射（前端显示用）
+const _legacyTypeMap = {
+  page_structure: 'experience',
+  navigation_path: 'experience',
+  test_experience: 'experience',
+  app_precondition: 'curated_rule',
+  global_knowledge: 'curated_rule',
 };
 function kbTypeLabel(type) {
-  const t = kbTypes.find(x => x.value === type);
+  const resolved = _legacyTypeMap[type] || type;
+  const t = kbTypes.find(x => x.value === resolved);
   return t ? t.label : (type || '未知');
 }
 function kbTypeColor(type) {
-  return kbTypeColorMap[type] || 'info';
+  const resolved = _legacyTypeMap[type] || type;
+  return kbTypeColorMap[resolved] || 'info';
 }
 
 function toggleStepDetail(index) {
@@ -1325,12 +1329,14 @@ function resetKbFilter() {
 }
 
 function openKbDialog() {
-  kbForm.value = { app_package: '', knowledge_type: 'test_experience', content: '' };
+  kbForm.value = { app_package: '', knowledge_type: 'experience', content: '' };
   kbDialogVisible.value = true;
 }
 
 async function saveKb() {
-  if (!kbForm.value.app_package.trim()) { ElMessage.warning('请输入应用包名'); return; }
+  if (!kbForm.value.app_package.trim() && kbForm.value.knowledge_type !== 'curated_rule') {
+    ElMessage.warning('请输入应用包名'); return;
+  }
   if (!kbForm.value.content.trim()) { ElMessage.warning('请输入知识内容'); return; }
   kbSaving.value = true;
   try {

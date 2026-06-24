@@ -461,16 +461,25 @@ def _score_known_identity(el: Any, known_ids: list[dict[str, Any]]) -> int:
 
 @tool
 def query_app_knowledge(query: str, app_package: str = "") -> str:
-    """Query app page structure, navigation paths, and test experience."""
+    """Query operation experience and curated rules for the given app."""
     ctx = get_tool_context()
     if not ctx.knowledge_base:
         return "未启用知识库"
     package = app_package or ctx.device.current_app().get("package", "")
-    results = ctx.knowledge_base.query(query, app_package=package)
-    if not results:
-        return f"未找到 '{query}' 的相关知识"
-    lines = [f"[{r.get('metadata',{}).get('knowledge_type','')}] {r['content']}" for r in results]
-    return "\n".join(lines)
+
+    exp_results = ctx.knowledge_base.query(query, app_package=package,
+                                           knowledge_type="experience", top_k=5)
+    rule_text = ctx.knowledge_base.query_curated_rules(package, top_k=3)
+
+    parts = []
+    if exp_results:
+        parts.append("## 操作经验")
+        parts.extend(f"- {r['content']}" for r in exp_results)
+    if rule_text:
+        parts.append("## 人工知识")
+        parts.append(rule_text)
+
+    return "\n".join(parts) if parts else f"未找到 '{query}' 的相关知识"
 
 
 @tool
@@ -749,11 +758,12 @@ def _record_page_transition(ctx: Any, pre_page: str, label: str) -> None:
             kb = ctx.knowledge_base
             if kb:
                 app_pkg = ctx.device.current_app().get("package", "")
-                kb.save_navigation_path(
+                kb.save_experience(
                     app_package=app_pkg,
-                    from_page=pre_page,
+                    page=pre_page,
+                    action=f"click({label})",
                     to_page=post_page,
-                    via_action=f"click({label})",
+                    outcome="成功",
                 )
                 logger.info("KB page transition: %s → %s (click %r)", pre_page, post_page, label)
     except Exception as exc:

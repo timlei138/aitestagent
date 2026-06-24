@@ -120,10 +120,8 @@ async def get_knowledge_types():
     return {
         "status": "success",
         "types": [
-            {"value": "page_structure", "label": "页面结构"},
-            {"value": "navigation_path", "label": "导航路径"},
-            {"value": "test_experience", "label": "测试经验"},
-            {"value": "element_identity", "label": "元素身份"},
+            {"value": "experience", "label": "操作经验"},
             {"value": "verified_plan", "label": "验证计划"},
+            {"value": "curated_rule", "label": "人工知识"},
         ],
     }

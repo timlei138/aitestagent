@@ -256,25 +256,25 @@ def _llm_cfg(cfg: TestConfig):
 
 
 def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
-    """查询 RAG 获取 App 上下文：前提条件 + 验证计划 + 导航经验。"""
+    """查询 RAG 获取上下文：人工知识 + 验证计划 + 操作经验。"""
     if not kb:
         return ""
     parts = []
-    # 1. App 前提条件（如"计算器需先清空"）
-    pre = kb.query_preconditions(app_package)
-    if pre:
-        parts.append("## App 操作前提\n" + pre)
-    # 2. 历史验证计划（同 App 同需求优先）
+    # 1. 人工知识（一次查询，Python 侧自动分组为全局知识 + App 操作前提）
+    rules = kb.query_curated_rules(app_package)
+    if rules:
+        parts.append("## 人工知识\n" + rules)
+    # 2. 历史验证计划（不变）
     plans = kb.query_verified_plan(app_package, user_request, top_k=2)
     if plans:
         parts.append(
             "## 历史验证计划\n" + "\n".join(f"- {p['content']}" for p in plans)
         )
-    # 3. 导航经验（用 user_request 动态查询）
+    # 3. 操作经验（替代原导航经验，覆盖更广）
     if user_request:
-        nav = kb.query_navigation(app_package, user_request[:50], top_k=2)
-        if nav:
-            parts.append("## 导航经验\n" + "\n".join(f"- {n['content']}" for n in nav))
+        exp = kb.query_experience(app_package, user_request[:50], top_k=3)
+        if exp:
+            parts.append("## 操作经验\n" + "\n".join(f"- {e['content']}" for e in exp))
     return "\n\n".join(parts)
 
 
@@ -395,13 +395,13 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         )
     )
 
-    # 根据 Goal 复杂度动态计算 max_turns：基础 6 + 每页面 3 + 每验证项 2，上限 30
+    # 根据 Goal 复杂度动态计算 max_turns：基础 18 + 每页面 4 + 每验证项 4
     _goal_turns = (
         18
-        + len(goal.get("target_pages", [])) * 4
-        + len(goal.get("verification", [])) * 4
+        + len(goal.get("target_pages", [])) * 10
+        + len(goal.get("verification", [])) * 10
     )
-    _max_turns = min(max(_goal_turns, 8), 30)  # 最少 8，最多 30
+    _max_turns = min(max(_goal_turns, 10), 200)  # 最少 10，最多 200
 
     result = _run_agent(
         msgs,

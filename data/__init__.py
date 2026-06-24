@@ -3,21 +3,20 @@ from __future__ import annotations
 import logging
 
 from config import TestConfig
-from data.vector_store import VectorStoreBackend, MemoryBackend, ChromaBackend
+from data.vector_store import VectorStoreBackend, ChromaBackend
 from data.relational import RelationalBackend, SqliteBackend
 
 logger = logging.getLogger(__name__)
 
 
 def create_vector_store(config: TestConfig) -> VectorStoreBackend:
-    """工厂：根据配置创建向量存储后端。
-    注意: HuggingFace 模式不需要 api_key，不能用 api_key 作为启用条件。
-    """
-    # HuggingFace 模式不依赖 api_key； OpenAI 模式需要 api_key
+    """工厂：根据配置创建向量存储后端（仅 ChromaDB，强制要求向量数据库）。"""
     embedding_provider = getattr(config, "embedding_provider", "huggingface")
     if embedding_provider == "openai" and not (getattr(config, "embedding_api_key", None) or config.api_key):
-        logger.warning("OpenAI embedding requires api_key, falling back to MemoryBackend")
-        return MemoryBackend()
+        raise RuntimeError(
+            "OpenAI embedding requires api_key. "
+            "请在 config.yaml 中配置 embedding_api_key 或 api_key。"
+        )
     try:
         return ChromaBackend(
             persist_dir=config.rag_persist_dir,
@@ -27,12 +26,10 @@ def create_vector_store(config: TestConfig) -> VectorStoreBackend:
             base_url=getattr(config, "embedding_base_url", None),
         )
     except Exception as exc:
-        logger.warning(
-            "ChromaDB init failed: %s, falling back to MemoryBackend. "
-            "Hint: 如使用 huggingface, 请 pip install langchain-huggingface sentence-transformers",
-            exc
-        )
-    return MemoryBackend()
+        raise RuntimeError(
+            f"ChromaDB 初始化失败: {exc}. "
+            "Hint: 如使用 huggingface, 请 pip install langchain-huggingface sentence-transformers"
+        ) from exc
 
 
 def create_relational_db(config: TestConfig) -> RelationalBackend:
@@ -41,7 +38,7 @@ def create_relational_db(config: TestConfig) -> RelationalBackend:
 
 
 __all__ = [
-    "VectorStoreBackend", "MemoryBackend", "ChromaBackend",
+    "VectorStoreBackend", "ChromaBackend",
     "RelationalBackend", "SqliteBackend",
     "create_vector_store", "create_relational_db",
 ]

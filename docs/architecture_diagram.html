@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AI 自动化测试 Agent — 组件架构图</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; background: #f5f6fa; padding: 30px 20px; }
+  h1 { text-align: center; color: #1a1a2e; font-size: 26px; margin-bottom: 4px; }
+  .subtitle { text-align: center; color: #888; font-size: 13px; margin-bottom: 24px; }
+
+  .main { display: flex; justify-content: center; max-width: 900px; margin: 0 auto; }
+
+  /* 主流程 */
+  .flow { flex: 1; max-width: 900px; }
+
+  /* 大层框 */
+  .big-layer {
+    border-radius: 10px; padding: 12px 16px 14px; margin-bottom: 0;
+    border: 2.5px solid; position: relative;
+  }
+  .big-layer .layer-header {
+    font-size: 14px; font-weight: bold; margin-bottom: 8px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .big-layer .layer-header .num {
+    width: 22px; height: 22px; border-radius: 50%;
+    color: #fff; font-size: 12px; display: flex;
+    align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .big-layer .layer-header .name { flex: 1; }
+  .big-layer .layer-header .tag {
+    font-size: 10px; padding: 2px 8px; border-radius: 10px;
+    color: #fff; font-weight: normal;
+  }
+
+  /* 内部小模块 */
+  .modules { display: flex; flex-wrap: wrap; gap: 6px; }
+  .mod {
+    background: rgba(255,255,255,0.85); border-radius: 6px;
+    padding: 6px 12px; font-size: 12px; border: 1px solid rgba(0,0,0,0.12);
+    line-height: 1.4;
+  }
+  .mod b { color: #333; }
+  .mod.primary { background: rgba(255,255,255,0.95); font-weight: bold; border-width: 1.5px; }
+  .mod.sub { font-size: 11px; color: #555; }
+
+  /* 层颜色 */
+  .layer-ui { background: #e8f5e9; border-color: #4caf50; }
+  .layer-ui .num, .layer-ui .tag { background: #4caf50; }
+  .layer-core { background: #fff3e0; border-color: #ff9800; }
+  .layer-core .num, .layer-core .tag { background: #ff9800; }
+  .layer-exec { background: #f3e5f5; border-color: #9c27b0; }
+  .layer-exec .num, .layer-exec .tag { background: #9c27b0; }
+  .layer-target { background: #eceff1; border-color: #607d8b; }
+  .layer-target .num, .layer-target .tag { background: #607d8b; }
+  .layer-data { background: #e8eaf6; border-color: #5c6bc0; }
+  .layer-data .num, .layer-data .tag { background: #5c6bc0; }
+
+  /* 箭头 */
+  .arrow {
+    text-align: center; padding: 4px 0; color: #999; font-size: 11px;
+    line-height: 1.2;
+  }
+  .arrow .icon { font-size: 16px; display: block; }
+
+  /* 图例 */
+  .legend {
+    max-width: 900px; margin: 20px auto 0;
+    display: flex; flex-wrap: wrap; gap: 14px; justify-content: center;
+    font-size: 11px; color: #666;
+  }
+  .legend .l { display: flex; align-items: center; gap: 5px; }
+  .legend .l .d { width: 10px; height: 10px; border-radius: 50%; }
+
+  /* 调用顺序标注 */
+  .flow-order {
+    position: absolute; right: -8px; top: 50%; transform: translateY(-50%);
+    font-size: 18px; color: #bbb;
+  }
+</style>
+</head>
+<body>
+
+<h1>AI 自动化测试 Agent — 组件架构图</h1>
+<p class="subtitle">基于 LangChain + LangGraph · 数字表示调用顺序 · ↓ 请求方向 ↑ 结果方向</p>
+
+<div class="main">
+  <!-- 主流程 -->
+  <div class="flow">
+
+    <!-- ① 用户交互层 -->
+    <div class="big-layer layer-ui">
+      <div class="layer-header">
+        <div class="num">1</div>
+        <div class="name">用户交互层</div>
+        <div class="tag">FRONTEND + API</div>
+      </div>
+      <div class="modules">
+        <div class="mod primary">Vue 3 工作台</div>
+        <div class="mod">报告中心</div>
+        <div class="mod">知识库管理</div>
+        <div class="mod">实时投屏</div>
+        <div class="mod primary">FastAPI Server</div>
+        <div class="mod">WebSocket 管理</div>
+        <div class="mod sub">REST API 路由</div>
+      </div>
+    </div>
+
+    <div class="arrow">
+      <span class="icon">↓</span>
+      测试请求
+    </div>
+
+    <!-- ② TestOrchestrator 总入口 -->
+    <div class="big-layer" style="background:#fbe9e7; border-color:#d84315;">
+      <div class="layer-header">
+        <div class="num" style="background:#d84315;">2</div>
+        <div class="name">TestOrchestrator — 测试编排总入口</div>
+        <div class="tag" style="background:#d84315;">ORCHESTRATOR</div>
+      </div>
+      <div style="font-size:11px; color:#bf360c; margin-bottom:8px;">
+        🎯 生命周期管理（启动/暂停/恢复/结束）· 中断处理 · 节点注册 · 入口调度
+      </div>
+      <!-- AI 核心层（内嵌） -->
+      <div style="background:rgba(255,152,0,0.1); border:2px solid #ff9800; border-radius:8px; padding:10px 14px;">
+        <div style="font-weight:bold; font-size:13px; color:#e65100; margin-bottom:8px;">🧠 AI 核心层</div>
+        <div class="modules">
+          <!-- LangGraph 大框 -->
+          <div style="background:rgba(255,152,0,0.15); border:1.5px solid #ff9800; border-radius:8px; padding:8px 12px; flex:1; min-width:260px;">
+            <div style="font-weight:bold; font-size:12px; color:#e65100; margin-bottom:6px;">🔀 LangGraph — 状态图引擎</div>
+            <div style="display:flex; flex-wrap:wrap; gap:5px;">
+              <div class="mod sub" style="border-color:#ff9800;" title="定义节点和边，构建执行流程图">StateGraph 节点注册</div>
+              <div class="mod sub" style="border-color:#ff9800;" title="节点返回值，指定下一节点 + 更新状态">Command 节点返回</div>
+              <div class="mod sub" style="border-color:#ff9800;" title="暂停等待用户确认/编辑">interrupt() 人机交互</div>
+              <div class="mod sub" style="border-color:#ff9800;" title="保存图状态，支持中断恢复">MemorySaver 状态持久化</div>
+            </div>
+          </div>
+          <!-- LangChain 大框 -->
+          <div style="background:rgba(233,30,99,0.1); border:1.5px solid #e91e63; border-radius:8px; padding:8px 12px; flex:1; min-width:260px;">
+            <div style="font-weight:bold; font-size:12px; color:#880e4f; margin-bottom:6px;">🔗 LangChain — LLM 应用框架</div>
+            <div style="display:flex; flex-wrap:wrap; gap:5px;">
+              <div class="mod sub" style="border-color:#e91e63;" title="统一接口调用不同 LLM">ChatOpenAI 模型调用</div>
+              <div class="mod sub" style="border-color:#e91e63;" title="将 18 个工具绑定到 LLM">bind_tools() 工具绑定</div>
+              <div class="mod sub" style="border-color:#e91e63;" title="执行 LLM 返回的工具调用">ToolNode 工具执行</div>
+              <div class="mod sub" style="border-color:#e91e63;" title="Planner/Agent 的结构化提示词">PromptTemplate 提示词</div>
+              <div class="mod sub" style="border-color:#e91e63;" title="判断继续调用工具还是结束">tools_condition 路由</div>
+            </div>
+          </div>
+          <!-- LLM 服务 -->
+          <div class="mod primary" style="border-color:#ffa000; width:100%;">
+            <b>🤖 LLM 服务</b> — DeepSeek V4 Pro (推理) · 智谱 GLM (Vision 截图) · BGE (Embedding 向量化)
+          </div>
+          <!-- KnowledgeBase 大框 -->
+          <div style="background:rgba(92,107,192,0.12); border:1.5px solid #5c6bc0; border-radius:8px; padding:8px 12px; width:100%;">
+            <div style="font-weight:bold; font-size:12px; color:#283593; margin-bottom:6px;">📚 KnowledgeBase — 知识管理封装层</div>
+            <div style="display:flex; flex-wrap:wrap; gap:5px;">
+              <div class="mod sub" style="border-color:#5c6bc0;" title="向量数据库，存储和检索语义相似内容">ChromaDB 向量存储</div>
+              <div class="mod sub" style="border-color:#5c6bc0;" title="关系型数据库，记录测试历史">SQLite 关系存储</div>
+              <div class="mod sub" style="border-color:#5c6bc0;" title="统一向量/关系存储的抽象接口">VectorStoreBackend 抽象</div>
+              <div class="mod sub" style="border-color:#5c6bc0;" title="本地模型，文本转向量">HuggingFace Embedding</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow">
+      <span class="icon">↓ ↑</span>
+      tool_calls ↓ / 执行结果 ↑
+    </div>
+
+    <!-- ③ 工具执行层 -->
+    <div class="big-layer layer-exec">
+      <div class="layer-header">
+        <div class="num">3</div>
+        <div class="name">设备控制层</div>
+        <div class="tag">DEVICE CONTROL</div>
+      </div>
+      <div class="modules">
+        <div class="mod primary" style="border-color:#00bcd4;">DeviceController<br><span style="font-weight:normal; font-size:11px;">uiautomator2 封装 · 点击/滑动/输入/按键</span></div>
+        <div class="mod primary" style="border-color:#00bcd4;">SmartPerceiver<br><span style="font-weight:normal; font-size:11px;">UI 树解析 · 语义搜索 · 截图分析</span></div>
+        <div class="mod sub" style="border-color:#00bcd4;">ADB 连接 · 元素定位 · 页面状态获取</div>
+      </div>
+    </div>
+
+    <div class="arrow">
+      <span class="icon">↕</span>
+      ADB 指令
+    </div>
+
+    <!-- ④ 目标设备 -->
+    <div class="big-layer layer-target">
+      <div class="layer-header">
+        <div class="num">4</div>
+        <div class="name">目标设备</div>
+        <div class="tag">ANDROID</div>
+      </div>
+      <div class="modules">
+        <div class="mod">物理设备 / 模拟器</div>
+        <div class="mod">Android 12+ · ARM64</div>
+        <div class="mod">App UI 界面运行</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- 图例 -->
+<div class="legend">
+  <div class="l"><div class="d" style="background:#4caf50;"></div> ① 用户交互层</div>
+  <div class="l"><div class="d" style="background:#d84315;"></div> ② TestOrchestrator (总入口) → AI 核心层 (LangGraph + LangChain + KnowledgeBase + LLM)</div>
+  <div class="l"><div class="d" style="background:#9c27b0;"></div> ③ 设备控制层 (DeviceController + SmartPerceiver)</div>
+  <div class="l"><div class="d" style="background:#607d8b;"></div> ④ 目标设备 (Android)</div>
+</div>
+
+</body>
+</html>

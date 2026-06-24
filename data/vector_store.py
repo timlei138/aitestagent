@@ -27,13 +27,13 @@ class VectorStoreBackend(ABC):
 
     @abstractmethod
     def search(
-        self, query: str, filter: dict[str, str] | None = None, top_k: int = 5
+        self, query: str, filter: dict[str, Any] | None = None, top_k: int = 5
     ) -> list[dict[str, Any]]:
         """相似度搜索，返回 [{content, metadata, score}, ...]。"""
         ...
 
     @abstractmethod
-    def delete(self, filter: dict[str, str]) -> int:
+    def delete(self, filter: dict[str, Any]) -> int:
         """按条件删除知识，返回删除条数。"""
         ...
 
@@ -41,51 +41,6 @@ class VectorStoreBackend(ABC):
     def count(self) -> int:
         """返回知识总数。"""
         ...
-
-
-class MemoryBackend(VectorStoreBackend):
-    """纯内存实现 —— 无 embedding 依赖，仅做关键词匹配。"""
-
-    def __init__(self):
-        self._items: list[dict[str, Any]] = []
-
-    def add(self, content: str, metadata: dict[str, Any]) -> None:
-        self._items.append({"content": content, "metadata": dict(metadata)})
-
-    def search(self, query: str, filter: dict[str, str] | None = None, top_k: int = 5) -> list[dict[str, Any]]:
-        candidates = self._filtered(filter)
-        query_lower = query.lower()
-        scored: list[tuple[int, dict[str, Any]]] = []
-        for item in candidates:
-            score = 0
-            content_lower = item["content"].lower()
-            for word in query_lower.split():
-                if word in content_lower:
-                    score += 1
-            if score > 0:
-                scored.append((score, item))
-        scored.sort(key=lambda x: -x[0])
-        return [{"content": s["content"], "metadata": s["metadata"], "score": float(sc)}
-                for sc, s in scored[:top_k]]
-
-    def delete(self, filter: dict[str, str]) -> int:
-        before = len(self._items)
-        self._items = [i for i in self._items if not self._match(i, filter)]
-        return before - len(self._items)
-
-    def count(self) -> int:
-        return len(self._items)
-
-    def _filtered(self, filter: dict[str, str] | None) -> list[dict[str, Any]]:
-        if not filter:
-            return list(self._items)
-        return [i for i in self._items if self._match(i, filter)]
-
-    def _match(self, item: dict, filter: dict[str, str]) -> bool:
-        return all(
-            str(item.get("metadata", {}).get(k, "")).lower() == str(v).lower()
-            for k, v in filter.items()
-        )
 
 
 class ChromaBackend(VectorStoreBackend):
@@ -125,13 +80,28 @@ class ChromaBackend(VectorStoreBackend):
         from langchain_core.documents import Document
         self._store.add_documents([Document(page_content=content, metadata=metadata)])
 
-    def _to_chroma_filter(self, filter: dict[str, str]) -> dict[str, Any]:
-        """将多 key 简单过滤转为 ChromaDB 兼容的 $and 格式。"""
-        if len(filter) <= 1:
-            return filter
-        return {"$and": [{k: v} for k, v in filter.items()]}
+    def _to_chroma_filter(self, filter: dict[str, Any]) -> dict[str, Any]:
+        """将多 key 简单过滤转为 ChromaDB 兼容的 $and / $or 格式。
 
-    def search(self, query: str, filter: dict[str, str] | None = None, top_k: int = 5) -> list[dict[str, Any]]:
+        关键：当 filter 同时含普通字段（如 app_package）和复合操作符（$or/$and）时，
+        ChromaDB 要求必须用 $and 包裹，不能直接透传 flat dict。
+        例如 {"app_package":"x", "$or":[...]} 必须转为 {"$and":[{"app_package":"x"},{"$or":[...]}]}
+        """
+        has_compound = "$or" in filter or "$and" in filter
+        if not has_compound:
+            if len(filter) <= 1:
+                return filter
+            return {"$and": [{k: v} for k, v in filter.items()]}
+
+        # 有 $or/$and + 普通字段 → 需要包成 $and
+        plain = {k: v for k, v in filter.items() if not k.startswith("$")}
+        compound = {k: v for k, v in filter.items() if k.startswith("$")}
+        parts = [{k: v} for k, v in plain.items()] + [{k: v} for k, v in compound.items()]
+        if len(parts) == 1:
+            return parts[0]
+        return {"$and": parts}
+
+    def search(self, query: str, filter: dict[str, Any] | None = None, top_k: int = 5) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {"k": top_k}
         if filter:
             kwargs["filter"] = self._to_chroma_filter(filter)
@@ -141,7 +111,7 @@ class ChromaBackend(VectorStoreBackend):
             for doc, score in results
         ]
 
-    def delete(self, filter: dict[str, str]) -> int:
+    def delete(self, filter: dict[str, Any]) -> int:
         where = self._to_chroma_filter(filter)
         ids = self._store.get(where=where).get("ids", [])
         if ids:

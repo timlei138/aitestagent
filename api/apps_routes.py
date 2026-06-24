@@ -61,15 +61,21 @@ def load_app_list() -> list[dict[str, Any]]:
 
 def resolve_app(text: str) -> tuple[str, str]:
     """从用户输入文本中解析 (package, name)。
-    先按关键词匹配 YAML 中的应用，找不到则正则提取包名。
+    先按关键词匹配 YAML 中的应用（最长关键词优先），找不到则正则提取包名。
     """
     import re
     lowered = text.lower()
     apps = load_app_list()
+    best_kw_len = 0
+    best_app: tuple[str, str] = ("", "")
     for app in apps:
         for kw in (app.get("keywords") or []):
-            if kw.lower() in lowered:
-                return app.get("package", ""), app.get("name", "")
+            kw_lower = kw.lower()
+            if kw_lower in lowered and len(kw_lower) > best_kw_len:
+                best_kw_len = len(kw_lower)
+                best_app = (app.get("package", ""), app.get("name", ""))
+    if best_kw_len > 0:
+        return best_app
     # 兜底：正则提取包名
     m = re.search(r"\b[a-zA-Z][\w]*(?:\.[\w]+){2,}\b", text)
     if m:
