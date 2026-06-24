@@ -339,6 +339,11 @@ class DeviceController:
         left, top, right, bottom = bounds
         self.device.click((left + right) // 2, (top + bottom) // 2)
 
+    def long_click_bounds(self, bounds, duration: float = 0.8) -> None:
+        """长按元素（swipe 同点模拟）。"""
+        x, y = (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2
+        self.device.swipe(x, y, x, y, duration)
+
     def click_text(self, text: str, timeout: float = 2.0) -> bool:
         if self.device(text=text).exists(timeout=timeout):
             self.device(text=text).click()
@@ -357,8 +362,40 @@ class DeviceController:
     def type_text(self, text: str) -> None:
         self.device.send_keys(text, clear=True)
 
+    def paste(self) -> None:
+        """粘贴剪贴板内容（CTRL+V 系统级粘贴，无需操作弹窗）。"""
+        self.device.press("v", meta=True)
+
     def press(self, key: str) -> None:
         self.device.press(key)
 
     def swipe(self, direction: str = "up", scale: float = 0.75) -> None:
         self.device.swipe_ext(direction, scale=scale)
+
+    def unlock(self) -> None:
+        """解锁设备（swipe up 解锁，无密码时有效）。"""
+        self.device.unlock()
+
+    def screen_off(self) -> None:
+        """关闭屏幕（等同于按电源键锁屏）。"""
+        self.device.screen_off()
+
+    def screen_on(self) -> None:
+        """点亮屏幕（等同于按电源键亮屏）。"""
+        self.device.screen_on()
+
+    def set_orientation(self, orientation: str) -> None:
+        """设置屏幕方向。orientation: natural(竖屏) / left(左横屏) / right(右横屏)。"""
+        self.device.set_orientation(orientation)
+
+    def freeze_rotation(self, freeze: bool) -> None:
+        """冻结/解冻屏幕旋转。freeze=True 锁定当前方向。"""
+        self.device.freeze_rotation(freeze)
+
+    def open_notification(self) -> None:
+        """打开通知栏（系统级操作，横屏时从顶部左侧下拉获取通知）。"""
+        self.device.open_notification()
+
+    def open_quick_settings(self) -> None:
+        """打开快速设置面板（系统级操作，横屏时从顶部右侧下拉，竖屏时与通知栏同面板）。"""
+        self.device.open_quick_settings()

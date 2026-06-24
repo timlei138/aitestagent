@@ -219,7 +219,7 @@
           <button class="float-win-close" @click="deviceWindowVisible = false">×</button>
         </div>
       </div>
-      <div class="preview" ref="previewRef">
+      <div class="preview" ref="previewRef" @mousemove="onPreviewMouseMove" @mouseleave="hoveredElement = null">
         <div v-if="!deviceOnline" class="device-offline-mask">
           <div class="device-offline-content">
             <div class="device-offline-icon">📱</div>
@@ -230,6 +230,40 @@
         <canvas v-if="snapshotImage" ref="previewCanvas" class="preview-canvas" />
         <img v-if="snapshotImage" ref="previewImg" :src="'data:image/png;base64,' + snapshotImage"
              class="preview-img" @load="drawElementOverlay" />
+        <!-- 元素属性浮窗（显示全部属性） -->
+        <div v-if="hoveredElement" class="element-tooltip"
+             :style="{ left: tooltipX + 'px', top: tooltipY + 'px' }">
+          <!-- 标题：label -->
+          <div class="et-row et-label">{{ hoveredElement.label || '(无标签)' }}</div>
+          <!-- 文本内容 -->
+          <div class="et-row" v-if="hoveredElement.text"><span class="et-k">text</span><span class="et-v">{{ hoveredElement.text }}</span></div>
+          <div class="et-row" v-if="hoveredElement.content_desc"><span class="et-k">content_desc</span><span class="et-v">{{ hoveredElement.content_desc }}</span></div>
+          <div class="et-row" v-if="hoveredElement.associated_label"><span class="et-k">assoc_label</span><span class="et-v">{{ hoveredElement.associated_label }}</span></div>
+          <!-- 身份标识 -->
+          <div class="et-row"><span class="et-k">resource_id</span><span class="et-v">{{ hoveredElement.resource_id || '-' }}</span></div>
+          <div class="et-row"><span class="et-k">class_name</span><span class="et-v">{{ hoveredElement.class_name || '-' }}</span></div>
+          <div class="et-row" v-if="hoveredElement.package"><span class="et-k">package</span><span class="et-v">{{ hoveredElement.package }}</span></div>
+          <!-- 布局 -->
+          <div class="et-row"><span class="et-k">bounds</span><span class="et-v">{{ hoveredElement.bounds ? hoveredElement.bounds.join(', ') : '-' }}</span></div>
+          <div class="et-row" v-if="hoveredElement.region"><span class="et-k">region</span><span class="et-v">{{ hoveredElement.region }}</span></div>
+          <div class="et-row" v-if="hoveredElement.context_path" :title="hoveredElement.context_path"><span class="et-k">path</span><span class="et-v">{{ hoveredElement.context_path }}</span></div>
+          <!-- 分类 -->
+          <div class="et-row"><span class="et-k">role</span><span class="et-v et-badge" :class="'et-role-' + (hoveredElement.role || 'default')">{{ hoveredElement.role || '-' }}</span></div>
+          <div class="et-row" v-if="hoveredElement.priority !== undefined"><span class="et-k">priority</span><span class="et-v">{{ hoveredElement.priority }}</span></div>
+          <!-- 状态标记 -->
+          <div class="et-row et-flags">
+            <span v-if="hoveredElement.clickable" class="et-flag et-clickable">clickable</span>
+            <span v-if="!hoveredElement.clickable" class="et-flag et-disabled">not clickable</span>
+            <span v-if="hoveredElement.enabled" class="et-flag et-checked">enabled</span>
+            <span v-if="!hoveredElement.enabled" class="et-flag et-disabled">disabled</span>
+            <span v-if="hoveredElement.selected" class="et-flag et-selected">selected</span>
+            <span v-if="hoveredElement.checked === true" class="et-flag et-checked">checked</span>
+            <span v-if="hoveredElement.checked === false" class="et-flag et-disabled">unchecked</span>
+            <span v-if="hoveredElement.safe_to_click === false" class="et-flag et-disabled">unsafe</span>
+            <span v-if="hoveredElement.is_container" class="et-flag et-selected">container</span>
+            <span v-if="hoveredElement.has_switch_child" class="et-flag et-clickable">has_switch</span>
+          </div>
+        </div>
       </div>
       <div class="float-win-meta">
         <span class="float-meta-label">语义</span>
@@ -524,6 +558,9 @@ const pageSummary = ref("");
 const primaryPaths = ref([]);
 const elementList = ref([]);
 const showElementOverlay = ref(true);
+const hoveredElement = ref(null);
+const tooltipX = ref(0);
+const tooltipY = ref(0);
 const previewRef = ref(null);
 const previewImg = ref(null);
 const previewCanvas = ref(null);
@@ -1075,6 +1112,54 @@ function drawElementOverlay() {
       ctx.fillStyle = '#fff';
       ctx.fillText(label, l + 3, Math.max(0, t - 18) + 12);
     }
+  }
+}
+
+// ═══════════ 元素悬浮检测 ═══════════
+
+function onPreviewMouseMove(e) {
+  const img = previewImg.value;
+  if (!img || !img.complete) { hoveredElement.value = null; return; }
+
+  const rect = img.getBoundingClientRect();
+  const mx = e.clientX - rect.left;  // mouse X within image
+  const my = e.clientY - rect.top;   // mouse Y within image
+
+  // 映射到设备原生坐标
+  const dw = img.naturalWidth || 1080;
+  const dh = img.naturalHeight || 1920;
+  const scaleX = dw / img.clientWidth;
+  const scaleY = dh / img.clientHeight;
+  const dx = mx * scaleX;
+  const dy = my * scaleY;
+
+  // 命中检测（倒序遍历，优先匹配上层元素）
+  const elements = elementList.value || [];
+  let found = null;
+  for (let i = elements.length - 1; i >= 0; i--) {
+    const el = elements[i];
+    if (!el.bounds || el.bounds.length !== 4) continue;
+    const [l, t, r, b] = el.bounds;
+    if (dx >= l && dx <= r && dy >= t && dy <= b) {
+      found = el;
+      break;
+    }
+  }
+
+  hoveredElement.value = found;
+
+  // 浮窗定位：默认在鼠标上方，靠近顶部则放下方
+  if (found) {
+    const gap = 8;
+    const ttW = 240; // 预估浮窗宽度
+    const ttH = 340; // 全属性浮窗预估高度
+    let tx = e.clientX + gap;
+    let ty = e.clientY - ttH - gap;
+    if (ty < 10) ty = e.clientY + gap;
+    // 防超出右边界
+    if (tx + ttW > window.innerWidth - 10) tx = e.clientX - ttW - gap;
+    tooltipX.value = tx;
+    tooltipY.value = ty;
   }
 }
 

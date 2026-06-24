@@ -251,8 +251,8 @@ class SmartPerceiver:
                 is_container=is_structural and not (text or desc),
             )
 
-            # 为没有 text/desc 的可点击控件（Switch 或 clickable 容器）建立关联标签
-            if not text and not desc and clickable:
+            # 为没有 text/desc 的控件（Switch、clickable 容器、或系统弹窗等结构性容器）建立关联标签
+            if not text and not desc and (clickable or is_structural):
                 associated = self._find_associated_label(node, parent_map)
                 if associated:
                     el.associated_label = associated

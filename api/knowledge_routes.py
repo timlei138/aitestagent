@@ -42,14 +42,14 @@ class SearchRequest(BaseModel):
 # ── API ──
 
 @router.get("/count")
-async def get_count():
+def get_count():
     """获取知识库总条数。"""
     kb = _get_kb()
     return {"status": "success", "count": kb.count}
 
 
 @router.post("/search")
-async def search_knowledge(req: SearchRequest):
+def search_knowledge(req: SearchRequest):
     """语义搜索知识库。"""
     kb = _get_kb()
     results = kb.query(
@@ -62,7 +62,7 @@ async def search_knowledge(req: SearchRequest):
 
 
 @router.get("/list")
-async def list_knowledge(
+def list_knowledge(
     app_package: str = Query(default=""),
     knowledge_type: str = Query(default=""),
     query: str = Query(default="*"),
@@ -82,7 +82,7 @@ async def list_knowledge(
 
 
 @router.post("")
-async def add_knowledge(entry: KnowledgeEntry):
+def add_knowledge(entry: KnowledgeEntry):
     """手动新增一条知识。"""
     kb = _get_kb()
     from data.knowledge import UIKnowledge
@@ -97,7 +97,7 @@ async def add_knowledge(entry: KnowledgeEntry):
 
 
 @router.delete("")
-async def delete_knowledge(
+def delete_knowledge(
     app_package: str = Query(default=""),
     knowledge_type: str = Query(default=""),
 ):

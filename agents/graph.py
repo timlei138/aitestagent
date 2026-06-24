@@ -168,8 +168,8 @@ def _run_agent(
     return "ABORT: No agent response"
 
 
-# Phase 1.2: 锚定行首的 DONE/ABORT 检测
-_DONE_PATTERN = re.compile(r"^(DONE|ABORT)\s*[:：]", re.IGNORECASE | re.MULTILINE)
+# Phase 1.2: 锚定行首的 DONE/ABORT 检测（兼容 ##/### Markdown 标题前缀）
+_DONE_PATTERN = re.compile(r"^(?:#{1,3}\s*)?(DONE|ABORT)\s*[:：]", re.IGNORECASE | re.MULTILINE)
 
 
 def _detect_termination(result: str) -> tuple[bool, bool]:

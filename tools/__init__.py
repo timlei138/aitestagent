@@ -331,6 +331,46 @@ def _has_cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 
 
+def _disambiguate_container(
+    best_el: Any, all_elements: list[Any],
+) -> Any | None:
+    """当最佳匹配是大型容器（list_entry/container）且存在同 label 的 navigation_item
+    子元素时，返回子元素替代容器。解决 taskbar_view 等容器遮盖子控件的问题。"""
+    best_role = getattr(best_el, "role", "")
+    if best_role not in ("list_entry", "container"):
+        return None
+    best_label = (best_el.label or "").strip()
+    if not best_label or len(best_label) < 2:
+        return None
+    bb = best_el.bounds
+    if not bb or len(bb) != 4:
+        return None
+    best_area = (bb[2] - bb[0]) * (bb[3] - bb[1])
+    if best_area <= 0:
+        return None
+
+    for el in all_elements:
+        if not el.clickable or el is best_el:
+            continue
+        el_label = (el.label or "").strip()
+        if el_label != best_label:
+            continue
+        el_role = getattr(el, "role", "")
+        if el_role not in ("navigation_item", "button", "tab"):
+            continue
+        eb = el.bounds
+        if not eb or len(eb) != 4:
+            continue
+        el_area = (eb[2] - eb[0]) * (eb[3] - eb[1])
+        if el_area > 0 and el_area < best_area * 0.5:
+            logger.info(
+                "_disambiguate: role=%s label=%r → role=%s (area %d→%d)",
+                best_role, best_label, el_role, best_area, el_area,
+            )
+            return el
+    return None
+
+
 def _find_best_element_with_known(
     understanding: Any, description: str
 ) -> tuple[Any | None, list[dict[str, Any]]]:
@@ -395,6 +435,10 @@ def _find_best_element_with_known(
 
     if best is not None:
         best_el = best[2]
+        child = _disambiguate_container(best_el, all_elements)
+        if child is not None:
+            best = (best[0], best[1], child)
+            best_el = child
         logger.info("_find_best: desc=%r best_score=%d role=%s label=%r (scanned %d clickable)",
                     description, best[0], getattr(best_el, "role", ""),
                     getattr(best_el, "label", ""), scanned)
@@ -834,6 +878,49 @@ def scroll_find_and_click(label: str, max_swipes: int = 3, panel: str = "") -> s
 
 
 @tool
+def long_press(label: str, duration: float = 0.8) -> str:
+    """长按指定元素。先搜索匹配 label 的元素，再对其执行长按。适用于拖拽、上下文菜单、删除等场景。
+    duration: 长按持续时间（秒），默认 0.8。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+
+    if ctx.perceiver is not None:
+        understanding = ctx.perceiver.perceive()
+        best_el, _ = _find_best_element_with_known(understanding, label)
+        if best_el is not None:
+            ctx.device.long_click_bounds(best_el.bounds, duration)
+            msg = _format_click_log(label, best_el, strategy="long_press")
+            return msg + f" | 长按 {duration}s"
+        # 扩充搜索：含非 clickable 元素（历史记录行、文本标签等 clickable=false 但支持长按）
+        label_lower = label.lower().strip()
+        for el in understanding.elements:
+            el_label = (el.label or "").lower()
+            el_rid = (el.resource_id or "").lower()
+            if (label_lower in el_label or label_lower in el_rid) and el.bounds != (0, 0, 0, 0):
+                ctx.device.long_click_bounds(el.bounds, duration)
+                msg = _format_click_log(label, el, strategy="long_press_nonclickable")
+                return msg + f" | 长按 {duration}s"
+        logger.info("long_press: miss target=%r", label)
+
+    # 兜底：用 resource_id 长按
+    if ctx.device.device(resourceId=label).exists(timeout=2.0):
+        ctx.device.device(resourceId=label).long_click()
+        return f"已长按: {label}"
+    return f"long_press: 未找到 '{label}'"
+
+
+@tool
+def paste() -> str:
+    """粘贴剪贴板内容到当前焦点输入框（系统级 CTRL+V，无需操作系统粘贴弹窗）。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+    ctx.device.paste()
+    return "已粘贴剪贴板内容"
+
+
+@tool
 def type_input(text: str) -> str:
     """向当前已聚焦的输入框输入文本。"""
     ctx = get_tool_context()
@@ -845,7 +932,7 @@ def type_input(text: str) -> str:
 
 @tool
 def press_key(key: str) -> str:
-    """按系统键。key 可为 back / home / enter / recent。"""
+    """按系统键。key 可为 back / home / enter / recent / power（电源键，锁屏或亮屏）。"""
     ctx = get_tool_context()
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
@@ -861,6 +948,61 @@ def swipe(direction: str = "up") -> str:
         return "ERROR: 未连接 Android 设备"
     ctx.device.swipe(direction)
     return f"已滑动: {direction}"
+
+
+@tool
+def open_notification() -> str:
+    """打开通知栏。系统级操作：横屏时等效于从顶部左侧下滑，竖屏时从顶部下滑。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+    ctx.device.open_notification()
+    return "已打开通知栏"
+
+
+@tool
+def open_quick_settings() -> str:
+    """打开快速设置面板（Quick Settings / 控制中心）。系统级操作：横屏时等效于从顶部右侧下滑，竖屏时从顶部下滑。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+    ctx.device.open_quick_settings()
+    return "已打开快速设置面板"
+
+
+@tool
+def unlock_screen() -> str:
+    """解锁屏幕（swipe up 解锁，适用于无密码/图案的测试设备）。亮屏后若处于锁屏界面需调用此工具。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+    ctx.device.unlock()
+    return "已解锁屏幕"
+
+
+@tool
+def set_orientation(orientation: str = "portrait") -> str:
+    """设置屏幕方向。orientation: portrait（竖屏）/ landscape（横屏）。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+    mapping = {"portrait": "natural", "landscape": "left"}
+    raw = mapping.get(orientation, orientation)
+    ctx.device.set_orientation(raw)
+    return f"已设置屏幕方向: {orientation}"
+
+
+@tool
+def toggle_auto_rotate(enable: bool = True) -> str:
+    """启用或禁用屏幕自动旋转（等同于控制中心/Quick Settings 中的"自动旋转"开关）。
+    enable=True 开启自动旋转，设备横屏时 App 随重力感应切换布局；
+    enable=False 关闭自动旋转，设备方向锁定，App 不会随横屏切换。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+    ctx.device.freeze_rotation(not enable)
+    action = "开启" if enable else "关闭"
+    return f"已{action}自动旋转"
 
 
 @tool
@@ -1202,8 +1344,10 @@ PLANNER_TOOLS: list[Any] = [
 
 AGENT_TOOLS: list[Any] = [
     get_screen_info, query_app_knowledge, query_element_identity,
-    click, navigate_to, scroll_find_and_click, scroll_panel,
-    type_input, press_key, swipe, launch_app,
+    click, navigate_to, scroll_find_and_click, long_press, scroll_panel,
+    type_input, press_key, paste, swipe, open_notification, open_quick_settings,
+    unlock_screen, set_orientation, toggle_auto_rotate,
+    launch_app,
     detect_popup, dismiss_popup, wait_seconds,
     check_page_health, recover_from_anomaly,
     assert_page_contains, assert_element_exists,

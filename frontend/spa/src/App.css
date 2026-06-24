@@ -315,6 +315,62 @@
 }
 .float-win-resize:hover { background: rgba(64,158,255,0.15); }
 
+/* ═══════════ Element Inspector Tooltip ═══════════ */
+.element-tooltip {
+  position: fixed;
+  z-index: 2500;
+  min-width: 220px;
+  max-width: 360px;
+  max-height: 420px;
+  overflow-y: auto;
+  background: rgba(15, 23, 42, 0.95);
+  backdrop-filter: blur(8px);
+  border: 1.5px solid rgba(64, 158, 255, 0.4);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(64, 158, 255, 0.1);
+  pointer-events: none;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.et-row { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+.et-label {
+  font-size: 14px; font-weight: 700; color: #e0eaff;
+  margin-bottom: 4px; padding-bottom: 4px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.et-k {
+  min-width: 72px; color: #5a7a99; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.3px; flex-shrink: 0;
+}
+.et-v {
+  color: #b0c8e8; word-break: break-all;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 11px;
+}
+.et-badge {
+  display: inline-block;
+  padding: 0 6px; border-radius: 4px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.3px;
+}
+.et-role-switch           { background: rgba(64,158,255,0.2); color: #409eff; }
+.et-role-navigation_item  { background: rgba(103,194,58,0.2); color: #67c23a; }
+.et-role-tab              { background: rgba(230,162,60,0.2); color: #e6a23c; }
+.et-role-list_entry       { background: rgba(144,147,153,0.2); color: #b0b8c8; }
+.et-role-button           { background: rgba(245,108,108,0.2); color: #f56c6c; }
+.et-role-image            { background: rgba(144,147,153,0.15); color: #909399; }
+.et-role-default          { background: rgba(144,147,153,0.1); color: #909399; }
+.et-flags { margin-top: 4px; gap: 4px; flex-wrap: wrap; }
+.et-flag {
+  display: inline-block;
+  padding: 1px 6px; border-radius: 4px;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.3px;
+}
+.et-clickable { background: rgba(64,158,255,0.18); color: #409eff; }
+.et-checked   { background: rgba(103,194,58,0.18); color: #67c23a; }
+.et-selected  { background: rgba(230,162,60,0.18); color: #e6a23c; }
+.et-disabled  { background: rgba(245,108,108,0.18); color: #f56c6c; }
+
 /* ── Float window transition ── */
 .floatwin-enter-active { transition: opacity 0.22s ease, transform 0.22s cubic-bezier(.34,1.56,.64,1); }
 .floatwin-leave-active  { transition: opacity 0.18s ease, transform 0.18s ease; }
