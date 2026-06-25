@@ -444,13 +444,13 @@
               <b>步骤 {{ s.index }}:</b> {{ s.intent || '—' }}
               <span class="step-time">{{ s.started_at ? s.started_at.replace('T', ' ').substring(10, 19) : '' }}</span>
             </div>
-            <div class="step-action">操作: <code>{{ s.action_type || '—' }}</code> → {{ s.target || '—' }}
-              <span v-if="s.duration_ms" class="step-duration">{{ s.duration_ms }}ms</span>
+            <div class="step-action">操作: <code>{{ s.action_type || '—' }}</code><span v-if="s.target"> → {{ s.target }}</span>
+              <span v-if="s.duration_ms" class="step-duration">{{ fmtDuration(s.duration_ms) }}</span>
             </div>
             <div v-if="s.page_from || s.page_to" class="step-pages">{{ s.page_from || '?' }} → {{ s.page_to || '?' }}</div>
             <div v-if="s.expected" class="step-expected">预期: {{ s.expected }}</div>
-            <div class="step-obs" :class="'obs-' + (s.status || '')">
-              <div class="obs-summary">{{ s.observation || '无观察结果' }}</div>
+            <div class="step-obs" :class="'obs-' + (s.status || '')" v-if="s.observation">
+              <div class="obs-summary">{{ s.observation }}</div>
               <div v-if="s.raw_observation && s.raw_observation !== s.observation" style="margin-top: 4px;">
                 <el-button size="small" text type="primary" @click="toggleStepDetail(s.index)">
                   {{ expandedSteps.has(s.index) ? '收起细节 ▲' : '展开细节 ▼' }}
@@ -464,7 +464,7 @@
         </div>
       </div>
       <!-- 结论 -->
-      <div class="report-conclusion" v-if="selectedReport.conclusion">
+      <div class="report-conclusion" v-if="selectedReport.conclusion && hasExtraConclusion(selectedReport)">
         <h4>📝 测试结论</h4>
         <div style="white-space: pre-wrap;">{{ selectedReport.conclusion }}</div>
       </div>
@@ -757,6 +757,25 @@ function execStatusLabel(s) { return (execStatusMap[s] || execStatusMap.error).l
 function execStatusType(s)  { return (execStatusMap[s] || execStatusMap.error).type; }
 function verdictLabel(s)    { return (verdictMap[s] || verdictMap.inconclusive).label; }
 function verdictType(s)     { return (verdictMap[s] || verdictMap.inconclusive).type; }
+function hasExtraConclusion(report) {
+  if (!report.conclusion) return false;
+  // 只有最后一个步骤有 observation，且结论与它不同时，才需要显示结论段
+  const steps = report.steps || [];
+  const lastObs = steps.length > 0 ? (steps[steps.length - 1].observation || '').trim() : '';
+  const conclusion = (report.conclusion || '').trim();
+  // 结论含 "已完成步骤:" 说明是失败摘要，必须显示
+  if (conclusion.includes('已完成步骤:')) return true;
+  // 结论与最后一步的 observation 相同则隐藏
+  return conclusion !== lastObs;
+}
+function fmtDuration(ms) {
+  if (!ms || ms <= 0) return '';
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+  const m = Math.floor(ms / 60000);
+  const s = Math.round((ms % 60000) / 1000);
+  return s > 0 ? `${m}m${s}s` : `${m}m`;
+}
 
 let ws = null;
 let snapshotTimer = null;

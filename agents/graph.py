@@ -80,7 +80,7 @@ class _SubState(_TD):
 
 def _run_agent(
     messages, tools, provider, model, api_key, base_url, max_turns=20
-) -> str:
+) -> tuple[str, list]:
     if provider == "zhipu":
         from zhipuai import ZhipuAI
 
@@ -153,19 +153,32 @@ def _run_agent(
     result = g.compile().invoke({"messages": list(messages), "_turn_count": 0})
     turn_count = result.get("_turn_count", 0)
 
+    # 提取内部工具调用信息（供报告展示用）
+    _tool_calls_log = []
+    for m in result["messages"]:
+        tcs = getattr(m, "tool_calls", None) or []
+        for tc in tcs:
+            name = tc.get("name", "")
+            if name not in ("get_screen_info", "check_page_health", "query_app_knowledge"):
+                args = tc.get("args", {}) or {}
+                _tool_calls_log.append({
+                    "name": name,
+                    "target": args.get("label", "") or args.get("target", "") or "",
+                })
+
     # Phase 1.1: 静默截断检测 —— 当 turn 耗尽时注入明确标记
     if turn_count >= max_turns:
         for m in reversed(result["messages"]):
             c = getattr(m, "content", None)
             if c:
-                return str(c) + "\nABORT: MAX_TURNS_EXHAUSTED"
-        return "ABORT: MAX_TURNS_EXHAUSTED — 达到最大工具调用次数"
+                return str(c) + "\nABORT: MAX_TURNS_EXHAUSTED", _tool_calls_log
+        return "ABORT: MAX_TURNS_EXHAUSTED — 达到最大工具调用次数", _tool_calls_log
 
     for m in reversed(result["messages"]):
         c = getattr(m, "content", None)
         if c:
-            return str(c)
-    return "ABORT: No agent response"
+            return str(c), _tool_calls_log
+    return "ABORT: No agent response", _tool_calls_log
 
 
 # Phase 1.2: 锚定行首的 DONE/ABORT 检测（兼容 ##/### Markdown 标题前缀）
@@ -398,7 +411,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     )
     _max_turns = min(max(_goal_turns, 10), 200)  # 最少 10，最多 200
 
-    result = _run_agent(
+    result, tool_calls_log = _run_agent(
         msgs,
         AGENT_TOOLS,
         llm["provider"],
@@ -407,6 +420,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         llm["base_url"],
         max_turns=_max_turns,
     )
+    # 累积存入 ToolContext 供 _build_display_steps 使用（多轮 Agent 调用需累加）
+    if ctx:
+        if not hasattr(ctx, '_tool_calls_log'):
+            ctx._tool_calls_log = []
+        ctx._tool_calls_log.extend(tool_calls_log)
     logger.info("Agent #%d: %s", len(history) + 1, result[:200])
 
     done, abort = _detect_termination(result)
@@ -632,13 +650,8 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
 
     if _relational_db:
         try:
-            seen = set()
-            dd = []
-            for s in history:
-                k = (s.get("intent", ""), s.get("action_type", ""), s.get("target", ""))
-                if k not in seen:
-                    seen.add(k)
-                    dd.append(s)
+            from agents.orchestrator import _build_display_steps
+            dd = _build_display_steps(history)
             _relational_db.record_test_run(
                 run_id=config.get("configurable", {}).get("thread_id", ""),
                 user_request=state.get("user_request", ""),
