@@ -119,63 +119,13 @@
 
       <!-- ═══════════ 知识库 ═══════════ -->
       <el-main class="main-content" v-if="activeMenu === 'knowledge'">
-        <section class="panel">
-          <div class="panel-header">
-            <h3 class="panel-title">知识库管理</h3>
-            <div style="display:flex;gap:8px;align-items:center">
-              <el-tag size="small" type="info">共 {{ kbCount }} 条</el-tag>
-              <el-button size="small" @click="loadKbList">刷新</el-button>
-              <el-button size="small" type="primary" @click="openKbDialog(null)">+ 新增知识</el-button>
-            </div>
-          </div>
-          <div class="kb-filter-bar">
-            <el-input v-model="kbSearchQuery" placeholder="搜索关键词（语义检索）" size="small"
-                      style="width:220px" clearable />
-            <el-select v-model="kbFilterType" placeholder="知识类型" size="small"
-                       style="width:150px" clearable>
-              <el-option v-for="t in kbTypes" :key="t.value" :label="t.label" :value="t.value" />
-            </el-select>
-            <el-input v-model="kbFilterPackage" placeholder="应用包名" size="small"
-                      style="width:200px" clearable />
-            <el-button size="small" type="primary" @click="searchKb">搜索</el-button>
-            <el-button size="small" @click="resetKbFilter">重置</el-button>
-            <el-button size="small" type="danger" plain
-                       :disabled="!kbFilterPackage && !kbFilterType"
-                       @click="deleteKbByFilter">批量删除</el-button>
-          </div>
-          <el-table :data="kbList" border stripe empty-text="暂无知识数据" style="margin-top:12px">
-            <el-table-column type="index" width="50" />
-            <el-table-column label="知识类型" width="120">
-              <template #default="{ row }">
-                <el-tag :type="kbTypeColor(row.metadata && row.metadata.knowledge_type)" size="small">
-                  {{ kbTypeLabel(row.metadata && row.metadata.knowledge_type) }}
-                </el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="应用包名" min-width="160" show-overflow-tooltip>
-              <template #default="{ row }">{{ (row.metadata && row.metadata.app_package) || '-' }}</template>
-            </el-table-column>
-            <el-table-column label="内容" min-width="280" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.content }}</template>
-            </el-table-column>
-            <el-table-column label="时间" width="120">
-              <template #default="{ row }">
-                {{ ((row.metadata && row.metadata.timestamp) || '').substring(0, 16).replace('T', ' ') }}
-              </template>
-            </el-table-column>
-            <el-table-column label="相关度" width="80">
-              <template #default="{ row }">
-                <span v-if="row.score !== undefined">{{ row.score.toFixed ? row.score.toFixed(2) : row.score }}</span>
-                <span v-else>-</span>
-              </template>
-            </el-table-column>
-            <el-table-column label="操作" width="80" fixed="right">
-              <template #default="{ row }">
-                <el-button size="small" text type="primary" @click.stop="openKbDetail(row)">详情</el-button>
-              </template>
-            </el-table-column>
-          </el-table>
-        </section>
+        <KnowledgePanel
+          :list="kbList" :kbCount="kbCount" :types="kbTypes"
+          @refresh="loadKbList" @add="openKbDialog(null)"
+          @search="({ query, type, pkg }) => { kbSearchQuery = query; kbFilterType = type; kbFilterPackage = pkg; searchKb() }"
+          @deleteByFilter="({ type, pkg }) => { kbFilterType = type; kbFilterPackage = pkg; deleteKbByFilter() }"
+          @detail="openKbDetail"
+        />
       </el-main>
 
       <!-- ═══════════ APP 管理 ═══════════ -->
@@ -395,80 +345,8 @@
   </el-dialog>
 
   <!-- ═══════════ 报告详情 ═══════════ -->
-  <el-dialog v-model="reportDetailVisible" title="测试报告详情" width="68%" top="3vh">
-    <div v-if="selectedReport" class="report-detail">
-      <!-- 头部摘要 -->
-      <div class="report-header">
-        <div class="report-title">{{ selectedReport.user_request || '测试报告' }}</div>
-        <div class="report-meta">
-          <el-tag :type="execStatusType(selectedReport.execution_status)" size="default">
-            执行: {{ execStatusLabel(selectedReport.execution_status) }}
-          </el-tag>
-          <el-tag :type="verdictType(selectedReport.test_verdict)" size="default" style="margin-left:6px">
-            结论: {{ verdictLabel(selectedReport.test_verdict) }}
-          </el-tag>
-          <span>总耗时 {{ selectedReport.duration_seconds || 0 }}s</span>
-          <span>{{ (selectedReport.created_at || '').replace('T', ' ').substring(0, 19) }}</span>
-        </div>
-        <div class="report-summary">
-          <div class="stat"><b>{{ selectedReport.total_steps }}</b> 总步骤</div>
-          <div class="stat pass"><b>{{ selectedReport.pass_count }}</b> 通过</div>
-          <div class="stat fail"><b>{{ selectedReport.fail_count }}</b> 失败</div>
-          <div class="stat"><b>{{ selectedReport.total_steps ? Math.round(selectedReport.pass_count / selectedReport.total_steps * 100) : 0 }}%</b> 通过率</div>
-        </div>
-      </div>
-      <!-- 验证清单 -->
-      <div v-if="selectedReport.verification_results && selectedReport.verification_results.length" class="report-verification">
-        <h4>验证清单</h4>
-        <div v-for="(v, i) in selectedReport.verification_results" :key="i" class="verify-item">
-          <el-tag :type="v.result === 'passed' ? 'success' : v.result === 'failed' ? 'danger' : 'info'" size="small">
-            {{ v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?' }}
-          </el-tag>
-          <span class="verify-text">{{ v.item }}</span>
-          <el-image v-if="v.screenshot" :src="'/' + v.screenshot" :preview-src-list="['/' + v.screenshot]"
-                    fit="cover" class="verify-shot" title="点击查看大图" />
-        </div>
-      </div>
-      <!-- 步骤时间线 -->
-      <div class="report-steps">
-        <div class="step-card" v-for="s in (selectedReport.steps || [])" :key="s.index"
-             :class="'step-' + (s.status || 'unknown')">
-          <div class="step-icon">
-            <span v-if="s.status === 'success'">✅</span>
-            <span v-else-if="s.status === 'fail'">❌</span>
-            <span v-else-if="s.status === 'continue'">🏃</span>
-            <span v-else>⚠️</span>
-          </div>
-          <div class="step-body">
-            <div class="step-title">
-              <b>步骤 {{ s.index }}:</b> {{ s.intent || '—' }}
-              <span class="step-time">{{ s.started_at ? s.started_at.replace('T', ' ').substring(10, 19) : '' }}</span>
-            </div>
-            <div class="step-action">操作: <code>{{ s.action_type || '—' }}</code><span v-if="s.target"> → {{ s.target }}</span>
-              <span v-if="s.duration_ms" class="step-duration">{{ fmtDuration(s.duration_ms) }}</span>
-            </div>
-            <div v-if="s.page_from || s.page_to" class="step-pages">{{ s.page_from || '?' }} → {{ s.page_to || '?' }}</div>
-            <div v-if="s.expected" class="step-expected">预期: {{ s.expected }}</div>
-            <div class="step-obs" :class="'obs-' + (s.status || '')" v-if="s.observation">
-              <div class="obs-summary">{{ s.observation }}</div>
-              <div v-if="s.raw_observation && s.raw_observation !== s.observation" style="margin-top: 4px;">
-                <el-button size="small" text type="primary" @click="toggleStepDetail(s.index)">
-                  {{ expandedSteps.has(s.index) ? '收起细节 ▲' : '展开细节 ▼' }}
-                </el-button>
-                <div v-if="expandedSteps.has(s.index)" class="obs-detail">
-                  <pre>{{ s.raw_observation }}</pre>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <!-- 结论 -->
-      <div class="report-conclusion" v-if="selectedReport.conclusion && hasExtraConclusion(selectedReport)">
-        <h4>📝 测试结论</h4>
-        <div style="white-space: pre-wrap;">{{ selectedReport.conclusion }}</div>
-      </div>
-    </div>
+  <el-dialog v-model="reportDetailVisible" title="测试报告详情" width="720px" top="3vh">
+    <ReportDetail :report="selectedReport" />
   </el-dialog>
 
   <!-- ═══════════ 知识库新增对话框 ═══════════ -->
@@ -570,6 +448,8 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import ReportDetail from "./components/ReportDetail.vue";
+import KnowledgePanel from "./components/KnowledgePanel.vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 const activeMenu = ref("workspace");

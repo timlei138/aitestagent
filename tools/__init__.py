@@ -1219,12 +1219,15 @@ def launch_app(
     ctx = get_tool_context()
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备，无法启动应用"
+    _pre_page = _capture_page_id(ctx)
     target_activity = (activity or "").strip()
     if target_activity:
         ctx.device.app_start(package, activity=target_activity)
-        return f"已启动: {package}/{target_activity}"
-    ctx.device.app_start(package)
-    return f"已启动: {package}"
+    else:
+        ctx.device.app_start(package)
+    # 记录页面跳转
+    _record_page_transition(ctx, _pre_page, f"launch_app({package})")
+    return f"已启动: {package}/{target_activity}" if target_activity else f"已启动: {package}"
 
 
 @tool
