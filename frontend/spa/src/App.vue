@@ -99,10 +99,17 @@
             <el-table-column prop="user_request" label="测试用例" min-width="200" show-overflow-tooltip />
             <el-table-column prop="total_steps" label="步骤数" width="80" />
             <el-table-column prop="duration_seconds" label="耗时(s)" width="90" />
-            <el-table-column prop="status" label="结果" width="80">
+            <el-table-column label="执行状态" width="100">
               <template #default="{ row }">
-                <el-tag :type="row.status === 'success' ? 'success' : 'danger'" size="small">
-                  {{ row.status === 'success' ? '通过' : '失败' }}
+                <el-tag :type="execStatusType(row.execution_status)" size="small">
+                  {{ execStatusLabel(row.execution_status) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="测试结论" width="90">
+              <template #default="{ row }">
+                <el-tag :type="verdictType(row.test_verdict)" size="small">
+                  {{ verdictLabel(row.test_verdict) }}
                 </el-tag>
               </template>
             </el-table-column>
@@ -394,8 +401,11 @@
       <div class="report-header">
         <div class="report-title">{{ selectedReport.user_request || '测试报告' }}</div>
         <div class="report-meta">
-          <el-tag :type="selectedReport.status === 'success' ? 'success' : 'danger'" size="default">
-            {{ selectedReport.status === 'success' ? '✅ 通过' : '❌ 失败' }}
+          <el-tag :type="execStatusType(selectedReport.execution_status)" size="default">
+            执行: {{ execStatusLabel(selectedReport.execution_status) }}
+          </el-tag>
+          <el-tag :type="verdictType(selectedReport.test_verdict)" size="default" style="margin-left:6px">
+            结论: {{ verdictLabel(selectedReport.test_verdict) }}
           </el-tag>
           <span>总耗时 {{ selectedReport.duration_seconds || 0 }}s</span>
           <span>{{ (selectedReport.created_at || '').replace('T', ' ').substring(0, 19) }}</span>
@@ -405,6 +415,18 @@
           <div class="stat pass"><b>{{ selectedReport.pass_count }}</b> 通过</div>
           <div class="stat fail"><b>{{ selectedReport.fail_count }}</b> 失败</div>
           <div class="stat"><b>{{ selectedReport.total_steps ? Math.round(selectedReport.pass_count / selectedReport.total_steps * 100) : 0 }}%</b> 通过率</div>
+        </div>
+      </div>
+      <!-- 验证清单 -->
+      <div v-if="selectedReport.verification_results && selectedReport.verification_results.length" class="report-verification">
+        <h4>验证清单</h4>
+        <div v-for="(v, i) in selectedReport.verification_results" :key="i" class="verify-item">
+          <el-tag :type="v.result === 'passed' ? 'success' : v.result === 'failed' ? 'danger' : 'info'" size="small">
+            {{ v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?' }}
+          </el-tag>
+          <span class="verify-text">{{ v.item }}</span>
+          <el-image v-if="v.screenshot" :src="'/' + v.screenshot" :preview-src-list="['/' + v.screenshot]"
+                    fit="cover" class="verify-shot" title="点击查看大图" />
         </div>
       </div>
       <!-- 步骤时间线 -->
@@ -422,7 +444,10 @@
               <b>步骤 {{ s.index }}:</b> {{ s.intent || '—' }}
               <span class="step-time">{{ s.started_at ? s.started_at.replace('T', ' ').substring(10, 19) : '' }}</span>
             </div>
-            <div class="step-action">操作: <code>{{ s.action_type || '—' }}</code> → {{ s.target || '—' }}</div>
+            <div class="step-action">操作: <code>{{ s.action_type || '—' }}</code> → {{ s.target || '—' }}
+              <span v-if="s.duration_ms" class="step-duration">{{ s.duration_ms }}ms</span>
+            </div>
+            <div v-if="s.page_from || s.page_to" class="step-pages">{{ s.page_from || '?' }} → {{ s.page_to || '?' }}</div>
             <div v-if="s.expected" class="step-expected">预期: {{ s.expected }}</div>
             <div class="step-obs" :class="'obs-' + (s.status || '')">
               <div class="obs-summary">{{ s.observation || '无观察结果' }}</div>
@@ -715,6 +740,24 @@ function toggleStepDetail(index) {
   expandedSteps.value = s;
 }
 
+// ── 双维度结果映射 ──
+const execStatusMap = {
+  completed:     { label: '已完成', type: 'success' },
+  exhausted:     { label: '步骤耗尽', type: 'warning' },
+  error:         { label: '异常中断', type: 'danger' },
+  cancelled:     { label: '已取消', type: 'info' },
+  device_offline:{ label: '设备离线', type: 'info' },
+};
+const verdictMap = {
+  passed:       { label: '通过', type: 'success' },
+  failed:       { label: '未通过', type: 'danger' },
+  inconclusive: { label: '待确认', type: 'warning' },
+};
+function execStatusLabel(s) { return (execStatusMap[s] || execStatusMap.error).label; }
+function execStatusType(s)  { return (execStatusMap[s] || execStatusMap.error).type; }
+function verdictLabel(s)    { return (verdictMap[s] || verdictMap.inconclusive).label; }
+function verdictType(s)     { return (verdictMap[s] || verdictMap.inconclusive).type; }
+
 let ws = null;
 let snapshotTimer = null;
 let snapshotInFlight = false;
@@ -878,7 +921,16 @@ function handleEvent(data) {
       flushStreamToken();
       currentTool.value = "";
       addMessage("ai", "执行结果", content.conclusion || content.message || JSON.stringify(content));
-      addLog(`${content.status === "success" ? "PASS" : "FAIL"}: ${(content.conclusion || "").substring(0, 200)}`);
+      // 双维度结果日志
+      const exLabel = execStatusLabel(content.execution_status || 'error');
+      const vLabel = verdictLabel(content.test_verdict || 'inconclusive');
+      addLog(`${exLabel} | ${vLabel}: ${(content.conclusion || "").substring(0, 200)}`);
+      if (content.verification_results && content.verification_results.length) {
+        content.verification_results.forEach(v => {
+          const icon = v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?';
+          addLog(`  ${icon} ${v.item}`);
+        });
+      }
       refreshSnapshot();
       loadReports();
       break;
@@ -1271,6 +1323,9 @@ async function openReportDetail(row) {
     if (data.status !== "success") { ElMessage.error(data.message || "读取失败"); return; }
     selectedReport.value = data.report || null;
     reportDetailVisible.value = true;
+    // 自动展开失败步骤
+    const failIndices = ((data.report || {}).steps || []).filter(s => s.status === 'fail').map(s => s.index);
+    expandedSteps.value = new Set(failIndices);
   } catch (e) {
     ElMessage.error(`读取失败: ${e}`);
   }

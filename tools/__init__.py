@@ -1455,6 +1455,41 @@ def assert_element_exists(label: str) -> str:
 
 
 # ═══════════════════════════════════════════
+# ═══════════════════════════════════════════
+#  验证工具
+# ═══════════════════════════════════════════
+
+
+@tool
+def assert_verification(condition: str, result: str, detail: str = "") -> str:
+    """逐条报告验证条件的结果。condition 对应 goal.verification 中的验证项，
+    result 为 "passed" 或 "failed"，detail 可选补充说明。
+    失败时自动截图存入 verification 记录。"""
+    ctx = get_tool_context()
+    if ctx:
+        if not hasattr(ctx, '_verifications'):
+            ctx._verifications = []
+        shot_path = ""
+        if result == "failed" and ctx.device:
+            try:
+                import os
+                from datetime import datetime
+                os.makedirs("storage/screenshots", exist_ok=True)
+                safe_cond = re.sub(r"[^\w一-鿿-]", "_", condition[:30])
+                shot_path = f"storage/screenshots/verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_cond}.png"
+                ctx.device.screenshot().save(shot_path)
+            except Exception:
+                pass
+        ctx._verifications.append({
+            "item": condition,
+            "result": result if result in ("passed", "failed") else "unknown",
+            "detail": detail,
+            "screenshot": shot_path,
+        })
+    return f"记录完成: {condition} → {result}"
+
+
+# ═══════════════════════════════════════════
 #  辅助工具（多个 Agent 共用）
 # ═══════════════════════════════════════════
 
@@ -1500,7 +1535,7 @@ AGENT_TOOLS: list[Any] = [
     launch_app,
     detect_popup, dismiss_popup, wait_seconds,
     check_page_health, recover_from_anomaly,
-    assert_page_contains, assert_element_exists,
+    assert_page_contains, assert_element_exists, assert_verification,
 ]
 
 # ── 内部辅助 ──

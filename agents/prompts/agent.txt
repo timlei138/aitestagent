@@ -26,6 +26,12 @@ click("A") → click("B") → click("A") → ...
 ## 启动 App
 - 打开指定 App 的最快方式：`launch_app("App名称")`。不要在桌面手动翻找图标，直接用 launch_app。
 
+## 验证报告
+- 完成所有验证条件后，**必须**逐条调用 assert_verification(condition, result) 报告结果
+- condition 对应 goal.verification 中每一项，result 为 "passed" 或 "failed"
+- 例如：assert_verification("搜索结果显示计算器", "passed")
+- 例如：assert_verification("粘贴内容为不是数字", "failed", "实际粘贴内容为空")
+
 ## 规则
 - 每次只做一个操作
 - 工具调用次数由任务复杂度自动分配（10~50 次），超了就 ABORT

@@ -327,6 +327,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     # Page info
     ctx = get_tool_context()
     page_info = "unknown"
+    pid = ""
     t0 = 0
     if ctx and ctx.perceiver:
         try:
@@ -416,14 +417,48 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         si,
         "DONE" if done else ("ABORT" if abort else "CONTINUE"),
     )
+    # 从 messages 中提取最后一条工具调用的结构化信息
+    _tool_name = "agent"
+    _tool_target = ""
+    _page_from = pid  # 当前页（已在感知阶段获取）
+    _page_to = ""
+    for _m in reversed(msgs):
+        _tcs = getattr(_m, "tool_calls", None) or []
+        if _tcs:
+            _last = _tcs[-1]
+            _tn = _last.get("name", "")
+            if _tn not in ("get_screen_info", "check_page_health", "query_app_knowledge"):
+                _tool_name = _tn
+                _args = _last.get("args", {}) or {}
+                _tool_target = _args.get("label", "") or _args.get("target", "") or ""
+            break
+    # 尝试捕获 page_to（本步骤之后下一次感知的页面）
+    try:
+        if ctx and ctx.perceiver and (done or abort or si == 1):
+            _u2 = ctx.perceiver.perceive()
+            _act2 = _u2.activity.split(".")[-1] if _u2.activity else "?"
+            _t2 = _u2.page_title or ""
+            _page_to = _act2 + "「" + _t2 + "」" if _t2 else _act2
+    except Exception:
+        pass
+
+    try:
+        _step_duration_ms = int((_time.time() - t0) * 1000) if t0 else 0
+    except NameError:
+        _step_duration_ms = 0
+
     nh = list(history) + [
         {
             "index": si,
             "intent": result[:80].replace("\n", " "),
-            "action_type": "agent",
-            "target": "",
+            "action_type": _tool_name,
+            "target": _tool_target,
+            "page_from": _page_from,
+            "page_to": _page_to,
+            "duration_ms": _step_duration_ms,
             "status": st,
-            "observation": result[:300],
+            "observation": result[:500],
+            "raw_observation": result,
             "screenshot_path": "",
             "anomaly": None,
         }
@@ -499,6 +534,53 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     return Command(update={"step_history": nh, "messages": um})
 
 
+def _determine_execution_status(state: dict) -> str:
+    """判定执行状态：completed / exhausted / error / cancelled / device_offline。"""
+    s = state.get("status", "")
+    conclusion = state.get("conclusion", "")
+    if s == "cancelled":
+        return "cancelled"
+    if s == "device_offline":
+        return "device_offline"
+    done, abort = _detect_termination(conclusion)
+    if done:
+        return "completed"
+    if abort:
+        if "MAX_TURNS" in conclusion:
+            return "exhausted"
+        # Agent 主动 ABORT 仍算 completed，verdict 由 test_verdict 决定
+        return "completed"
+    history = state.get("step_history", [])
+    if len(history) >= 12:
+        return "exhausted"
+    return "error"
+
+
+def _collect_verification_results(goal: dict) -> tuple[str, list]:
+    """从 ToolContext._verifications 收集 assert_verification 的结构化结果。"""
+    ctx = get_tool_context()
+    assertions = getattr(ctx, '_verifications', []) if ctx else []
+
+    if not assertions:
+        verification_items = goal.get("verification", [])
+        if verification_items:
+            assertions = [{"item": v, "result": "unknown"} for v in verification_items]
+        else:
+            return "passed", []
+
+    passed = sum(1 for a in assertions if a["result"] == "passed")
+    failed = sum(1 for a in assertions if a["result"] == "failed")
+
+    if failed > 0:
+        verdict = "failed"
+    elif passed == len(assertions):
+        verdict = "passed"
+    else:
+        verdict = "inconclusive"
+
+    return verdict, assertions
+
+
 def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     history = state.get("step_history", [])
@@ -506,6 +588,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     status = state.get("status", "") or (
         "success" if _detect_termination(conclusion)[0] else "fail"
     )
+    goal = state.get("goal_description", {})
 
     # Compute duration
     duration = 0.0
@@ -538,6 +621,15 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
 
     ctx = get_tool_context()
 
+    # ── 双维度结果判定 ──
+    execution_status = _determine_execution_status(state)
+    test_verdict, verification_results = _collect_verification_results(goal)
+    if execution_status not in ("completed",):
+        test_verdict = "inconclusive"
+        verification_results = []
+    # 向后兼容 status
+    status = "success" if (execution_status == "completed" and test_verdict == "passed") else status
+
     if _relational_db:
         try:
             seen = set()
@@ -556,13 +648,16 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 conclusion=str(conclusion),
                 steps=dd,
                 duration_seconds=duration,
+                execution_status=execution_status,
+                test_verdict=test_verdict,
+                verification_json=json.dumps(verification_results, ensure_ascii=False),
             )
         except:
             pass
 
     logger.info(
-        "Reporter: status=%s success=%d fail=%d continue=%d duration=%.1fs conclusion=%s",
-        status,
+        "Reporter: exec=%s verdict=%s steps(success=%d fail=%d continue=%d) duration=%.1fs conclusion=%s",
+        execution_status, test_verdict,
         pc,
         fc,
         cc,
@@ -574,6 +669,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             "conclusion": str(conclusion),
             "status": status,
             "step_history": history,
+            "execution_status": execution_status,
+            "test_verdict": test_verdict,
+            "verification_results": verification_results,
         }
     )
 

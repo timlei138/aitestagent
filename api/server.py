@@ -333,6 +333,7 @@ async def get_case_content(case_file: str):
 
 # ── 静态文件 ──
 
+app.mount("/storage", StaticFiles(directory=str(BASE_DIR / "storage")), name="storage")
 app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 

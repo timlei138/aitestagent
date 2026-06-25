@@ -33,3 +33,7 @@ class TestState(TypedDict, total=False):
     status: str
     started_at: str
     step_times: list[dict[str, Any]]
+    # V2: 双维度结果
+    execution_status: str       # completed / exhausted / error / cancelled / device_offline
+    test_verdict: str           # passed / failed / inconclusive
+    verification_results: list  # [{"item": "...", "result": "passed|failed|unknown", "screenshot": ""}]

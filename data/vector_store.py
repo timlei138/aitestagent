@@ -129,8 +129,9 @@ class ChromaBackend(VectorStoreBackend):
     def get_by_metadata(self, where: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
         """按 metadata 精确过滤获取，返回格式对齐 search()。"""
         try:
+            chroma_where = self._to_chroma_filter(where) if len(where) > 1 else where
             raw = self._store.get(
-                where=where, limit=limit,
+                where=chroma_where, limit=limit,
                 include=["documents", "metadatas"],
             )
         except Exception:

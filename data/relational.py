@@ -106,6 +106,8 @@ class SqliteBackend(RelationalBackend):
         self._conn.commit()
         # ── V2: 新增列（兼容已有数据库） ──
         self._migrate_v2_columns()
+        # ── V3: 双维度结果列 ──
+        self._migrate_v3_columns()
 
     def _migrate_v2_columns(self) -> None:
         """V2 迁移：为 element_identities 新增 screen_width/screen_height/bounds_json 列。"""
@@ -120,6 +122,19 @@ class SqliteBackend(RelationalBackend):
                 )
             except sqlite3.OperationalError:
                 pass  # 列已存在
+        self._conn.commit()
+
+    def _migrate_v3_columns(self) -> None:
+        """V3 迁移：为 test_runs 新增 execution_status / test_verdict / verification_json 列。"""
+        for col, typedef in [
+            ("execution_status", "TEXT DEFAULT ''"),
+            ("test_verdict", "TEXT DEFAULT ''"),
+            ("verification_json", "TEXT DEFAULT '[]'"),
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
         self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
@@ -169,7 +184,9 @@ class SqliteBackend(RelationalBackend):
 
     def record_test_run(self, run_id: str, user_request: str, app_package: str,
                         app_name: str, status: str, conclusion: str,
-                        steps: list[dict], duration_seconds: float = 0) -> None:
+                        steps: list[dict], duration_seconds: float = 0,
+                        execution_status: str = "", test_verdict: str = "",
+                        verification_json: str = "[]") -> None:
         """快捷方法：记录一次测试执行。"""
         self.upsert("test_runs", {
             "id": run_id,
@@ -180,6 +197,9 @@ class SqliteBackend(RelationalBackend):
             "conclusion": str(conclusion)[:2000],
             "steps_json": json.dumps(steps, ensure_ascii=False),
             "duration_seconds": duration_seconds,
+            "execution_status": execution_status,
+            "test_verdict": test_verdict,
+            "verification_json": verification_json,
             "created_at": datetime.now().isoformat(),
         }, key="id")
 
@@ -198,7 +218,8 @@ class SqliteBackend(RelationalBackend):
         """查询最近的测试执行记录列表。"""
         rows = self._conn.execute(
             "SELECT id, user_request, app_package, status, conclusion, "
-            "steps_json, duration_seconds, created_at FROM test_runs "
+            "steps_json, duration_seconds, created_at, "
+            "execution_status, test_verdict FROM test_runs "
             "ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
         result: list[dict[str, Any]] = []
@@ -210,6 +231,11 @@ class SqliteBackend(RelationalBackend):
             d["pass_count"] = pass_count
             d["fail_count"] = fail_count
             d["total_steps"] = len(steps)
+            # 旧数据兼容：无新列时从 status 推导
+            if not d.get("execution_status"):
+                d["execution_status"] = "completed" if d["status"] == "success" else "error"
+            if not d.get("test_verdict"):
+                d["test_verdict"] = "passed" if d["status"] == "success" else "inconclusive"
             result.append(d)
         return result
 
@@ -217,7 +243,8 @@ class SqliteBackend(RelationalBackend):
         """查询单次测试执行的完整报告。"""
         row = self._conn.execute(
             "SELECT id, user_request, app_package, app_name, status, conclusion, "
-            "steps_json, duration_seconds, created_at FROM test_runs WHERE id = ?",
+            "steps_json, duration_seconds, created_at, "
+            "execution_status, test_verdict, verification_json FROM test_runs WHERE id = ?",
             (run_id,)
         ).fetchone()
         if not row:
@@ -230,6 +257,12 @@ class SqliteBackend(RelationalBackend):
         d["pass_count"] = pass_count
         d["fail_count"] = fail_count
         d["total_steps"] = len(steps)
+        # 旧数据兼容
+        if not d.get("execution_status"):
+            d["execution_status"] = "completed" if d["status"] == "success" else "error"
+        if not d.get("test_verdict"):
+            d["test_verdict"] = "passed" if d["status"] == "success" else "inconclusive"
+        d["verification_results"] = json.loads(d.pop("verification_json", "[]") or "[]")
         return d
 
     # ── 元素身份 ──

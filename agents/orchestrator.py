@@ -45,18 +45,19 @@ class TestOrchestrator:
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
         # 设备连接前置检查
-        try:
-            from tools import get_tool_context
-            ctx = get_tool_context()
-            if getattr(ctx, "device", None) is None:
-                msg = "Android 设备未连接，请检查 USB/ADB 连接后重试"
-                self._emit("error", {"message": msg})
-                return {
-                    "thread_id": thread_id or "", "status": "device_offline",
-                    "mode": "run", "conclusion": msg, "steps": [],
-                }
-        except Exception:
-            pass
+        from tools import get_tool_context
+        ctx = get_tool_context()
+        if ctx and hasattr(ctx, '_verifications'):
+            ctx._verifications.clear()
+        if getattr(ctx, "device", None) is None:
+            msg = "Android 设备未连接，请检查 USB/ADB 连接后重试"
+            self._emit("error", {"message": msg})
+            return {
+                "thread_id": thread_id or "", "status": "device_offline",
+                "execution_status": "device_offline", "test_verdict": "inconclusive",
+                "verification_results": [],
+                "mode": "run", "conclusion": msg, "steps": [],
+            }
 
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -90,6 +91,8 @@ class TestOrchestrator:
                     return {
                         "thread_id": thread_id, "status": "need_human", "mode": "run",
                         "interrupt": interrupt_data, "conclusion": "", "steps": [],
+                        "execution_status": "", "test_verdict": "inconclusive",
+                        "verification_results": [],
                     }
             return self._build_result(thread_id, final_state)
         except Exception as exc:
@@ -117,6 +120,12 @@ class TestOrchestrator:
         config_ctx = {"configurable": {"thread_id": thread_id, "test_config": self.config}}
 
         yield {"type": "status", "content": f"开始执行: {user_request}"}
+
+        # 清空上次测试的验证结果
+        from tools import get_tool_context as _gtc
+        _sctx = _gtc()
+        if _sctx and hasattr(_sctx, '_verifications'):
+            _sctx._verifications.clear()
 
         from config import start_run_log
         run_log = start_run_log(thread_id)
@@ -158,7 +167,11 @@ class TestOrchestrator:
                     "type": "result",
                     "content": {
                         "status": final_state.values.get("status", "success"),
+                        "execution_status": final_state.values.get("execution_status", ""),
+                        "test_verdict": final_state.values.get("test_verdict", ""),
+                        "verification_results": final_state.values.get("verification_results", []),
                         "conclusion": final_state.values.get("conclusion", ""),
+                        "steps": final_state.values.get("step_history", []),
                     },
                 }
 
@@ -182,6 +195,11 @@ class TestOrchestrator:
             logger.warning("Resume already in flight for thread %s, ignoring duplicate", thread_id)
             return self._build_result(thread_id, self._state_cache.get(thread_id, {}))
         self._resume_in_flight.add(thread_id)
+        # 清空上次验证结果
+        from tools import get_tool_context as _gtc
+        _sctx = _gtc()
+        if _sctx and hasattr(_sctx, '_verifications'):
+            _sctx._verifications.clear()
         config_ctx = {"configurable": {"thread_id": thread_id, "test_config": self.config}}
         self._emit("status",
                    f"恢复执行: {decision if isinstance(decision, str) else decision.get('action', 'confirm')}")
@@ -217,6 +235,11 @@ class TestOrchestrator:
             yield {"type": "error", "content": "执行已在恢复中，请勿重复操作"}
             return
         self._resume_in_flight.add(thread_id)
+        # 清空上次验证结果
+        from tools import get_tool_context as _gtc
+        _sctx = _gtc()
+        if _sctx and hasattr(_sctx, '_verifications'):
+            _sctx._verifications.clear()
         config_ctx = {"configurable": {"thread_id": thread_id, "test_config": self.config}}
         label = decision if isinstance(decision, str) else decision.get("action", "confirm")
         yield {"type": "status", "content": f"恢复执行: {label}"}
@@ -251,7 +274,11 @@ class TestOrchestrator:
                 if final_state and final_state.values:
                     yield {"type": "result", "content": {
                         "status": final_state.values.get("status", "success"),
+                        "execution_status": final_state.values.get("execution_status", ""),
+                        "test_verdict": final_state.values.get("test_verdict", ""),
+                        "verification_results": final_state.values.get("verification_results", []),
                         "conclusion": final_state.values.get("conclusion", ""),
+                        "steps": final_state.values.get("step_history", []),
                     }}
             except Exception as exc:
                 yield {"type": "error", "content": str(exc)}
@@ -265,6 +292,9 @@ class TestOrchestrator:
         result = {
             "thread_id": thread_id,
             "status": state.get("status", "success"),
+            "execution_status": state.get("execution_status", ""),
+            "test_verdict": state.get("test_verdict", ""),
+            "verification_results": state.get("verification_results", []),
             "mode": "run",
             "conclusion": state.get("conclusion", ""),
             "steps": state.get("step_history", []),
@@ -279,10 +309,13 @@ class TestOrchestrator:
             info = _extract_interrupt_info(exc)
             self._emit(info.get("type", "need_human_approval"), info)
             return {"thread_id": thread_id, "status": "need_human", "mode": "run",
-                    "interrupt": info, "conclusion": "", "steps": []}
+                    "interrupt": info, "conclusion": "", "steps": [],
+                    "execution_status": "", "test_verdict": "", "verification_results": []}
         self._emit("result", {"status": "error", "conclusion": exc_msg})
         return {"thread_id": thread_id, "status": "error", "mode": "run",
-                "conclusion": exc_msg, "steps": []}
+                "conclusion": exc_msg, "steps": [],
+                "execution_status": "error", "test_verdict": "inconclusive",
+                "verification_results": []}
 
 
 def _extract_interrupt_info(exc: Exception) -> dict[str, Any]:
