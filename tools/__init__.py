@@ -911,13 +911,26 @@ def long_press(label: str, duration: float = 0.8) -> str:
 
 
 @tool
-def paste() -> str:
-    """粘贴剪贴板内容到当前焦点输入框（系统级 CTRL+V，无需操作系统粘贴弹窗）。"""
+def copy() -> str:
+    """复制当前选中内容到剪贴板。应在 long_press 触发系统弹窗后调用，自动点击弹窗中的"复制"按钮。"""
     ctx = get_tool_context()
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
-    ctx.device.paste()
-    return "已粘贴剪贴板内容"
+    strategy = ctx.device.copy()
+    return f"已复制 (strategy={strategy})"
+
+
+@tool
+def paste() -> str:
+    """粘贴剪贴板内容到当前焦点输入框。依次尝试 CTRL+V → KEYCODE_PASTE → 系统弹窗"粘贴"按钮。粘贴后应用 get_screen_info 验证内容是否已成功出现在输入框中。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+    strategy = ctx.device.paste()
+    msg = f"已粘贴 (strategy={strategy})"
+    if strategy == "paste_ctrl_v":
+        msg += " | 请用 get_screen_info 确认内容已出现在输入框，如未出现则手动 long_press 输入框后 click(\"粘贴\")"
+    return msg
 
 
 @tool
@@ -1003,6 +1016,23 @@ def toggle_auto_rotate(enable: bool = True) -> str:
     ctx.device.freeze_rotation(not enable)
     action = "开启" if enable else "关闭"
     return f"已{action}自动旋转"
+
+
+@tool
+def check_desktop_mode(mode: str = "dw") -> str:
+    """检查当前是否处于指定桌面模式。mode 可选: dw（无限工作台/CustomModeLauncher，检查 zui_ov_desktop_mode==1）。
+    返回当前模式和判断结果，供 Agent 在操作前确认环境状态。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备"
+
+    key_map = {"dw": "zui_ov_desktop_mode"}
+    key = key_map.get(mode, mode)
+    val = ctx.device.get_system_setting(key, "system")
+    if mode == "dw":
+        is_dw = val == "1"
+        return f"桌面模式: {'无限工作台' if is_dw else '普通桌面'} (zui_ov_desktop_mode={val or '0'})"
+    return f"{key}={val or '(未设置)'}"
 
 
 @tool
@@ -1344,9 +1374,9 @@ PLANNER_TOOLS: list[Any] = [
 
 AGENT_TOOLS: list[Any] = [
     get_screen_info, query_app_knowledge, query_element_identity,
-    click, navigate_to, scroll_find_and_click, long_press, scroll_panel,
+    click, navigate_to, scroll_find_and_click, long_press, copy, scroll_panel,
     type_input, press_key, paste, swipe, open_notification, open_quick_settings,
-    unlock_screen, set_orientation, toggle_auto_rotate,
+    unlock_screen, set_orientation, toggle_auto_rotate, check_desktop_mode,
     launch_app,
     detect_popup, dismiss_popup, wait_seconds,
     check_page_health, recover_from_anomaly,

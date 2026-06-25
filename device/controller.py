@@ -362,9 +362,45 @@ class DeviceController:
     def type_text(self, text: str) -> None:
         self.device.send_keys(text, clear=True)
 
-    def paste(self) -> None:
-        """粘贴剪贴板内容（CTRL+V 系统级粘贴，无需操作弹窗）。"""
+    def copy(self) -> str:
+        """触发复制操作：查找并点击系统弹窗中的'复制'按钮。"""
+        try:
+            if self.device(text="复制").exists(timeout=1):
+                self.device(text="复制").click()
+                return "copy_popup"
+        except Exception:
+            pass
+        # 兜底：KEYCODE_COPY (278)
+        try:
+            self.device.shell("input keyevent 278")
+            return "copy_keyevent"
+        except Exception:
+            pass
+        return "copy_unknown"
+
+    def paste(self) -> str:
+        """粘贴剪贴板内容。先尝试 CTRL+V，失败则通过长按触发系统弹窗点击'粘贴'。"""
+        # 方案1: CTRL+V
         self.device.press("v", meta=True)
+        # 方案2: KEYCODE_PASTE (279)
+        try:
+            self.device.shell("input keyevent 279")
+        except Exception:
+            pass
+        # 方案3: 查找并点击系统弹窗中的"粘贴"按钮
+        try:
+            if self.device(text="粘贴").exists(timeout=1):
+                self.device(text="粘贴").click()
+                return "paste_popup"
+        except Exception:
+            pass
+        return "paste_ctrl_v"
+
+    def get_system_setting(self, key: str, namespace: str = "system") -> str:
+        """读取 Android 系统设置（Settings.System / Secure / Global）。"""
+        resp = self.device.shell(f"settings get {namespace} {key}")
+        raw = (resp.output or "").strip() if hasattr(resp, "output") else str(resp).strip()
+        return raw if raw and raw != "null" else ""
 
     def press(self, key: str) -> None:
         self.device.press(key)

@@ -28,3 +28,12 @@
 
 ## App 知识参考
 如果用户消息中提供了 App 操作前提、历史验证计划或导航经验，请将其融入 hints（前提条件放第一条），但以实际页面为准。
+
+## Agent 可用工具
+Agent 有以下快捷工具，hints 中应直接提示使用工具名，不要建议手动操作：
+- `launch_app("名称")` — 直接启动应用（最快）
+- `paste()` — 粘贴剪贴板内容（系统CTRL+V，无需操作弹窗）
+- `long_press("元素")` — 长按触发菜单
+- `open_quick_settings()` — 打开控制中心
+- `open_notification()` — 打开通知栏
+- `unlock_screen()` / `set_orientation()` — 锁屏解锁 / 屏幕方向

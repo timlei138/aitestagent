@@ -12,9 +12,9 @@ get_screen_info → click("目标元素") 或 long_press("目标元素") → 查
 → 否则继续下一步
 ```
 
-## 长按与粘贴
-- 长按触发菜单、删除、拖拽等 → 使用 `long_press("目标元素")`
-- 粘贴剪贴板内容 → 先点击输入框获得焦点，再直接用 `paste()`（系统级 CTRL+V，无需操作弹窗）
+## 长按、复制与粘贴
+- 长按触发菜单 → `long_press("目标元素")`，弹窗出现后 `copy()` 点击"复制"按钮
+- 粘贴剪贴板 → 先点击输入框获得焦点，再 `paste()`。如 paste 返回 strategy=paste_ctrl_v，必须用 `get_screen_info` 验证内容是否真的出现了
 - 页面元素不可见时，使用 `scroll_find_and_click("目标元素")` 滑动查找
 
 ## 错误流程（禁止）
