@@ -36,7 +36,7 @@ def test_ws_run_flow():
 
 def test_case_content_read():
     """GET /api/cases/content 读取已有的用例文件。"""
-    existing_case = "test_cases/feedback_submit.yaml"
+    existing_case = "test_cases/日期格式切换验证_美国与英国.yaml"
     response = client.get("/api/cases/content", params={"case_file": existing_case})
     assert response.status_code == 200
     data = response.json()

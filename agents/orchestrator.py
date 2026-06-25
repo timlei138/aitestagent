@@ -72,6 +72,10 @@ class TestOrchestrator:
 
         self._emit("status", f"开始执行: {user_request}")
 
+        # 为本次运行创建独立日志
+        from config import start_run_log
+        run_log = start_run_log(thread_id)
+
         try:
             final_state = self.graph.invoke(initial_state, config_ctx)
             self._state_cache[thread_id] = final_state
@@ -90,6 +94,8 @@ class TestOrchestrator:
             return self._build_result(thread_id, final_state)
         except Exception as exc:
             return self._handle_exception(thread_id, exc)
+        finally:
+            run_log["cleanup"]()
 
     # ── 流式执行 (LangGraph astream_events) ──
 
@@ -112,6 +118,8 @@ class TestOrchestrator:
 
         yield {"type": "status", "content": f"开始执行: {user_request}"}
 
+        from config import start_run_log
+        run_log = start_run_log(thread_id)
         try:
             async for event in self.graph.astream_events(initial_state, config_ctx, version="v2"):
                 kind = event.get("event", "")
@@ -163,6 +171,8 @@ class TestOrchestrator:
             else:
                 logger.exception("Stream execution failed")
                 yield {"type": "error", "content": exc_msg}
+        finally:
+            run_log["cleanup"]()
 
     # ── 恢复执行 ──
 
@@ -188,6 +198,8 @@ class TestOrchestrator:
             else:
                 resume_value = "confirm"
 
+        from config import start_run_log
+        run_log = start_run_log(f"{thread_id}_resume")
         try:
             final_state = self.graph.invoke(Command(resume=resume_value), config_ctx)
             self._state_cache[thread_id] = final_state
@@ -195,6 +207,7 @@ class TestOrchestrator:
         except Exception as exc:
             return self._handle_exception(thread_id, exc)
         finally:
+            run_log["cleanup"]()
             self._resume_in_flight.discard(thread_id)
 
     async def resume_stream(self, thread_id: str, decision: Any) -> AsyncIterator[dict[str, Any]]:
@@ -219,6 +232,8 @@ class TestOrchestrator:
             else:
                 resume_value = "confirm"
 
+        from config import start_run_log
+        run_log = start_run_log(f"{thread_id}_resume")
         try:
             try:
                 async for event in self.graph.astream_events(Command(resume=resume_value), config_ctx, version="v2"):
@@ -241,6 +256,7 @@ class TestOrchestrator:
             except Exception as exc:
                 yield {"type": "error", "content": str(exc)}
         finally:
+            run_log["cleanup"]()
             self._resume_in_flight.discard(thread_id)
 
     # ── 内部 ──

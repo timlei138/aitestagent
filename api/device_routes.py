@@ -62,10 +62,16 @@ def _device_required(dev):
 
 @router.get("/status")
 async def device_status():
-    """查询设备连接状态。"""
+    """查询设备连接状态。离线时自动尝试重连。"""
     dev = _get_device()
     if dev is None:
-        return {"connected": False, "detail": "Android 设备未连接，请检查 USB/ADB 连接后重试"}
+        # 自动尝试重连（设备可能在服务器启动后才插入）
+        from api.server import reconnect_device
+        result = reconnect_device()
+        if result.get("connected"):
+            dev = _get_device()
+        else:
+            return {"connected": False, "detail": "Android 设备未连接，请检查 USB/ADB 连接后重试"}
     try:
         app = dev.current_app()
         return {

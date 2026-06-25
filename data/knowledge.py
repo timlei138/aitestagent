@@ -16,10 +16,11 @@ class UIKnowledge:
 
 
 class KnowledgeBase:
-    """RAG 知识库 —— 业务逻辑（操作经验、验证计划、人工知识）和底层存储解耦。"""
+    """RAG 知识库 —— 业务逻辑（操作经验、人工知识）和底层存储解耦。"""
 
     # 类型别名映射（旧数据兼容：查询新类型时自动匹配旧类型）
-    _TYPE_ALIASES = {
+    _TYPE_ALIASES: dict[str, list[str]] = {
+        # 旧类型名仍可能被查询到（清理前的过渡期），保留别名兼容
         "experience": ["experience", "navigation_path", "page_structure", "test_experience"],
         "curated_rule": ["curated_rule", "app_precondition", "global_knowledge"],
     }
@@ -54,26 +55,22 @@ class KnowledgeBase:
     def save_experience(self, app_package: str, page: str, action: str = "",
                         to_page: str = "", outcome: str = "",
                         detail: str = "", labels: list[str] | None = None) -> None:
-        """保存操作经验 —— 统一记录页面操作的结果。"""
+        """保存操作经验 —— 精简格式: A → action → B"""
 
-        # 动态构建 content（根据实际参数灵活组合）
-        parts = [f"在 {page} 页面"]
+        # 精简内容格式
+        content = page
         if action:
-            parts.append(f"通过 '{action}' 操作")
+            content += f" → {action}"
         if to_page:
-            parts.append(f"到达 {to_page}")
-        if labels:
-            parts.append(f"包含: {'; '.join(labels[:15])}")
-        if outcome:
-            parts.append(f"结果: {outcome}")
-        if detail and outcome != "成功":
-            parts.append(f"详情: {detail[:100]}")
-        content = "，".join(parts)
+            content += f" → {to_page}"
 
-        # 去重：用 content 文本直接比较，简单可靠
-        existing = self.query("", app_package=app_package,
-                             knowledge_type="experience", top_k=5)
-        if any(e.get("content", "") == content for e in existing):
+        # 去重：用 get_by_metadata 按 metadata 精确过滤（不走向量搜索）
+        existing = self.backend.get_by_metadata(
+            where={"app_package": app_package, "knowledge_type": "experience",
+                   "page": page, "action": action, "to_page": to_page},
+            limit=1,
+        )
+        if existing:
             return
 
         self.save_knowledge(UIKnowledge(
@@ -83,9 +80,40 @@ class KnowledgeBase:
                       "outcome": outcome, "timestamp": datetime.now().isoformat()},
         ))
 
-    def query_experience(self, app_package: str, page: str, top_k: int = 5):
-        return self.query(f"从 {page} 操作", app_package=app_package,
-                         knowledge_type="experience", top_k=top_k)
+    def query_experience(self, app_package: str, user_request: str = "",
+                          top_k: int = 5) -> list[dict[str, Any]]:
+        """分层查询操作经验: Layer1 精确过滤当前 App + Layer2 语义搜索兆底。"""
+        results: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        # Layer 1: 精确过滤当前 App（有包名时，同 App 内导航最常见）
+        if app_package:
+            precise = self.backend.get_by_metadata(
+                where={"app_package": app_package, "knowledge_type": "experience"},
+                limit=top_k * 3,
+            )
+            # ChromaDB get() 不保证顺序，Python 侧按 timestamp 降序
+            precise.sort(
+                key=lambda r: r.get("metadata", {}).get("timestamp", ""),
+                reverse=True,
+            )
+            for r in precise[:top_k]:
+                key = r["content"]
+                if key not in seen:
+                    seen.add(key)
+                    results.append(r)
+
+        # Layer 2: 语义搜索兆底（跨 App / 系统级 / 无包名场景）
+        if len(results) < top_k and user_request:
+            semantic = self.query(user_request[:80], knowledge_type="experience",
+                                  top_k=top_k - len(results))
+            for r in semantic:
+                key = r["content"]
+                if key not in seen:
+                    seen.add(key)
+                    results.append(r)
+
+        return results
 
     # ── 人工知识 (curated_rule) ──
 
@@ -125,150 +153,10 @@ class KnowledgeBase:
             parts.append("### App 操作前提\n" + "\n".join(app_lines))
         return "\n\n".join(parts)
 
-    # ── 旧方法兼容 wrapper（转发 + DeprecationWarning）──
-
-    def save_navigation_path(self, app_package: str, from_page: str, to_page: str,
-                             action: str) -> None:
-        import warnings
-        warnings.warn("save_navigation_path is deprecated, use save_experience", DeprecationWarning)
-        self.save_experience(app_package=app_package, page=from_page,
-                            action=action, to_page=to_page, outcome="成功")
-
-    def save_test_experience(self, app_package: str, page: str, action: str,
-                             outcome: str, detail: str = "") -> None:
-        import warnings
-        warnings.warn("save_test_experience is deprecated, use save_experience", DeprecationWarning)
-        self.save_experience(app_package=app_package, page=page, action=action,
-                            outcome=outcome, detail=detail)
-
-    def save_page_structure(self, app_package: str, page_name: str,
-                            elements: list[dict[str, Any]]) -> int:
-        import warnings
-        warnings.warn("save_page_structure is deprecated, use save_experience", DeprecationWarning)
-        labels = [e.get("label") or e.get("text") or e.get("content_desc") for e in elements[:30]]
-        labels = [l for l in labels if l]
-        self.save_experience(app_package=app_package, page=page_name, labels=labels)
-        return 1
-
-    def save_precondition(self, app_package: str, rule: str) -> None:
-        import warnings
-        warnings.warn("save_precondition is deprecated, use save_curated_rule", DeprecationWarning)
-        self.save_curated_rule(app_package=app_package, content=rule)
-
-    def save_global_knowledge(self, content: str) -> None:
-        import warnings
-        warnings.warn("save_global_knowledge is deprecated, use save_curated_rule", DeprecationWarning)
-        self.save_curated_rule(app_package="", content=content)
-
-    def query_navigation(self, app_package: str, page: str,
-                         top_k: int = 5) -> list[dict[str, Any]]:
-        import warnings
-        warnings.warn("query_navigation is deprecated, use query_experience", DeprecationWarning)
-        return self.query_experience(app_package, page, top_k=top_k)
-
-    def query_preconditions(self, app_package: str, top_k: int = 3) -> str:
-        import warnings
-        warnings.warn("query_preconditions is deprecated, use query_curated_rules", DeprecationWarning)
-        rules = self.query_curated_rules(app_package, top_k=top_k)
-        return rules.replace("### 全局知识\n", "").replace("### App 操作前提\n", "").strip()
-
-    def query_global_knowledge(self, query: str = "",
-                                top_k: int = 5) -> str:
-        import warnings
-        warnings.warn("query_global_knowledge is deprecated, use query_curated_rules", DeprecationWarning)
-        rules = self.query_curated_rules("", top_k=top_k)
-        return rules.replace("### 全局知识\n", "").strip()
-
-    # ── 从测试结果批量提取 ──
-
-    def extract_from_test_result(
-        self, app_package: str, test_case: str,
-        execution_log: list[dict[str, Any]], final_result: str,
-    ) -> int:
-        count = 0
-        visited_pages: set[str] = set()
-        for entry in execution_log:
-            page = entry.get("page", "") or "未知页面"
-            action = entry.get("action", "?")
-            observation = entry.get("observation", "")
-            step_ok = entry.get("result") == "success"
-            to_page = entry.get("post_page", "")
-
-            # labels 提取沿用原逻辑，visited 去重（同一页面不重复提取）
-            labels = []
-            if page not in visited_pages:
-                visited_pages.add(page)
-                labels = _extract_labels_from_observation(observation)
-
-            self.save_experience(
-                app_package=app_package, page=page, action=action,
-                to_page=to_page if (to_page and to_page != page) else "",
-                outcome="成功" if step_ok else "失败",
-                detail=observation if not step_ok else "",
-                labels=labels,
-            )
-            count += 1
-        return count
-
-    # ── 验证计划 (ChromaDB) ──
-
-    def save_verified_plan(self, app_package: str, user_request: str,
-                           plan: list[dict[str, Any]],
-                           results: list[dict[str, Any]]) -> None:
-        """保存验证计划到向量库, 供下次 Planner RAG 检索。"""
-        # P6.1 去重：已有相似计划则跳过
-        existing = self.query_verified_plan(app_package, user_request, top_k=1)
-        if existing:
-            return
-        success_targets = [s.get("intent", "")[:30] for s in results if s.get("status") == "success"]
-        fail_targets = [s.get("intent", "")[:30] for s in results if s.get("status") != "success"]
-        steps_desc = "; ".join(
-            f"步骤{s.get('index')}: {s.get('intent')}({s.get('action_type')}->{s.get('target')})"
-            for s in plan
-        )
-        content = (
-            f"{app_package} 测试 '{user_request[:50]}' 的计划: "
-            f"共 {len(plan)} 步, "
-            f"已验证成功: {', '.join(success_targets) or '无'}, "
-            f"待验证: {', '.join(fail_targets) or '无'}. "
-            f"步骤: {steps_desc}"
-        )
-        self.save_knowledge(UIKnowledge(
-            app_package=app_package,
-            knowledge_type="verified_plan",
-            content=content,
-            metadata={
-                "user_request_hash": str(hash(user_request))[:16],
-                "total_steps": len(plan),
-                "success_count": len(success_targets),
-                "fail_count": len(fail_targets),
-                "timestamp": datetime.now().isoformat(),
-            },
-        ))
-
-    def query_verified_plan(self, app_package: str, user_request: str,
-                            top_k: int = 1) -> list[dict[str, Any]]:
-        """查询向量库中的验证计划。"""
-        return self.query(
-            f"{user_request[:50]} 测试计划",
-            app_package=app_package,
-            knowledge_type="verified_plan",
-            top_k=top_k,
-        )
+    # ── 旧类型别名兼容（已删除的类型仍保留别名映射，避免旧数据查询报错） ──
 
     @property
     def count(self) -> int:
         return self.backend.count()
-
-
-def _extract_labels_from_observation(observation: str) -> list[str]:
-    """从 observation 文本中提取元素标签。"""
-    labels: list[str] = []
-    for line in observation.split("\n"):
-        for m in __import__("re").finditer(r"label='([^']+)'", line):
-            labels.append(m.group(1))
-        for m in __import__("re").finditer(r'click\("([^"]+)"\)', line):
-            labels.append(m.group(1))
-    return list(dict.fromkeys(labels))[:20]
 
 

@@ -216,3 +216,65 @@ def resolve_perception_mode(config: TestConfig) -> tuple[str, bool, Any]:
             api_key=config.vision_api_key, base_url=config.vision_base_url,
         )
         return (PerceptionMode.HYBRID, True, vlm)
+
+
+# ── 单次运行日志 ──
+
+def start_run_log(run_id: str) -> dict:
+    """为单次测试运行创建独立的 app + langchain 日志文件。
+    返回 {"app_handler": FileHandler, "langchain_file": Path, "cleanup": callable}
+    """
+    import re
+    from pathlib import Path
+
+    run_dir = Path("logs/runs")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[<>:\"/\\|?* ]", "_", run_id)[:60]
+    ts = datetime.now().strftime("%H%M%S")
+
+    # ── app 日志 ──
+    app_path = run_dir / f"{ts}_{safe_id}_app.log"
+    app_fh = logging.FileHandler(app_path, encoding="utf-8")
+    app_fh.setLevel(logging.INFO)
+    app_fh.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    ))
+    logging.getLogger().addHandler(app_fh)
+
+    # ── langchain 日志 ──
+    lc_path = run_dir / f"{ts}_{safe_id}_langchain.log"
+    lc_file = open(lc_path, "w", encoding="utf-8-sig")
+
+    _orig_stdout = sys.stdout
+    _orig_encoding = getattr(_orig_stdout, "encoding", "utf-8") or "utf-8"
+
+    class _Tee:
+        def write(self, s):
+            _orig_stdout.write(s)
+            if lc_file and not lc_file.closed:
+                try:
+                    lc_file.write(s)
+                except Exception:
+                    pass
+
+        def flush(self):
+            _orig_stdout.flush()
+            if lc_file and not lc_file.closed:
+                try:
+                    lc_file.flush()
+                except Exception:
+                    pass
+
+        @property
+        def encoding(self):
+            return _orig_encoding
+
+    sys.stdout = _Tee()
+
+    def cleanup():
+        logging.getLogger().removeHandler(app_fh)
+        app_fh.close()
+        sys.stdout = _orig_stdout
+        lc_file.close()
+
+    return {"app_handler": app_fh, "langchain_file": lc_path, "cleanup": cleanup}

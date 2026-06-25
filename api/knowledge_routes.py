@@ -121,7 +121,6 @@ async def get_knowledge_types():
         "status": "success",
         "types": [
             {"value": "experience", "label": "操作经验"},
-            {"value": "verified_plan", "label": "验证计划"},
             {"value": "curated_rule", "label": "人工知识"},
         ],
     }

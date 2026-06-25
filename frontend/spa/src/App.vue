@@ -684,16 +684,15 @@ const kbSaving = ref(false);
 const kbForm = ref({ app_package: '', knowledge_type: 'experience', content: '' });
 const kbTypes = [
   { value: 'experience', label: '操作经验' },
-  { value: 'verified_plan', label: '验证计划' },
   { value: 'curated_rule', label: '人工知识' },
 ];
 const kbTypeColorMap = {
   experience: 'warning',
-  verified_plan: 'danger',
   curated_rule: 'success',
 };
 // 旧类型兼容映射（前端显示用）
 const _legacyTypeMap = {
+  verified_plan: 'experience',
   page_structure: 'experience',
   navigation_path: 'experience',
   test_experience: 'experience',

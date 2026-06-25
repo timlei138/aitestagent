@@ -22,6 +22,7 @@ _CONTEXT: ToolContext | None = None
 def set_tool_context(context: ToolContext) -> None:
     global _CONTEXT
     _CONTEXT = context
+    reset_session_click_ids()  # 每次新执行时重置 session 去重
 
 
 def get_tool_context() -> ToolContext:
@@ -503,6 +504,107 @@ def _score_known_identity(el: Any, known_ids: list[dict[str, Any]]) -> int:
     return bonus
 
 
+# ═══════════════════════════════════════════
+#  元素身份自动记忆（SQLite，LLM 无感）
+# ═══════════════════════════════════════════
+
+_session_click_ids: set[str] = set()  # 同一次执行中已记录的 alias，用于 session 去重
+_page_transition_seen: set[str] = set()  # 同一次执行中已记录的 (page, action, to_page)，避免重复写入
+
+
+def reset_session_click_ids() -> None:
+    """重置 session 去重集合。每次测试执行开始时调用。"""
+    _session_click_ids.clear()
+    _page_transition_seen.clear()
+
+
+def _compute_page_signature(understanding: Any) -> str:
+    """计算页面签名: Activity + 可点击元素指纹。
+
+    同页面不同内容 → 指纹稳定（按钮标签不变）
+    同 Activity 不同 Fragment → 指纹不同（按钮集不同）
+    """
+    act = (understanding.activity or "").split(".")[-1] or "Unknown"
+    clickable = [e for e in understanding.elements if e.clickable]
+    stable = [e for e in clickable
+              if e.label and len(e.label) > 1 and len(e.label) < 10
+              and not e.label.isdigit() and not e.label.startswith("--")]
+    # 按 label 排序，取前 5 个最稳定的
+    stable.sort(key=lambda e: len(e.label or ""))
+    fingerprint = [e.label for e in stable[:5]]
+    return f"{act}「{','.join(fingerprint)}」" if fingerprint else act
+
+
+def _query_known_by_rid(resource_id: str) -> list[dict[str, Any]]:
+    """反向查询: 通过 resource_id 查找历史身份。
+
+    用于场景: click("左下角应用按钮") → 语义搜索找到 el, rid=taskbar_view
+    → 反查 SQLite 发现 alias='应用列表' click_count=3 → 加分
+    """
+    if not resource_id:
+        return []
+    try:
+        ctx = get_tool_context()
+        if not ctx or not ctx.device:
+            return []
+        db = getattr(ctx, "relational_db", None)
+        if db is None:
+            from data import create_relational_db
+            from config import TestConfig
+            db = create_relational_db(TestConfig())
+        package = ctx.device.current_app().get("package", "")
+        rows = db.select("element_identities", {
+            "app_package": package, "resource_id": resource_id,
+        }, order_by="click_count DESC", limit=3)
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _save_click_identity(ctx: Any, label: str, best_el: Any, understanding: Any) -> None:
+    """click 成功后自动保存元素身份到 SQLite。
+
+    session 去重: 同一次执行中同一个 alias 的 click_count 只 +1。
+    """
+    try:
+        if not ctx or not ctx.device or not best_el:
+            return
+        db = getattr(ctx, "relational_db", None)
+        if db is None:
+            return
+        # Session 去重
+        alias_key = f"{ctx.device.current_app().get('package', '')}:{label}"
+        if alias_key in _session_click_ids:
+            return
+        _session_click_ids.add(alias_key)
+
+        page_sig = _compute_page_signature(understanding) if understanding else ""
+        resource_id = getattr(best_el, "resource_id", "") or ""
+        bounds = getattr(best_el, "bounds", (0, 0, 0, 0))
+        bounds_json = ""
+        if bounds and bounds != (0, 0, 0, 0):
+            bounds_json = json.dumps({"x1": bounds[0], "y1": bounds[1],
+                                       "x2": bounds[2], "y2": bounds[3]})
+        screen_w, screen_h = ctx.screen_size
+        db.save_element_identity(
+            app_package=ctx.device.current_app().get("package", ""),
+            page_signature=page_sig,
+            alias=label,
+            resource_id=resource_id,
+            class_name=getattr(best_el, "class_name", "") or "",
+            role=getattr(best_el, "role", "") or "",
+            region=getattr(best_el, "region", "") or "",
+            text_hint=getattr(best_el, "text", "") or "",
+            bounds_json=bounds_json,
+            screen_width=screen_w,
+            screen_height=screen_h,
+        )
+        logger.info("Saved identity: alias=%r rid=%s page_sig=%s",
+                    label, resource_id, page_sig)
+    except Exception as exc:
+        logger.debug("_save_click_identity failed: %s", exc)
+
+
 @tool
 def query_app_knowledge(query: str, app_package: str = "") -> str:
     """Query operation experience and curated rules for the given app."""
@@ -623,6 +725,7 @@ def click(label: str, alternatives: str = "") -> str:
 
     def _with_snapshot(base_result: str) -> str:
         """为成功的点击结果追加操作后页面状态。"""
+        _save_click_identity(ctx, label, best_el, understanding)
         snap = _post_click_snapshot(ctx, _pre_title, label)
         return f"{base_result} | {snap}" if snap else base_result
 
@@ -653,8 +756,9 @@ def click(label: str, alternatives: str = "") -> str:
             _record_page_transition(ctx, _pre_page, label)
             return _with_snapshot(_format_click_log(matched_label, best_el, strategy="bounds"))
 
-    # 兜底：未找到语义匹配，回退到原始文本/资源点击
+    # 兆底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):
+        _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(ctx, _pre_page, label)
         return _with_snapshot(f"已点击: {label} (strategy=text-fallback)")
     # 历史身份兜底
@@ -663,7 +767,7 @@ def click(label: str, alternatives: str = "") -> str:
     for known in known_ids:
         rid = known.get("resource_id", "")
         if rid and ctx.device.click_resource_id(rid):
-            _clicked = True
+            _save_click_identity(ctx, label, None, understanding)
             _record_page_transition(ctx, _pre_page, label)
             return _with_snapshot(f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)")
     # 百分比 bounds 兜底
@@ -679,6 +783,7 @@ def click(label: str, alternatives: str = "") -> str:
                     and 0 <= bounds[0] < screen_w and 0 <= bounds[1] < screen_h
                     and bounds[2] <= screen_w and bounds[3] <= screen_h):
                 ctx.device.click_bounds(bounds)
+                _save_click_identity(ctx, label, None, understanding)
                 _clicked = True
                 _record_page_transition(ctx, _pre_page, label)
                 return _with_snapshot(
@@ -686,6 +791,7 @@ def click(label: str, alternatives: str = "") -> str:
                     f"bounds=({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) "
                     f"(strategy=pct-bounds-fallback)")
     if ctx.device.click_resource_id(label):
+        _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(ctx, _pre_page, label)
         return _with_snapshot(f"已点击资源: {label} (strategy=rid-fallback)")
     return f"未找到可点击元素: {label}"
@@ -793,19 +899,29 @@ def _post_click_snapshot(ctx: Any, pre_title: str, label: str) -> str:
 
 
 def _record_page_transition(ctx: Any, pre_page: str, label: str) -> None:
-    """记录页面流转到知识库（异步，失败不阻塞）。"""
+    """记录页面流转到知识库（异步，失败不阻塞）。
+
+    组合去重: 同一次执行中同一 (page, action, to_page) 只写入一次。
+    """
     if not pre_page:
         return
     try:
         post_page = _capture_page_id(ctx)
         if post_page and post_page != pre_page:
+            # 组合去重
+            action = f"click({label})"
+            combo_key = f"{pre_page}|{action}|{post_page}"
+            if combo_key in _page_transition_seen:
+                return
+            _page_transition_seen.add(combo_key)
+
             kb = ctx.knowledge_base
             if kb:
                 app_pkg = ctx.device.current_app().get("package", "")
                 kb.save_experience(
                     app_package=app_pkg,
                     page=pre_page,
-                    action=f"click({label})",
+                    action=action,
                     to_page=post_page,
                     outcome="成功",
                 )
@@ -840,6 +956,7 @@ def scroll_find_and_click(label: str, max_swipes: int = 3, panel: str = "") -> s
                 understanding = ctx.perceiver.perceive()
                 best_el, _ = _find_best_element_with_known(understanding, label)
                 if best_el is not None:
+                    _save_click_identity(ctx, label, best_el, understanding)
                     if best_el.text and ctx.device.click_text(best_el.text):
                         logger.info("scroll_find[%d]: semantic hit label=%r text=%r",
                                     attempt, label, best_el.text)
@@ -861,6 +978,7 @@ def scroll_find_and_click(label: str, max_swipes: int = 3, panel: str = "") -> s
                 logger.warning("scroll_find[%d]: perceive failed | %s", attempt, exc)
 
         if ctx.device.click_text(label, timeout=0.5):
+            _save_click_identity(ctx, label, None, understanding)
             logger.info("scroll_find[%d]: text hit label=%r", attempt, label)
             return f"已找到并点击: {label}"
 
@@ -890,6 +1008,7 @@ def long_press(label: str, duration: float = 0.8) -> str:
         best_el, _ = _find_best_element_with_known(understanding, label)
         if best_el is not None:
             ctx.device.long_click_bounds(best_el.bounds, duration)
+            _save_click_identity(ctx, label, best_el, understanding)
             msg = _format_click_log(label, best_el, strategy="long_press")
             return msg + f" | 长按 {duration}s"
         # 扩充搜索：含非 clickable 元素（历史记录行、文本标签等 clickable=false 但支持长按）
@@ -899,6 +1018,7 @@ def long_press(label: str, duration: float = 0.8) -> str:
             el_rid = (el.resource_id or "").lower()
             if (label_lower in el_label or label_lower in el_rid) and el.bounds != (0, 0, 0, 0):
                 ctx.device.long_click_bounds(el.bounds, duration)
+                _save_click_identity(ctx, label, el, understanding)
                 msg = _format_click_log(label, el, strategy="long_press_nonclickable")
                 return msg + f" | 长按 {duration}s"
         logger.info("long_press: miss target=%r", label)

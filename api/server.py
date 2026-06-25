@@ -84,6 +84,8 @@ def reconnect_device() -> dict:
     global _device, _perceiver
     try:
         _device = DeviceController()
+        # 显式确保 ATX 代理已安装并运行（设备可能在服务器运行期间重启过）
+        _device._ensure_atx()
         logging.getLogger(__name__).info("Device reconnected")
     except DeviceUnavailableError as exc:
         _device = None

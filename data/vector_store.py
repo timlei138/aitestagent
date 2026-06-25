@@ -42,6 +42,11 @@ class VectorStoreBackend(ABC):
         """返回知识总数。"""
         ...
 
+    @abstractmethod
+    def get_by_metadata(self, where: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
+        """按 metadata 精确过滤获取，返回格式对齐 search()。"""
+        ...
+
 
 class ChromaBackend(VectorStoreBackend):
     """ChromaDB 向量存储实现。支持 HuggingFace 本地 embedding 和 OpenAI 远程 embedding。"""
@@ -120,6 +125,21 @@ class ChromaBackend(VectorStoreBackend):
 
     def count(self) -> int:
         return self._store._collection.count()
+
+    def get_by_metadata(self, where: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
+        """按 metadata 精确过滤获取，返回格式对齐 search()。"""
+        try:
+            raw = self._store.get(
+                where=where, limit=limit,
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            logger.exception("get_by_metadata failed")
+            return []
+        return [
+            {"content": doc, "metadata": meta, "score": 1.0}
+            for doc, meta in zip(raw.get("documents", []), raw.get("metadatas", []))
+        ]
 
     @property
     def store(self):

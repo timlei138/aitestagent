@@ -256,7 +256,7 @@ def _llm_cfg(cfg: TestConfig):
 
 
 def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
-    """查询 RAG 获取上下文：人工知识 + 验证计划 + 操作经验。"""
+    """查询 RAG 获取上下文：人工知识 + 操作经验（2 sections）。"""
     if not kb:
         return ""
     parts = []
@@ -264,13 +264,7 @@ def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
     rules = kb.query_curated_rules(app_package)
     if rules:
         parts.append("## 人工知识\n" + rules)
-    # 2. 历史验证计划（不变）
-    plans = kb.query_verified_plan(app_package, user_request, top_k=2)
-    if plans:
-        parts.append(
-            "## 历史验证计划\n" + "\n".join(f"- {p['content']}" for p in plans)
-        )
-    # 3. 操作经验（替代原导航经验，覆盖更广）
+    # 2. 操作经验
     if user_request:
         exp = kb.query_experience(app_package, user_request[:50], top_k=3)
         if exp:
@@ -543,41 +537,6 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             conclusion = f"{conclusion}\n\n---\n{progress}" if conclusion else progress
 
     ctx = get_tool_context()
-    if ctx and ctx.knowledge_base:
-        try:
-            ctx.knowledge_base.extract_from_test_result(
-                state.get("app_package", ""),
-                state.get("user_request", ""),
-                [
-                    {
-                        "page": s.get("target", ""),
-                        "action": s.get("action_type", ""),
-                        "observation": s.get("observation", ""),
-                        "result": s.get("status", ""),
-                        "error": (
-                            s.get("observation", "")
-                            if s.get("status") != "success"
-                            else ""
-                        ),
-                    }
-                    for s in history
-                ],
-                "PASS" if status == "success" else "FAIL",
-            )
-        except:
-            pass
-
-    # P3: 成功后保存 verified_plan 到 RAG
-    if status == "success" and ctx and ctx.knowledge_base:
-        try:
-            ctx.knowledge_base.save_verified_plan(
-                app_package=state.get("app_package", ""),
-                user_request=state.get("user_request", ""),
-                plan=history,
-                results=history,
-            )
-        except Exception:
-            pass
 
     if _relational_db:
         try:
