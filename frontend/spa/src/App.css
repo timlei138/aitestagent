@@ -3,34 +3,6 @@
    Border-radius tokens: sm=6px  md=8px  lg=12px  full=50%
    ══════════════════════════════════════════════════════════════ */
 
-/* ── Tool status & streaming ── */
-.tool-status {
-  padding: 6px 12px;
-  margin: 4px 0;
-  font-size: 13px;
-  color: var(--el-color-primary);
-  background: var(--el-color-primary-light-9);
-  border-radius: 6px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.bubble.streaming .bubble-content {
-  border-left: 3px solid var(--el-color-primary);
-  padding-left: 10px;
-  animation: pulse 1.5s infinite;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
-}
-
-/* ── Log & message helpers ── */
-.log-warn { color: var(--el-color-warning); }
-.log-ok  { color: var(--el-color-success); }
-
 .human-question {
   font-size: 15px;
   font-weight: 600;
@@ -160,37 +132,6 @@
 }
 .kw-input-row { display: flex; gap: 8px; align-items: center; }
 
-/* ═══════════ Workspace Layout (logs : chat = 3 : 4) ═══════════ */
-.workspace-cols {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  gap: 12px;
-}
-.workspace-left {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  flex: 1;
-  min-height: 0;
-}
-.workspace-left .panel-status {
-  flex: 3;
-  min-height: 180px;
-  display: flex;
-  flex-direction: column;
-}
-.workspace-left .panel-chat {
-  flex: 4;
-  min-height: 240px;
-  display: flex;
-  flex-direction: column;
-}
-.workspace-left .panel-status .status-logs,
-.workspace-left .panel-chat .chat-list {
-  flex: 1;
-  overflow-y: auto;
-}
 
 /* ═══════════ Sidebar Device Float Toggle ═══════════ */
 .side-nav {

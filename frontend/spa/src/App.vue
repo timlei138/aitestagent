@@ -37,52 +37,7 @@
 
       <!-- ═══════════ 工作台 ═══════════ -->
       <el-main class="main-content workspace-main" v-if="activeMenu === 'workspace'">
-        <div class="workspace-cols">
-          <!-- 左列: 实时日志 + AI 对话 -->
-          <div class="workspace-left">
-            <!-- 实时日志 -->
-            <section class="panel panel-status">
-              <div class="panel-header">
-                <h3 class="panel-title">实时日志</h3>
-                <el-button size="small" @click="logs = []">清空</el-button>
-              </div>
-              <div class="logs status-logs">
-                <div v-for="(log, idx) in logs" :key="idx" class="log-row"
-                     :class="{ 'log-warn': log.includes('异常') || log.includes('FAIL'),
-                               'log-ok': log.includes('PASS') || log.includes('成功') }">
-                  {{ log }}
-                </div>
-              </div>
-            </section>
-
-            <!-- AI 对话与执行 -->
-            <section class="panel panel-chat">
-              <div class="panel-header">
-                <h3 class="panel-title">AI 对话与执行</h3>
-                <el-tag v-if="executing" type="warning" size="small">执行中</el-tag>
-              </div>
-              <div class="chat-list" ref="chatListRef">
-                <div v-for="m in messages" :key="m.id" class="bubble" :class="m.type">
-                  <div class="bubble-title">{{ m.title }} · {{ m.time }}</div>
-                  <div class="bubble-content">{{ m.content }}</div>
-                </div>
-                <div v-if="streamingToken" class="bubble ai streaming">
-                  <div class="bubble-title">AI 思考中 · {{ now() }}</div>
-                  <div class="bubble-content">{{ streamingToken }}</div>
-                </div>
-                <div v-if="currentTool" class="tool-status">
-                  <el-icon class="is-loading"><span>⚙</span></el-icon>
-                  {{ currentTool }}
-                </div>
-              </div>
-              <el-input v-model="inputText" type="textarea" :rows="3"
-                        placeholder="输入测试指令，如: 检查 Settings 的 WLAN 开关是否正常" />
-              <div style="margin-top: 8px; text-align: right">
-                <el-button type="primary" :loading="executing" @click="startRun">开始执行</el-button>
-              </div>
-            </section>
-          </div>
-        </div>
+        <WorkspacePanel ref="workspaceRef" :executing="executing" @run="startRun" />
       </el-main>
 
       <!-- ═══════════ 报告中心 ═══════════ -->
@@ -450,10 +405,10 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import ReportDetail from "./components/ReportDetail.vue";
 import KnowledgePanel from "./components/KnowledgePanel.vue";
+import WorkspacePanel from "./components/WorkspacePanel.vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 const activeMenu = ref("workspace");
-const inputText = ref("");
 const executing = ref(false);
 const wsConnected = ref(false);
 const deviceOnline = ref(false);
@@ -469,11 +424,7 @@ const tooltipY = ref(0);
 const previewRef = ref(null);
 const previewImg = ref(null);
 const previewCanvas = ref(null);
-const logs = ref([]);
-const messages = ref([]);
-const streamingToken = ref("");
-const currentTool = ref("");
-const chatListRef = ref(null);
+const workspaceRef = ref(null);
 
 // 计划审阅
 const planReviewVisible = ref(false);
@@ -660,10 +611,7 @@ function fmtDuration(ms) {
 let ws = null;
 let snapshotTimer = null;
 let snapshotInFlight = false;
-let streamTokenTimer = null;
 let deviceStatusTimer = null;
-
-function now() { return new Date().toLocaleTimeString(); }
 
 const formattedPageSummary = computed(() => {
   const raw = (pageSummary.value || "").trim();
@@ -689,175 +637,34 @@ const formattedPrimaryPaths = computed(() => {
   return labels.length ? labels.join(" / ") : "暂无";
 });
 
-function addLog(text) {
-  logs.value.push(`${now()} ${text}`);
-  if (logs.value.length > 500) logs.value.shift();
-}
-
-function addMessage(type, title, content) {
-  messages.value.push({
-    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    type, title,
-    content: String(content || ""),
-    time: now(),
-  });
-}
+function addLog(text) { console.debug(text) }
+function addMessage(type, title, content) { console.debug(type, title, content) }
 
 // ═══════════ WebSocket 事件处理 ═══════════
 
 function handleEvent(data) {
   const type = data.type;
   const content = data.content || {};
+  const wp = workspaceRef.value;
 
   switch (type) {
-    case "status":
-      addLog(`状态: ${content}`);
-      addMessage("ai", "AI状态", content);
-      refreshSnapshot();
-      break;
+    case "status": wp?.addEntry({ type: "log", text: String(content) }); refreshSnapshot(); break;
+    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewVisible.value = true; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
-    case "plan_review":
-      // 显示目标确认对话框
-      flushStreamToken();
-      const pd = content.plan || content;
-      planReviewGoal.value = pd.goal || content.goal || "";
-      planReviewPages.value = pd.target_pages || content.pages || [];
-      planReviewVerifications.value = pd.verification || content.verification || [];
-      planReviewHints.value = pd.hints || [];
-      planReviewVisible.value = true;
-      addLog(`测试目标: ${planReviewGoal.value}`);
-      break;
+    case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
+    case "stream_token": wp?.onToken(); break;
+    case "tool_start": wp?.addTool(content.name || "", (content.input || {}).label || ""); break;
+    case "tool_end": wp?.finishTool(content.name || "", 0); break;
+    case "step_start": refreshSnapshot(); break;
+    case "step_end": refreshSnapshot(); break;
+    case "snapshot": if (content.image) snapshotImage.value = content.image; break;
+    case "anomaly": wp?.addEntry({ type: "error", icon: "⚠", text: content.message || content.description || "" }); break;
 
-    case "plan_ready":
-      addLog(`测试目标已生成: ${content.goal || content.steps || "?"}`);
-      break;
-
-    case "stream_token":
-      // 流式 token：累积到 streamingToken，定时刷新
-      streamingToken.value += String(content || "");
-      resetStreamTimer();
-      break;
-
-    case "tool_start":
-      currentTool.value = `正在执行: ${content.name || ""}`;
-      addLog(`🔧 ${content.name || "tool"}`);
-      break;
-
-    case "tool_end":
-      currentTool.value = "";
-      if (content.name) addLog(`   ✓ ${content.name} 完成`);
-      break;
-
-    case "step_start":
-      addLog(`▶ 步骤开始: ${content.content || content.step || ""}`);
-      refreshSnapshot();
-      break;
-
-    case "step_end":
-      addLog(`   ✓ 步骤结束: ${content.content || content.status || ""}`);
-      refreshSnapshot();
-      break;
-
-    case "snapshot":
-      if (content.image) snapshotImage.value = content.image;
-      break;
-
-    case "anomaly":
-      addMessage("error", "异常告警", content.message || JSON.stringify(content));
-      addLog(`⚠ 异常: ${content.message || content.description || ""}`);
-      break;
-
-    case "need_human_approval":
-      // 人工确认
-      currentThreadId.value = content.thread_id || currentThreadId.value;
-      humanQuestion.value = content.question || "是否继续执行?";
-      humanStep.value = content.step || 0;
-      humanAction.value = content.action || "";
-      humanDialogVisible.value = true;
-      executing.value = false;
-      addLog(`⏸ 需要人工确认: ${humanQuestion.value}`);
-      break;
-
+    case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      // need_human → 触发计划审阅或人工确认
-      if (content.status === "need_human" || content.interrupt) {
-        const intr = content.interrupt || content;
-        if (intr.type === "plan_review") {
-          const planData = intr.plan || {};
-          planReviewGoal.value = planData.goal || intr.goal || "";
-          planReviewPages.value = planData.target_pages || intr.pages || [];
-          planReviewVerifications.value = planData.verification || intr.verification || [];
-          planReviewHints.value = planData.hints || [];
-          planReviewVisible.value = true;
-          currentThreadId.value = content.thread_id || "";
-          addLog(`测试目标: ${planReviewGoal.value}`);
-        } else {
-          // 人工确认
-          humanQuestion.value = intr.question || "是否继续?";
-          humanStep.value = intr.step || 0;
-          humanAction.value = intr.action || "";
-          humanDialogVisible.value = true;
-          addLog("需要人工确认");
-        }
-        executing.value = false;
-        stopSnapshotPolling();
-        break;
-      }
-      // Level2 元素身份确认
-      const pendingIds = content.pending_identities || [];
-      if (content.status === "success" && pendingIds.length > 0) {
-        const level2 = pendingIds.filter(p => p.level === 2);
-        if (level2.length > 0) {
-          identityPending.value = level2;
-          identityDialogVisible.value = true;
-          currentThreadId.value = content.thread_id || "";
-          addLog(`发现 ${level2.length} 个待确认的元素映射`);
-        }
-      }
-      // 最终结果
-      executing.value = false;
-      stopSnapshotPolling();
-      flushStreamToken();
-      currentTool.value = "";
-      addMessage("ai", "执行结果", content.conclusion || content.message || JSON.stringify(content));
-      // 双维度结果日志
-      const exLabel = execStatusLabel(content.execution_status || 'error');
-      const vLabel = verdictLabel(content.test_verdict || 'inconclusive');
-      addLog(`${exLabel} | ${vLabel}: ${(content.conclusion || "").substring(0, 200)}`);
-      if (content.verification_results && content.verification_results.length) {
-        content.verification_results.forEach(v => {
-          const icon = v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?';
-          addLog(`  ${icon} ${v.item}`);
-        });
-      }
-      refreshSnapshot();
-      loadReports();
-      break;
-
-    case "error":
-      addLog(`❌ 错误: ${content}`);
-      executing.value = false;
-      stopSnapshotPolling();
-      break;
-
-    default:
-      addLog(`[${type}] ${JSON.stringify(content).substring(0, 200)}`);
-  }
-}
-
-function resetStreamTimer() {
-  if (streamTokenTimer) clearTimeout(streamTokenTimer);
-  streamTokenTimer = setTimeout(flushStreamToken, 2000);
-}
-
-function flushStreamToken() {
-  if (streamingToken.value.trim()) {
-    addMessage("ai", "AI输出", streamingToken.value.trim());
-    streamingToken.value = "";
-  }
-  if (streamTokenTimer) {
-    clearTimeout(streamTokenTimer);
-    streamTokenTimer = null;
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopSnapshotPolling(); break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopSnapshotPolling(); wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports(); break;
+    case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; stopSnapshotPolling(); break;
+    default: wp?.addEntry({ type: "log", text: "[" + type + "] " + JSON.stringify(content).substring(0, 200) });
   }
 }
 
@@ -867,7 +674,6 @@ function connectWS() {
   ws = new WebSocket(`ws://${location.host}/ws/chat`);
   ws.onopen = () => {
     wsConnected.value = true;
-    addLog("WebSocket 已连接");
   };
   ws.onclose = () => {
     wsConnected.value = false;
@@ -878,18 +684,15 @@ function connectWS() {
 
 // ═══════════ 一键执行 ═══════════
 
-async function startRun() {
-  const text = inputText.value.trim();
-  if (!text) return;
+async function startRun(text) {
+  if (!text || !text.trim()) return;
+  text = text.trim();
   if (!deviceOnline.value) {
     ElMessage.warning("Android 设备未连接，请先连接设备");
     return;
   }
-  addMessage("user", "用户指令", text);
-  inputText.value = "";
+  if (workspaceRef.value) workspaceRef.value.addEntry({ type: "user", icon: "🧑", text });
   executing.value = true;
-  streamingToken.value = "";
-  currentTool.value = "";
   startSnapshotPolling();
 
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
@@ -916,7 +719,7 @@ async function sendHumanDecision(decision) {
   humanDeciding.value = true;
   executing.value = true;
   humanDialogVisible.value = false;
-  addLog(`人工决定: ${decision}`);
+  if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", text: "人工决定: " + decision });
   startSnapshotPolling();
 
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
@@ -954,7 +757,7 @@ async function confirmIdentities() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ identities: confirmed }),
     });
-    addLog(`已确认 ${confirmed.length} 个元素映射`);
+    if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", text: "已确认 " + confirmed.length + " 个元素映射" });
   } catch (e) { /* ignore */ }
   identityDialogVisible.value = false;
 }
@@ -976,7 +779,7 @@ async function confirmPlan(action) {
     hints: planReviewHints.value.filter(h => h.trim()),
   };
 
-  addLog(action === "cancel" ? "目标已取消" : `目标已确认: ${planReviewGoal.value}`);
+  if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", text: action === "cancel" ? "目标已取消" : `目标已确认: ${planReviewGoal.value}` });
 
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "human_decision", thread_id: currentThreadId.value, decision: resumePayload }));
@@ -1154,7 +957,6 @@ async function sendDeviceKey(key) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key }),
     });
-    addLog(`设备按键: ${key}`);
     setTimeout(() => refreshSnapshot(true), 350);
   } catch (e) {
     ElMessage.error(`按键失败: ${e}`);
@@ -1194,8 +996,7 @@ async function saveCaseContent(runAfterSave = false) {
     ElMessage.success("用例已保存");
     caseEditorVisible.value = false;
     if (runAfterSave) {
-      inputText.value = `执行 ${data.case_file || caseEditorFile.value}`;
-      startRun();
+      startRun(`执行 ${data.case_file || caseEditorFile.value}`);
     }
   } catch (e) {
     ElMessage.error(`保存失败: ${e}`);
@@ -1474,7 +1275,6 @@ async function checkDeviceStatus() {
     const wasOffline = !deviceOnline.value;
     deviceOnline.value = !!data.connected;
     if (data.connected && wasOffline) {
-      addLog("Android 设备已连接");
       if (deviceWindowVisible.value) refreshSnapshot(true);  // 仅投屏打开时加载截图
       stopDevicePolling();
     } else if (!data.connected) {
@@ -1511,7 +1311,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopSnapshotPolling();
   stopDevicePolling();
-  flushStreamToken();
   window.removeEventListener('resize', drawElementOverlay);
 });
 </script>
