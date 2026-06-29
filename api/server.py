@@ -22,7 +22,7 @@ from api.websocket_manager import WebSocketManager
 from config import TestConfig, resolve_perception_mode
 from data import create_vector_store, create_relational_db
 from device.controller import DeviceController, DeviceUnavailableError
-from agents.graph import set_relational_db
+from agents.graph import set_relational_db, set_ws_emit_callback
 from data.knowledge import KnowledgeBase
 from agents.orchestrator import TestOrchestrator
 from device.perceiver import SmartPerceiver
@@ -116,6 +116,7 @@ set_relational_db(_db)
 orchestrator.set_event_callback(
     lambda event_type, payload: ws_manager.broadcast_sync(event_type, payload)
 )
+set_ws_emit_callback(lambda t, p: ws_manager.broadcast_sync(t, p))
 
 app.include_router(device_router)
 app.include_router(apps_router)
@@ -243,19 +244,9 @@ async def websocket_chat(websocket: WebSocket):
                     app_name=app_name,
                 )
                 try:
-                    await ws_manager.send(websocket, {
-                        "type": "result",
-                        "content": {
-                            "status": result.get("status"),
-                            "conclusion": result.get("conclusion"),
-                            "steps": result.get("steps", []),
-                            "thread_id": result.get("thread_id", ""),
-                            "interrupt": result.get("interrupt"),
-                            "pending_identities": result.get("pending_identities", []),
-                        },
-                    })
+                    await ws_manager.send(websocket, {"type": "result", "content": result})
                 except RuntimeError:
-                    pass  # client disconnected during execution
+                    pass
 
             elif msg_type == "human_decision":
                 thread_id = data.get("thread_id", "")
@@ -264,17 +255,9 @@ async def websocket_chat(websocket: WebSocket):
                     orchestrator.resume, thread_id=thread_id, decision=decision,
                 )
                 try:
-                    await ws_manager.send(websocket, {
-                        "type": "result",
-                        "content": {
-                            "status": result.get("status"),
-                            "conclusion": result.get("conclusion"),
-                            "thread_id": thread_id,
-                            "interrupt": result.get("interrupt"),
-                        },
-                    })
+                    await ws_manager.send(websocket, {"type": "result", "content": result})
                 except RuntimeError:
-                    pass  # client disconnected during execution
+                    pass
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
@@ -307,29 +290,6 @@ async def get_report(run_id: str):
     return {"status": "error", "message": f"报告不存在: {run_id}"}
 
 
-# ── 用例 API ──
-
-@app.get("/api/cases/list")
-async def list_cases():
-    case_base = BASE_DIR / "test_cases"
-    case_base.mkdir(parents=True, exist_ok=True)
-    items: list[dict] = []
-    for p in sorted(case_base.glob("*.yaml"), key=lambda x: x.stat().st_mtime, reverse=True)[:50]:
-        items.append({"name": p.stem, "file": str(p.relative_to(BASE_DIR)).replace("/", "\\")})
-    for p in sorted(case_base.glob("*.yml"), key=lambda x: x.stat().st_mtime, reverse=True)[:50]:
-        items.append({"name": p.stem, "file": str(p.relative_to(BASE_DIR)).replace("/", "\\")})
-    return {"status": "success", "items": items[:50]}
-
-
-@app.get("/api/cases/content")
-async def get_case_content(case_file: str):
-    case_base = BASE_DIR / "test_cases"
-    target = _safe_resolve_under(case_base, case_file)
-    if not target or not target.exists():
-        return {"status": "error", "message": f"用例不存在: {case_file}"}
-    return {"status": "success", "case_file": str(target.relative_to(BASE_DIR)).replace("/", "\\"),
-            "content": target.read_text(encoding="utf-8")}
-
 
 # ── 静态文件 ──
 
@@ -351,18 +311,3 @@ def _quick_resolve_app(text: str) -> tuple[str, str]:
     """从用户输入中解析 (package, name)，优先读取 storage/apps.yaml。"""
     return _resolve_app_from_yaml(text)
 
-
-def _safe_resolve_under(base: Path, raw_path: str) -> Path | None:
-    raw = str(raw_path or "").strip().replace("/", "\\")
-    if not raw:
-        return None
-    path = Path(raw)
-    if not path.is_absolute():
-        path = (BASE_DIR / path).resolve()
-    else:
-        path = path.resolve()
-    try:
-        path.relative_to(base.resolve())
-    except ValueError:
-        return None
-    return path if path.exists() else None

@@ -23,7 +23,7 @@
                  :disabled="!filterPackage && !filterType"
                  @click="$emit('deleteByFilter', { type: filterType, pkg: filterPackage })">批量删除</el-button>
     </div>
-    <el-table :data="list" border stripe empty-text="暂无知识数据" style="margin-top:12px">
+    <el-table :data="list" empty-text="暂无知识数据" style="margin-top:12px">
       <el-table-column type="index" width="50" />
       <el-table-column label="知识类型" width="120">
         <template #default="{ row }">

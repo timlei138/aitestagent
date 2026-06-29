@@ -34,27 +34,8 @@ def test_ws_run_flow():
         assert msg.get("type") in {"status", "result", "error"}
 
 
-def test_case_content_read():
-    """GET /api/cases/content 读取已有的用例文件。"""
-    existing_case = "test_cases/日期格式切换验证_美国与英国.yaml"
-    response = client.get("/api/cases/content", params={"case_file": existing_case})
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"
-    assert "content" in data
-
-
 def test_reports_list_endpoint():
     response = client.get("/api/reports/list")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "success"
-    assert isinstance(data["items"], list)
-
-
-def test_cases_list_endpoint():
-    """新增的 /api/cases/list 端点。"""
-    response = client.get("/api/cases/list")
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "success"

@@ -62,25 +62,44 @@ def _device_required(dev):
 
 @router.get("/status")
 async def device_status():
-    """查询设备连接状态。离线时自动尝试重连。"""
+    """查询设备连接状态（主动探测 ADB + ATX 连通性，及时检测 USB 断开）。"""
     dev = _get_device()
     if dev is None:
-        # 自动尝试重连（设备可能在服务器启动后才插入）
-        from api.server import reconnect_device
-        result = reconnect_device()
-        if result.get("connected"):
-            dev = _get_device()
-        else:
-            return {"connected": False, "detail": "Android 设备未连接，请检查 USB/ADB 连接后重试"}
+        return {"connected": False}
     try:
+        # 主动探测：shell 命令确保 ADB 链路畅通（比 device.info 更可靠检测 USB 断开）
+        _ = dev.device.shell("echo 1")
         app = dev.current_app()
         return {
             "connected": True,
             "package": app.get("package", ""),
             "activity": app.get("activity", ""),
         }
+    except Exception:
+        return {"connected": False, "detail": "设备已断开，请检查 USB 连接"}
+
+
+@router.get("/info")
+async def device_info():
+    """获取设备基本信息（型号、SN、屏幕、系统版本等）。"""
+    dev = _get_device()
+    if dev is None:
+        return {"connected": False}
+    try:
+        u2dev = dev.device  # 底层 uiautomator2 设备对象
+        info = u2dev.device_info
+        w, h = u2dev.window_size()
+        return {
+            "connected": True,
+            "brand": info.get("brand", ""),
+            "model": info.get("model", ""),
+            "serial": info.get("serial", ""),
+            "android_version": info.get("version", ""),
+            "screen": f"{w}×{h}",
+            "sdk": info.get("sdk", ""),
+        }
     except Exception as exc:
-        return {"connected": False, "detail": f"设备通信异常: {exc}"}
+        return {"connected": False, "detail": str(exc)}
 
 
 @router.post("/reconnect")

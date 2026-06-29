@@ -32,6 +32,14 @@ class KnowledgeEntry(BaseModel):
     metadata: dict[str, Any] = {}
 
 
+class KnowledgeUpdate(BaseModel):
+    """编辑知识：通过旧内容定位 + 新内容覆盖。"""
+    old_content: str
+    old_app_package: str = ""
+    old_knowledge_type: str = ""
+    new_entry: KnowledgeEntry
+
+
 class SearchRequest(BaseModel):
     query: str
     app_package: str = ""
@@ -94,6 +102,47 @@ def add_knowledge(entry: KnowledgeEntry):
     )
     kb.save_knowledge(knowledge)
     return {"status": "success", "message": "知识已添加"}
+
+
+@router.put("")
+def update_knowledge(req: KnowledgeUpdate):
+    """编辑知识：按旧内容定位删除，再新增新条目。"""
+    kb = _get_kb()
+    from data.knowledge import UIKnowledge
+
+    # 1. 用 content + metadata 精确删除旧条目
+    results = kb.query(req.old_content[:80], app_package=req.old_app_package,
+                       knowledge_type=req.old_knowledge_type, top_k=20)
+    deleted = 0
+    for r in results:
+        if r.get("content", "") == req.old_content:
+            meta = r.get("metadata", {})
+            pkg = meta.get("app_package", "")
+            ktype = meta.get("knowledge_type", "")
+            if pkg or ktype:
+                filter_dict: dict[str, str] = {}
+                if pkg:
+                    filter_dict["app_package"] = pkg
+                if ktype:
+                    filter_dict["knowledge_type"] = ktype
+                del_count = kb.backend.delete(filter_dict)
+                if del_count > 0:
+                    deleted += del_count
+                    break  # 只删一条匹配的
+
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="未找到匹配的知识条目")
+
+    # 2. 新增新条目
+    new = req.new_entry
+    knowledge = UIKnowledge(
+        app_package=new.app_package,
+        knowledge_type=new.knowledge_type,
+        content=new.content,
+        metadata=new.metadata,
+    )
+    kb.save_knowledge(knowledge)
+    return {"status": "success", "message": "知识已更新"}
 
 
 @router.delete("")

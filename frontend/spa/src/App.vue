@@ -1,22 +1,65 @@
 <template>
   <el-container class="layout-root">
     <el-aside width="220px" class="side-nav">
-      <div class="brand">AI Test Workbench</div>
-      <el-menu :default-active="activeMenu" @select="activeMenu = $event">
-        <el-menu-item index="workspace">工作台</el-menu-item>
-        <el-menu-item index="reports">报告中心</el-menu-item>
-        <el-menu-item index="apps">APP 管理</el-menu-item>
-        <el-menu-item index="knowledge">知识库</el-menu-item>
-      </el-menu>
-      <!-- 左下角投屏悬浮按鈕 -->
-      <button class="device-float-toggle"
-              :class="{ active: deviceWindowVisible, online: deviceOnline }"
-              @click="toggleDeviceWindow"
-              :title="deviceWindowVisible ? '隐藏投屏窗口' : '显示投屏窗口'">
-        <span class="dft-icon">📱</span>
-        <span class="dft-label">{{ deviceWindowVisible ? '隐藏投屏' : '设备投屏' }}</span>
-        <span class="dft-dot" :class="deviceOnline ? 'dot-online' : 'dot-offline'"></span>
-      </button>
+      <div class="brand">
+        <span class="brand-icon">◇</span>
+        AI Workbench
+      </div>
+      <div class="menu-card">
+        <el-menu :default-active="activeMenu" @select="activeMenu = $event">
+        <el-menu-item index="workspace">
+          <el-icon><i class="nav-icon">💬</i></el-icon>
+          <span>工作台</span>
+        </el-menu-item>
+        <el-menu-item index="reports">
+          <el-icon><i class="nav-icon">📊</i></el-icon>
+          <span>报告中心</span>
+        </el-menu-item>
+        <el-menu-item index="apps">
+          <el-icon><i class="nav-icon">📱</i></el-icon>
+          <span>APP 管理</span>
+        </el-menu-item>
+        <el-menu-item index="knowledge">
+          <el-icon><i class="nav-icon">📚</i></el-icon>
+          <span>知识库</span>
+        </el-menu-item>
+        </el-menu>
+      </div>
+
+      <!-- 侧边栏底部: 设备信息卡片 -->
+      <div class="side-device-card">
+        <template v-if="deviceOnline && deviceInfo">
+          <div class="side-device-header">
+            <span class="side-device-dot online"></span>
+            <span class="side-device-title">{{ deviceInfo.brand }} {{ deviceInfo.model }}</span>
+          </div>
+          <div class="side-device-body">
+            <div class="side-device-row"><span>SN</span><span>{{ deviceInfo.serial }}</span></div>
+            <div class="side-device-row"><span>屏幕</span><span>{{ deviceInfo.screen }}</span></div>
+            <div class="side-device-row"><span>Android</span><span>{{ deviceInfo.android_version }}</span></div>
+          </div>
+        </template>
+        <template v-else>
+          <div class="side-device-header">
+            <span class="side-device-dot offline"></span>
+            <span class="side-device-title">设备离线</span>
+          </div>
+          <div class="side-device-body">
+            <div class="side-device-hint">请检查 USB / ADB 连接</div>
+            <button class="side-device-reconnect" @click="reconnectDevice">重新连接</button>
+          </div>
+        </template>
+      </div>
+
+      <DeviceFloat ref="deviceFloatRef"
+        :deviceOnline="deviceOnline"
+        :snapshotImage="snapshotImage"
+        :pageSummary="pageSummary"
+        :elementList="elementList"
+        @refresh="refreshSnapshot"
+        @send-key="sendDeviceKey"
+        @stop-polling="stopSnapshotPolling"
+      />
     </el-aside>
 
     <el-container>
@@ -26,28 +69,25 @@
           <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'apps' ? 'APP 管理' : '知识库' }}</el-breadcrumb-item>
         </el-breadcrumb>
         <div class="header-tags">
-          <el-tag :type="deviceOnline ? 'success' : 'danger'" size="small">
-            {{ deviceOnline ? "设备在线" : "设备离线" }}
-          </el-tag>
-          <el-tag :type="wsConnected ? 'success' : 'info'" size="small" style="margin-left: 6px">
+          <el-tag :type="wsConnected ? 'success' : 'info'" size="small" effect="light" round>
             {{ wsConnected ? "WS在线" : "HTTP模式" }}
           </el-tag>
         </div>
       </el-header>
 
       <!-- ═══════════ 工作台 ═══════════ -->
-      <el-main class="main-content workspace-main" v-if="activeMenu === 'workspace'">
+      <el-main class="main-content workspace-main" v-show="activeMenu === 'workspace'">
         <WorkspacePanel ref="workspaceRef" :executing="executing" @run="startRun" />
       </el-main>
 
       <!-- ═══════════ 报告中心 ═══════════ -->
-      <el-main class="main-content" v-if="activeMenu === 'reports'">
+      <el-main class="main-content" v-show="activeMenu === 'reports'">
         <section class="panel">
           <div class="panel-header">
             <h3 class="panel-title">测试报告中心</h3>
             <el-button size="small" @click="loadReports">刷新</el-button>
           </div>
-          <el-table :data="reportTasks" border stripe empty-text="暂无报告" @row-click="openReportDetail" row-style="cursor:pointer">
+          <el-table :data="reportTasks" empty-text="暂无报告" @row-click="openReportDetail" row-style="cursor:pointer">
             <el-table-column prop="created_at" label="执行时间" min-width="160">
               <template #default="{ row }">{{ (row.created_at || '').replace('T', ' ').substring(0, 19) }}</template>
             </el-table-column>
@@ -73,7 +113,7 @@
       </el-main>
 
       <!-- ═══════════ 知识库 ═══════════ -->
-      <el-main class="main-content" v-if="activeMenu === 'knowledge'">
+      <el-main class="main-content" v-show="activeMenu === 'knowledge'">
         <KnowledgePanel
           :list="kbList" :kbCount="kbCount" :types="kbTypes"
           @refresh="loadKbList" @add="openKbDialog(null)"
@@ -84,7 +124,7 @@
       </el-main>
 
       <!-- ═══════════ APP 管理 ═══════════ -->
-      <el-main class="main-content" v-if="activeMenu === 'apps'">
+      <el-main class="main-content" v-show="activeMenu === 'apps'">
         <section class="panel">
           <div class="panel-header">
             <h3 class="panel-title">APP 管理</h3>
@@ -93,14 +133,14 @@
               <el-button size="small" type="primary" @click="openAppDialog(null)">+ 添加</el-button>
             </div>
           </div>
-          <el-table :data="appList" border stripe empty-text="暂无应用，点击右上角添加">
+          <el-table :data="appList" empty-text="暂无应用，点击右上角添加">
             <el-table-column prop="name" label="应用名称" min-width="120" />
             <el-table-column prop="package" label="包名" min-width="220" show-overflow-tooltip />
             <el-table-column label="触发关键词" min-width="200">
               <template #default="{ row }">
                 <el-tag v-for="kw in (row.keywords || [])" :key="kw"
                         size="small" style="margin:2px">{{ kw }}</el-tag>
-                <span v-if="!(row.keywords && row.keywords.length)" style="color:#999;font-size:12px">未设置</span>
+                <span v-if="!(row.keywords && row.keywords.length)" style="color:var(--text-muted);font-size:12px">未设置</span>
               </template>
             </el-table-column>
             <el-table-column label="操作" width="130" fixed="right">
@@ -115,81 +155,6 @@
   
     </el-container>
   </el-container>
-  
-  <!-- ═══════════ 设备投屏悬浮窗（全局） ═══════════ -->
-  <transition name="floatwin">
-    <div v-if="deviceWindowVisible" class="device-float-win"
-         :style="{ left: floatWinX + 'px', top: floatWinY + 'px', width: floatWinW + 'px' }"
-         ref="floatWinRef">
-      <div class="float-win-header" @mousedown="onFloatWinDragStart">
-        <span class="float-win-title">📱 设备投屏</span>
-        <div class="float-win-actions">
-          <el-switch v-model="showElementOverlay" size="small" active-text="元素" inactive-text=""
-                     @change="drawElementOverlay" />
-          <el-button size="small" text @click="refreshSnapshot(true)" :disabled="!deviceOnline"
-                     style="margin-left:6px;color:#fff;">刷新</el-button>
-          <button class="float-win-close" @click="deviceWindowVisible = false">×</button>
-        </div>
-      </div>
-      <div class="preview" ref="previewRef" @mousemove="onPreviewMouseMove" @mouseleave="hoveredElement = null">
-        <div v-if="!deviceOnline" class="device-offline-mask">
-          <div class="device-offline-content">
-            <div class="device-offline-icon">📱</div>
-            <div class="device-offline-title">Android 设备未连接</div>
-            <div class="device-offline-desc">请检查 USB/ADB 连接</div>
-          </div>
-        </div>
-        <canvas v-if="snapshotImage" ref="previewCanvas" class="preview-canvas" />
-        <img v-if="snapshotImage" ref="previewImg" :src="'data:image/png;base64,' + snapshotImage"
-             class="preview-img" @load="drawElementOverlay" />
-        <!-- 元素属性浮窗（显示全部属性） -->
-        <div v-if="hoveredElement" class="element-tooltip"
-             :style="{ left: tooltipX + 'px', top: tooltipY + 'px' }">
-          <!-- 标题：label -->
-          <div class="et-row et-label">{{ hoveredElement.label || '(无标签)' }}</div>
-          <!-- 文本内容 -->
-          <div class="et-row" v-if="hoveredElement.text"><span class="et-k">text</span><span class="et-v">{{ hoveredElement.text }}</span></div>
-          <div class="et-row" v-if="hoveredElement.content_desc"><span class="et-k">content_desc</span><span class="et-v">{{ hoveredElement.content_desc }}</span></div>
-          <div class="et-row" v-if="hoveredElement.associated_label"><span class="et-k">assoc_label</span><span class="et-v">{{ hoveredElement.associated_label }}</span></div>
-          <!-- 身份标识 -->
-          <div class="et-row"><span class="et-k">resource_id</span><span class="et-v">{{ hoveredElement.resource_id || '-' }}</span></div>
-          <div class="et-row"><span class="et-k">class_name</span><span class="et-v">{{ hoveredElement.class_name || '-' }}</span></div>
-          <div class="et-row" v-if="hoveredElement.package"><span class="et-k">package</span><span class="et-v">{{ hoveredElement.package }}</span></div>
-          <!-- 布局 -->
-          <div class="et-row"><span class="et-k">bounds</span><span class="et-v">{{ hoveredElement.bounds ? hoveredElement.bounds.join(', ') : '-' }}</span></div>
-          <div class="et-row" v-if="hoveredElement.region"><span class="et-k">region</span><span class="et-v">{{ hoveredElement.region }}</span></div>
-          <div class="et-row" v-if="hoveredElement.context_path" :title="hoveredElement.context_path"><span class="et-k">path</span><span class="et-v">{{ hoveredElement.context_path }}</span></div>
-          <!-- 分类 -->
-          <div class="et-row"><span class="et-k">role</span><span class="et-v et-badge" :class="'et-role-' + (hoveredElement.role || 'default')">{{ hoveredElement.role || '-' }}</span></div>
-          <div class="et-row" v-if="hoveredElement.priority !== undefined"><span class="et-k">priority</span><span class="et-v">{{ hoveredElement.priority }}</span></div>
-          <!-- 状态标记 -->
-          <div class="et-row et-flags">
-            <span v-if="hoveredElement.clickable" class="et-flag et-clickable">clickable</span>
-            <span v-if="!hoveredElement.clickable" class="et-flag et-disabled">not clickable</span>
-            <span v-if="hoveredElement.enabled" class="et-flag et-checked">enabled</span>
-            <span v-if="!hoveredElement.enabled" class="et-flag et-disabled">disabled</span>
-            <span v-if="hoveredElement.selected" class="et-flag et-selected">selected</span>
-            <span v-if="hoveredElement.checked === true" class="et-flag et-checked">checked</span>
-            <span v-if="hoveredElement.checked === false" class="et-flag et-disabled">unchecked</span>
-            <span v-if="hoveredElement.safe_to_click === false" class="et-flag et-disabled">unsafe</span>
-            <span v-if="hoveredElement.is_container" class="et-flag et-selected">container</span>
-            <span v-if="hoveredElement.has_switch_child" class="et-flag et-clickable">has_switch</span>
-          </div>
-        </div>
-      </div>
-      <div class="float-win-meta">
-        <span class="float-meta-label">语义</span>
-        <span class="float-meta-val">{{ formattedPageSummary }}</span>
-      </div>
-      <div class="float-win-keys">
-        <button class="fkey" @click="sendDeviceKey('home')">Home</button>
-        <button class="fkey" @click="sendDeviceKey('back')">Back</button>
-        <button class="fkey" @click="sendDeviceKey('recent')">Recent</button>
-        <button class="fkey" @click="sendDeviceKey('power')">Power</button>
-      </div>
-      <div class="float-win-resize" @mousedown="onFloatWinResizeStart"></div>
-    </div>
-  </transition>
   
   <!-- ═══════════ 测试目标确认对话框（可编辑）═══════════ -->
   <el-dialog v-model="planReviewVisible" width="560px" :close-on-click-modal="false"
@@ -271,7 +236,7 @@
   <el-dialog v-model="humanDialogVisible" title="需要人工确认" width="420px"
              :close-on-click-modal="false" :close-on-press-escape="false">
     <div class="human-question">{{ humanQuestion }}</div>
-    <div style="margin-top: 12px; color: var(--muted); font-size: 13px;">
+    <div style="margin-top: 12px; color: var(--text-muted); font-size: 13px;">
       步骤: {{ humanStep }} | 操作: {{ humanAction }}
     </div>
     <template #footer>
@@ -283,29 +248,13 @@
     </template>
   </el-dialog>
 
-  <!-- ═══════════ 用例编辑器 ═══════════ -->
-  <el-dialog v-model="caseEditorVisible" title="测试用例 YAML" width="62%">
-    <div style="margin-bottom: 8px; color: var(--muted); font-size: 12px;">
-      {{ caseEditorFile }}
-    </div>
-    <el-input v-model="caseEditorContent" type="textarea" :rows="22"
-              :disabled="loadingCaseEditor || savingCaseEditor" />
-    <template #footer>
-      <el-button @click="caseEditorVisible = false">关闭</el-button>
-      <el-button :loading="savingCaseEditor" @click="saveCaseContent(false)">保存</el-button>
-      <el-button type="primary" :loading="savingCaseEditor" @click="saveCaseContent(true)">
-        保存并执行
-      </el-button>
-    </template>
-  </el-dialog>
-
   <!-- ═══════════ 报告详情 ═══════════ -->
   <el-dialog v-model="reportDetailVisible" title="测试报告详情" width="720px" top="3vh">
     <ReportDetail :report="selectedReport" />
   </el-dialog>
 
-  <!-- ═══════════ 知识库新增对话框 ═══════════ -->
-  <el-dialog v-model="kbDialogVisible" title="新增知识" width="560px" :close-on-click-modal="false">
+  <!-- ═══════════ 知识库新增/编辑对话框 ═══════════ -->
+  <el-dialog v-model="kbDialogVisible" :title="kbDialogMode === 'add' ? '新增知识' : '编辑知识'" width="560px" :close-on-click-modal="false">
     <el-form :model="kbForm" label-width="90px" style="padding-right:12px">
       <el-form-item label="应用包名" required>
         <el-input v-model="kbForm.app_package" :placeholder="kbForm.knowledge_type === 'curated_rule' ? '留空表示全局知识' : '如: com.android.settings'" />
@@ -322,7 +271,7 @@
     </el-form>
     <template #footer>
       <el-button @click="kbDialogVisible = false">取消</el-button>
-      <el-button type="primary" :loading="kbSaving" @click="saveKb">保存</el-button>
+      <el-button type="primary" :loading="kbSaving" @click="saveKb">{{ kbDialogMode === 'add' ? '保存' : '更新' }}</el-button>
     </template>
   </el-dialog>
 
@@ -357,6 +306,7 @@
       </div>
     </div>
     <template #footer>
+      <el-button type="primary" plain @click="editKbFromDetail">编辑</el-button>
       <el-button type="danger" plain @click="deleteKbItem(kbDetailRow)">删除此条</el-button>
       <el-button @click="kbDetailVisible = false">关闭</el-button>
     </template>
@@ -374,7 +324,7 @@
         <el-input v-model="appForm.package"
                   placeholder="如: com.android.settings"
                   :disabled="appDialogMode === 'edit'" />
-        <div v-if="appDialogMode === 'edit'" style="font-size:12px;color:#999;margin-top:4px">包名不可修改</div>
+        <div v-if="appDialogMode === 'edit'" style="font-size:12px;color:var(--text-muted);margin-top:4px">包名不可修改</div>
       </el-form-item>
       <el-form-item label="触发关键词">
         <div class="kw-editor">
@@ -389,7 +339,7 @@
             <el-button size="small" @click="addKeyword">添加</el-button>
           </div>
         </div>
-        <div style="font-size:12px;color:#999;margin-top:4px">
+        <div style="font-size:12px;color:var(--text-muted);margin-top:4px">
           用户输入测试指令时，包含任意关键词即自动匹配该应用
         </div>
       </el-form-item>
@@ -402,29 +352,24 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import ReportDetail from "./components/ReportDetail.vue";
 import KnowledgePanel from "./components/KnowledgePanel.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
+import DeviceFloat from "./components/DeviceFloat.vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 const activeMenu = ref("workspace");
 const executing = ref(false);
 const wsConnected = ref(false);
 const deviceOnline = ref(false);
+const deviceInfo = ref(null);
 const devicePolling = ref(false);
 const snapshotImage = ref("");
 const pageSummary = ref("");
-const primaryPaths = ref([]);
 const elementList = ref([]);
-const showElementOverlay = ref(true);
-const hoveredElement = ref(null);
-const tooltipX = ref(0);
-const tooltipY = ref(0);
-const previewRef = ref(null);
-const previewImg = ref(null);
-const previewCanvas = ref(null);
 const workspaceRef = ref(null);
+const deviceFloatRef = ref(null);
 
 // 计划审阅
 const planReviewVisible = ref(false);
@@ -455,13 +400,6 @@ const humanAction = ref("");
 const humanDeciding = ref(false);
 const currentThreadId = ref("");
 
-// 用例编辑器
-const caseEditorVisible = ref(false);
-const caseEditorContent = ref("");
-const caseEditorFile = ref("");
-const loadingCaseEditor = ref(false);
-const savingCaseEditor = ref(false);
-
 // 报告
 const reportTasks = ref([]);
 const reportDetailVisible = ref(false);
@@ -476,57 +414,6 @@ const appSaving = ref(false);
 const newKeyword = ref('');
 const appForm = ref({ name: '', package: '', keywords: [] });
 
-// 设备投屏悬浮窗
-const deviceWindowVisible = ref(false);
-const floatWinX = ref(240);
-const floatWinY = ref(80);
-const floatWinW = ref(320);
-const floatWinRef = ref(null);
-let _dragOffX = 0, _dragOffY = 0, _dragging = false;
-let _resizing = false, _resizeStartX = 0, _resizeStartW = 0;
-
-function toggleDeviceWindow() {
-  deviceWindowVisible.value = !deviceWindowVisible.value;
-  if (deviceWindowVisible.value) {
-    floatWinX.value = window.innerWidth - floatWinW.value - 24;
-    floatWinY.value = 80;
-    refreshSnapshot(true);
-  } else {
-    stopSnapshotPolling();  // 关闭投屏时停止定时获取截图
-  }
-}
-
-function onFloatWinDragStart(e) {
-  if (e.button !== 0) return;
-  _dragging = true;
-  _dragOffX = e.clientX - floatWinX.value;
-  _dragOffY = e.clientY - floatWinY.value;
-  const onMove = (ev) => {
-    if (!_dragging) return;
-    floatWinX.value = Math.max(0, Math.min(window.innerWidth - floatWinW.value, ev.clientX - _dragOffX));
-    floatWinY.value = Math.max(0, Math.min(window.innerHeight - 100, ev.clientY - _dragOffY));
-  };
-  const onUp = () => { _dragging = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-  window.addEventListener('mousemove', onMove);
-  window.addEventListener('mouseup', onUp);
-  e.preventDefault();
-}
-
-function onFloatWinResizeStart(e) {
-  if (e.button !== 0) return;
-  _resizing = true;
-  _resizeStartX = e.clientX;
-  _resizeStartW = floatWinW.value;
-  const onMove = (ev) => {
-    if (!_resizing) return;
-    floatWinW.value = Math.max(220, Math.min(600, _resizeStartW + ev.clientX - _resizeStartX));
-  };
-  const onUp = () => { _resizing = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
-  window.addEventListener('mousemove', onMove);
-  window.addEventListener('mouseup', onUp);
-  e.preventDefault();
-}
-
 // 知识库
 const kbList = ref([]);
 const kbCount = ref(0);
@@ -534,6 +421,7 @@ const kbSearchQuery = ref('');
 const kbFilterType = ref('');
 const kbFilterPackage = ref('');
 const kbDialogVisible = ref(false);
+const kbDialogMode = ref('add');  // 'add' | 'edit'
 const kbDetailVisible = ref(false);
 const kbDetailRow = ref(null);
 const kbSaving = ref(false);
@@ -613,32 +501,7 @@ let snapshotTimer = null;
 let snapshotInFlight = false;
 let deviceStatusTimer = null;
 
-const formattedPageSummary = computed(() => {
-  const raw = (pageSummary.value || "").trim();
-  if (!raw) return "暂无";
-  return raw.replace(/^two_pane/, "双栏").replace(/^single_pane/, "单栏")
-            .replace("主要路径入口", "可探索入口");
-});
 
-const formattedPrimaryPaths = computed(() => {
-  const labels = [];
-  const seen = new Set();
-  for (const item of primaryPaths.value || []) {
-    const raw = String(item?.label || item?.text || item?.content_desc || item?.resource_id || "").trim();
-    if (!raw || raw.includes(":id/")) continue;
-    if (/^[a-zA-Z0-9_.:-]+$/.test(raw) && !/wifi|bluetooth|setting|search/i.test(raw)) continue;
-    if (/^collapse$/i.test(raw)) continue;
-    const n = raw.replace(/\s+/g, " ").trim();
-    if (seen.has(n)) continue;
-    seen.add(n);
-    labels.push(n);
-    if (labels.length >= 8) break;
-  }
-  return labels.length ? labels.join(" / ") : "暂无";
-});
-
-function addLog(text) { console.debug(text) }
-function addMessage(type, title, content) { console.debug(type, title, content) }
 
 // ═══════════ WebSocket 事件处理 ═══════════
 
@@ -662,7 +525,9 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopSnapshotPolling(); break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopSnapshotPolling(); wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports(); break;
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopSnapshotPolling(); break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopSnapshotPolling();
+      // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
+      wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports(); break;
     case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; stopSnapshotPolling(); break;
     default: wp?.addEntry({ type: "log", text: "[" + type + "] " + JSON.stringify(content).substring(0, 200) });
   }
@@ -802,124 +667,10 @@ async function confirmPlan(action) {
   }
 }
 
-// ═══════════ 元素覆盖绘制 ═══════════
-
-const ROLE_COLORS = {
-  switch: { stroke: '#409eff', fill: 'rgba(64,158,255,0.12)' },
-  navigation_item: { stroke: '#67c23a', fill: 'rgba(103,194,58,0.10)' },
-  tab: { stroke: '#e6a23c', fill: 'rgba(230,162,60,0.10)' },
-  list_entry: { stroke: '#909399', fill: 'rgba(144,147,153,0.08)' },
-  settings_entry: { stroke: '#909399', fill: 'rgba(144,147,153,0.08)' },
-  button: { stroke: '#f56c6c', fill: 'rgba(245,108,108,0.10)' },
-  text: { stroke: '#b0b0b0', fill: 'rgba(176,176,176,0.06)' },
-  default: { stroke: '#409eff', fill: 'rgba(64,158,255,0.08)' },
-};
-
-function drawElementOverlay() {
-  const img = previewImg.value;
-  const canvas = previewCanvas.value;
-  if (!img || !canvas || !img.complete) return;
-
-  const dw = img.naturalWidth || 1080;
-  const dh = img.naturalHeight || 1920;
-  const scaleX = img.clientWidth / dw;
-  const scaleY = img.clientHeight / dh;
-
-  canvas.width = img.clientWidth;
-  canvas.height = img.clientHeight;
-  canvas.style.position = 'absolute';
-  canvas.style.top = '0';
-  canvas.style.left = '0';
-  canvas.style.pointerEvents = 'none';
-
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  if (!showElementOverlay.value) return;
-
-  const elements = elementList.value || [];
-  for (const el of elements) {
-    if (!el.bounds || el.bounds.length !== 4) continue;
-    let [l, t, r, b] = el.bounds;
-    l *= scaleX; t *= scaleY; r *= scaleX; b *= scaleY;
-    if (r - l < 2 || b - t < 2) continue;
-
-    const role = el.role || 'default';
-    const colors = ROLE_COLORS[role] || ROLE_COLORS.default;
-
-    ctx.strokeStyle = colors.stroke;
-    ctx.fillStyle = colors.fill;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.roundRect(l, t, r - l, b - t, 4);
-    ctx.fill();
-    ctx.stroke();
-
-    // Label
-    const label = (el.label || el.text || el.content_desc || '').substring(0, 12);
-    if (label && (el.clickable || role === 'switch')) {
-      ctx.fillStyle = colors.stroke;
-      ctx.font = '11px sans-serif';
-      const textW = ctx.measureText(label).width + 6;
-      ctx.fillRect(l, Math.max(0, t - 18), textW, 16);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(label, l + 3, Math.max(0, t - 18) + 12);
-    }
-  }
-}
-
-// ═══════════ 元素悬浮检测 ═══════════
-
-function onPreviewMouseMove(e) {
-  const img = previewImg.value;
-  if (!img || !img.complete) { hoveredElement.value = null; return; }
-
-  const rect = img.getBoundingClientRect();
-  const mx = e.clientX - rect.left;  // mouse X within image
-  const my = e.clientY - rect.top;   // mouse Y within image
-
-  // 映射到设备原生坐标
-  const dw = img.naturalWidth || 1080;
-  const dh = img.naturalHeight || 1920;
-  const scaleX = dw / img.clientWidth;
-  const scaleY = dh / img.clientHeight;
-  const dx = mx * scaleX;
-  const dy = my * scaleY;
-
-  // 命中检测（倒序遍历，优先匹配上层元素）
-  const elements = elementList.value || [];
-  let found = null;
-  for (let i = elements.length - 1; i >= 0; i--) {
-    const el = elements[i];
-    if (!el.bounds || el.bounds.length !== 4) continue;
-    const [l, t, r, b] = el.bounds;
-    if (dx >= l && dx <= r && dy >= t && dy <= b) {
-      found = el;
-      break;
-    }
-  }
-
-  hoveredElement.value = found;
-
-  // 浮窗定位：默认在鼠标上方，靠近顶部则放下方
-  if (found) {
-    const gap = 8;
-    const ttW = 240; // 预估浮窗宽度
-    const ttH = 340; // 全属性浮窗预估高度
-    let tx = e.clientX + gap;
-    let ty = e.clientY - ttH - gap;
-    if (ty < 10) ty = e.clientY + gap;
-    // 防超出右边界
-    if (tx + ttW > window.innerWidth - 10) tx = e.clientX - ttW - gap;
-    tooltipX.value = tx;
-    tooltipY.value = ty;
-  }
-}
-
 // ═══════════ 设备操作 ═══════════
 
 async function refreshSnapshot(force = false) {
-  if (!deviceWindowVisible.value && !force) return;  // 投屏窗口未打开时跳过
+  if (!(deviceFloatRef.value?.isVisible) && !force) return;  // 投屏窗口未打开时跳过
   if (snapshotInFlight && !force) return;
   snapshotInFlight = true;
   try {
@@ -939,9 +690,7 @@ async function refreshSnapshot(force = false) {
     stopDevicePolling();
     snapshotImage.value = (data.screen || {}).image_base64 || "";
     pageSummary.value = (data.understanding || {}).summary || "";
-    primaryPaths.value = (data.understanding || {}).primary_paths || [];
     elementList.value = (data.understanding || {}).elements || [];
-    setTimeout(drawElementOverlay, 100);
   } catch (e) {
     deviceOnline.value = false;
     startDevicePolling();
@@ -960,48 +709,6 @@ async function sendDeviceKey(key) {
     setTimeout(() => refreshSnapshot(true), 350);
   } catch (e) {
     ElMessage.error(`按键失败: ${e}`);
-  }
-}
-
-// ═══════════ 用例编辑 ═══════════
-
-async function openCaseEditor(caseFile) {
-  if (!caseFile) return;
-  loadingCaseEditor.value = true;
-  try {
-    const res = await fetch(`/api/cases/content?case_file=${encodeURIComponent(caseFile)}`, { cache: "no-store" });
-    const data = await res.json();
-    if (data.status !== "success") { ElMessage.error(data.message || "读取失败"); return; }
-    caseEditorFile.value = data.case_file || caseFile;
-    caseEditorContent.value = data.content || "";
-    caseEditorVisible.value = true;
-  } catch (e) {
-    ElMessage.error(`读取失败: ${e}`);
-  } finally {
-    loadingCaseEditor.value = false;
-  }
-}
-
-async function saveCaseContent(runAfterSave = false) {
-  if (!caseEditorFile.value) return;
-  savingCaseEditor.value = true;
-  try {
-    const res = await fetch("/api/cases/content", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ case_file: caseEditorFile.value, content: caseEditorContent.value }),
-    });
-    const data = await res.json();
-    if (data.status !== "success") { ElMessage.error(data.message || "保存失败"); return; }
-    ElMessage.success("用例已保存");
-    caseEditorVisible.value = false;
-    if (runAfterSave) {
-      startRun(`执行 ${data.case_file || caseEditorFile.value}`);
-    }
-  } catch (e) {
-    ElMessage.error(`保存失败: ${e}`);
-  } finally {
-    savingCaseEditor.value = false;
   }
 }
 
@@ -1168,7 +875,21 @@ function resetKbFilter() {
 }
 
 function openKbDialog() {
+  kbDialogMode.value = 'add';
   kbForm.value = { app_package: '', knowledge_type: 'experience', content: '' };
+  kbDialogVisible.value = true;
+}
+
+function editKbFromDetail() {
+  if (!kbDetailRow.value) return;
+  const row = kbDetailRow.value;
+  kbDialogMode.value = 'edit';
+  kbForm.value = {
+    app_package: (row.metadata && row.metadata.app_package) || '',
+    knowledge_type: (row.metadata && row.metadata.knowledge_type) || 'experience',
+    content: row.content || '',
+  };
+  kbDetailVisible.value = false;
   kbDialogVisible.value = true;
 }
 
@@ -1179,18 +900,43 @@ async function saveKb() {
   if (!kbForm.value.content.trim()) { ElMessage.warning('请输入知识内容'); return; }
   kbSaving.value = true;
   try {
-    const res = await fetch('/api/knowledge', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(kbForm.value),
-    });
-    const data = await res.json();
-    if (res.ok && data.status === 'success') {
-      ElMessage.success('知识已添加');
-      kbDialogVisible.value = false;
-      loadKbList();
+    if (kbDialogMode.value === 'edit' && kbDetailRow.value) {
+      // 编辑模式：PUT 请求（删旧+加新）
+      const oldRow = kbDetailRow.value;
+      const res = await fetch('/api/knowledge', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          old_content: oldRow.content || '',
+          old_app_package: (oldRow.metadata && oldRow.metadata.app_package) || '',
+          old_knowledge_type: (oldRow.metadata && oldRow.metadata.knowledge_type) || '',
+          new_entry: kbForm.value,
+        }),
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'success') {
+        ElMessage.success('知识已更新');
+        kbDialogVisible.value = false;
+        kbDetailRow.value = null;
+        loadKbList();
+      } else {
+        ElMessage.error(data.detail || data.message || '更新失败');
+      }
     } else {
-      ElMessage.error(data.detail || data.message || '保存失败');
+      // 新增模式：POST 请求
+      const res = await fetch('/api/knowledge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(kbForm.value),
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'success') {
+        ElMessage.success('知识已添加');
+        kbDialogVisible.value = false;
+        loadKbList();
+      } else {
+        ElMessage.error(data.detail || data.message || '保存失败');
+      }
     }
   } catch (e) {
     ElMessage.error(`保存失败: ${e}`);
@@ -1256,7 +1002,7 @@ async function deleteKbByFilter() {
 
 function startSnapshotPolling() {
   if (snapshotTimer) return;
-  if (!deviceWindowVisible.value) return;  // 投屏未打开时不启动
+  if (!(deviceFloatRef.value?.isVisible)) return;  // 投屏未打开时不启动
   snapshotTimer = window.setInterval(() => { if (executing.value) refreshSnapshot(); }, 2500);
 }
 
@@ -1275,21 +1021,51 @@ async function checkDeviceStatus() {
     const wasOffline = !deviceOnline.value;
     deviceOnline.value = !!data.connected;
     if (data.connected && wasOffline) {
-      if (deviceWindowVisible.value) refreshSnapshot(true);  // 仅投屏打开时加载截图
+      fetchDeviceInfo();
+      if (deviceFloatRef.value?.isVisible) refreshSnapshot(true);
       stopDevicePolling();
     } else if (!data.connected) {
+      deviceInfo.value = null;
       startDevicePolling();
     }
   } catch (e) {
     deviceOnline.value = false;
+    deviceInfo.value = null;
     startDevicePolling();
+  }
+}
+
+async function fetchDeviceInfo() {
+  try {
+    const res = await fetch("/api/device/info", { cache: "no-store" });
+    const data = await res.json();
+    if (data.connected) deviceInfo.value = data;
+  } catch (e) { /* ignore */ }
+}
+
+async function reconnectDevice() {
+  deviceInfo.value = null;
+  deviceOnline.value = false;
+  try {
+    const res = await fetch("/api/device/reconnect", { method: "POST" });
+    const data = await res.json();
+    if (data.connected) {
+      deviceOnline.value = true;
+      fetchDeviceInfo();
+      stopDevicePolling();
+      if (deviceFloatRef.value?.isVisible) refreshSnapshot(true);
+    } else {
+      ElMessage.warning(data.detail || "设备重连失败");
+    }
+  } catch (e) {
+    ElMessage.error("重连请求失败");
   }
 }
 
 function startDevicePolling() {
   if (deviceStatusTimer) return;
   devicePolling.value = true;
-  deviceStatusTimer = window.setInterval(checkDeviceStatus, 3000);
+  deviceStatusTimer = window.setInterval(checkDeviceStatus, 5000);
 }
 
 function stopDevicePolling() {
@@ -1302,16 +1078,15 @@ function stopDevicePolling() {
 onMounted(() => {
   connectWS();
   checkDeviceStatus();
+  startDevicePolling();  // 始终开启轮询监控设备状态
   loadReports();
   loadApps();
   loadKbList();
-  window.addEventListener('resize', drawElementOverlay);
 });
 
 onBeforeUnmount(() => {
   stopSnapshotPolling();
   stopDevicePolling();
-  window.removeEventListener('resize', drawElementOverlay);
 });
 </script>
 

@@ -15,6 +15,7 @@ class ToolContext:
     relational_db: Any = None          # V2: 注入已有的 SqliteBackend 实例，避免重复创建连接
     safety_level: str = "strict"
     _screen_size: tuple[int, int] | None = field(default=None, repr=False)
+    _ws_emit: Any = field(default=None, repr=False)  # WebSocket 实时事件回调 (type, payload) -> None
 
     @property
     def screen_size(self) -> tuple[int, int]:

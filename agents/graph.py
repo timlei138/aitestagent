@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from typing import Any, Annotated
 
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -34,6 +34,18 @@ _relational_db = None
 def set_relational_db(db) -> None:
     global _relational_db
     _relational_db = db
+
+
+# ═══ WebSocket 实时事件回调 ═══
+_ws_emit_callback = None
+
+
+def set_ws_emit_callback(callback) -> None:
+    global _ws_emit_callback
+    _ws_emit_callback = callback
+
+
+_SKIP_EMIT = {"get_screen_info", "check_page_health", "query_app_knowledge"}
 
 
 # ═══ Prompt ═══
@@ -81,6 +93,12 @@ class _SubState(_TD):
 def _run_agent(
     messages, tools, provider, model, api_key, base_url, max_turns=20
 ) -> tuple[str, list]:
+    try:
+        _ctx = get_tool_context()  # 捕获当前 ToolContext 供子图事件发射使用
+    except Exception:
+        _ctx = None
+    if _ctx and _ws_emit_callback:
+        _ctx._ws_emit = _ws_emit_callback
     if provider == "zhipu":
         from zhipuai import ZhipuAI
 
@@ -90,6 +108,9 @@ def _run_agent(
         schemas = _zhipu_schemas(tools)
 
         def _llm(s: _SubState) -> dict:
+            if _ctx and _ctx._ws_emit:
+                try: _ctx._ws_emit("stream_token", "thinking")
+                except Exception: pass
             ms = _to_zhipu(s["messages"])
             r = _call_retry(
                 "zhipu",
@@ -130,10 +151,36 @@ def _run_agent(
         ).bind_tools(tools)
 
         def _llm(s: _SubState) -> dict:
+            if _ctx and _ctx._ws_emit:
+                try: _ctx._ws_emit("stream_token", "thinking")
+                except Exception: pass
             r = _call_retry("openai", lc.invoke, s["messages"])
             return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
 
         llm_node = _llm
+
+    # ── 自定义工具执行节点（替代 ToolNode，支持实时事件发射）──
+    _tool_map = {t.name: t for t in tools}
+
+    def _tools_node(s: _SubState) -> dict:
+        last_ai = next(m for m in reversed(s["messages"]) if isinstance(m, AIMessage))
+        outputs = []
+        for tc in (last_ai.tool_calls or []):
+            name = tc["name"]
+            args = tc.get("args", {}) or {}
+            if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
+                try: _ctx._ws_emit("tool_start", {"name": name, "input": {"label": args.get("label", "") or args.get("target", "")}})
+                except Exception: pass
+            t = _tool_map.get(name)
+            try:
+                output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"
+            except Exception as e:
+                output = f"ERROR: {e}"
+            if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
+                try: _ctx._ws_emit("tool_end", {"name": name, "output": output[:200]})
+                except Exception: pass
+            outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
+        return {"messages": outputs}
 
     def _inc(s: _SubState) -> dict:
         return {"_turn_count": s.get("_turn_count", 0) + 1, "messages": []}
@@ -144,7 +191,7 @@ def _run_agent(
 
     g = StateGraph(_SubState)
     g.add_node("llm", llm_node)
-    g.add_node("tools", ToolNode(tools))
+    g.add_node("tools", _tools_node)
     g.add_node("inc", _inc)
     g.add_edge(START, "llm")
     g.add_conditional_edges("llm", _limit, {"tools": "inc", END: END})

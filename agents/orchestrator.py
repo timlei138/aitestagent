@@ -298,14 +298,29 @@ class TestOrchestrator:
 
     def _build_result(self, thread_id: str, state: dict) -> dict[str, Any]:
         display_steps = _build_display_steps(state.get("step_history", []))
+        conclusion = state.get("conclusion", "")
+        # Command 更新不传播新增 key，从 conclusion 文本推断
+        import re
+        _m = re.search(r"^(?:#{1,3}\s*)?(DONE|ABORT)\s*[:：]", conclusion, re.IGNORECASE | re.MULTILINE)
+        is_done = bool(_m and _m.group(1).upper() == "DONE")
+        is_abort = bool(_m and _m.group(1).upper() == "ABORT")
+        exec_status = state.get("execution_status", "")
+        verdict = state.get("test_verdict", "")
+        if not exec_status:
+            if is_done: exec_status = "completed"
+            elif is_abort and "MAX_TURNS" in conclusion: exec_status = "exhausted"
+            elif is_abort: exec_status = "completed"
+        if not verdict:
+            verdict = "passed" if is_done else "inconclusive"
+
         result = {
             "thread_id": thread_id,
             "status": state.get("status", "success"),
-            "execution_status": state.get("execution_status", ""),
-            "test_verdict": state.get("test_verdict", ""),
+            "execution_status": exec_status,
+            "test_verdict": verdict,
             "verification_results": state.get("verification_results", []),
             "mode": "run",
-            "conclusion": state.get("conclusion", ""),
+            "conclusion": conclusion,
             "steps": display_steps,
             "goal_description": state.get("goal_description", {}),
         }

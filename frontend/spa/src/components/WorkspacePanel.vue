@@ -11,36 +11,45 @@
         </template>
         <!-- tool -->
         <template v-else-if="entry.type === 'tool'">
-          <span class="wp-icon">⚙</span>
+          <span class="wp-icon-wrap wp-icon-tool">⚙</span>
           <span class="wp-text">{{ entry.text }}</span>
           <span v-if="entry.detail" class="wp-detail">{{ entry.detail }}</span>
           <span class="wp-time">{{ entry.time }}</span>
         </template>
         <!-- result -->
         <template v-else-if="entry.type === 'result'">
-          <span class="wp-icon">{{ entry.icon }}</span>
+          <span class="wp-icon-wrap wp-icon-result">{{ entry.icon }}</span>
           <span class="wp-text wp-result-text">{{ entry.text }}</span>
           <span class="wp-time">{{ entry.time }}</span>
           <div v-if="entry.detail" class="wp-conclusion">{{ entry.detail }}</div>
         </template>
         <!-- user / planner / log / error -->
         <template v-else>
-          <span class="wp-icon" v-if="entry.icon">{{ entry.icon }}</span>
+          <span class="wp-icon-wrap" v-if="entry.icon">{{ entry.icon }}</span>
           <span class="wp-text">{{ entry.text }}</span>
           <span class="wp-time">{{ entry.time }}</span>
         </template>
       </div>
-      <div v-if="timeline.length === 0" class="wp-empty">输入测试指令开始执行</div>
+      <div v-if="timeline.length === 0" class="wp-empty">
+        <div class="wp-empty-icon">◇</div>
+        <div class="wp-empty-text">输入测试指令开始执行</div>
+      </div>
     </div>
 
     <!-- 输入区 -->
-    <div class="wp-input-row">
-      <el-input v-model="inputText" type="textarea" :rows="2"
-                placeholder="输入测试指令，如: 检查 Settings 的 WLAN 开关是否正常"
-                @keydown.enter.ctrl="$emit('run', inputText)" />
-      <el-button type="primary" :loading="executing" @click="$emit('run', inputText)" style="margin-top:6px">
-        {{ executing ? '执行中...' : '开始执行' }}
-      </el-button>
+    <div class="wp-input-area">
+      <div class="wp-input-wrap">
+        <el-input v-model="inputText" type="textarea" :rows="2"
+                  placeholder="输入测试指令，如: 检查 Settings 的 WLAN 开关是否正常"
+                  class="wp-textarea"
+                  @keydown.enter.ctrl="$emit('run', inputText)" />
+        <div class="wp-input-actions">
+          <span class="wp-input-hint">Ctrl + Enter 发送</span>
+          <el-button type="primary" :loading="executing" @click="$emit('run', inputText)" round>
+            {{ executing ? '执行中...' : '开始执行' }}
+          </el-button>
+        </div>
+      </div>
     </div>
   </section>
 </template>
@@ -78,13 +87,8 @@ function stopThinking() {
   }
 }
 
-function addEntry(entry) {
-  stopThinking()
-  timeline.value.push({ ...entry, time: now(), id: Date.now() })
-  if (timeline.value.length > 500) timeline.value.shift()
-}
-
 function addTool(name, target) {
+  console.log('[WP] addTool:', name, target)
   startThinking()
   stopThinking()
   const text = target ? `${name} → ${target}` : name
@@ -92,11 +96,13 @@ function addTool(name, target) {
 }
 
 function finishTool(name, elapsedMs) {
+  console.log('[WP] finishTool:', name, elapsedMs)
   const last = [...timeline.value].reverse().find(e => e.type === 'tool')
   if (last) last.detail = elapsedMs ? `${name} ${elapsedMs}ms` : name
 }
 
 function addResult(execStatus, verdict, conclusion, verificationResults) {
+  console.log('[WP] addResult:', execStatus, verdict)
   stopThinking()
   const icon = verdict === 'passed' ? '✅' : verdict === 'failed' ? '❌' : '⚠️'
   addEntry({ type: 'result', icon, text: `${execLabel(execStatus)} | ${verdictLabel(verdict)}`, detail: conclusion })
@@ -108,6 +114,12 @@ function addResult(execStatus, verdict, conclusion, verificationResults) {
 }
 
 function onToken() { startThinking() }
+function addEntry(entry) {
+  console.log('[WP] addEntry:', entry.type, entry.text?.substring(0, 40))
+  stopThinking()
+  timeline.value.push({ ...entry, time: now(), id: Date.now() })
+  if (timeline.value.length > 500) timeline.value.shift()
+}
 
 defineExpose({ addEntry, addTool, finishTool, addResult, onToken })
 
@@ -121,25 +133,155 @@ watch(() => timeline.value.length, () => {
 </script>
 
 <style scoped>
-.wp-root { display: flex; flex-direction: column; height: 100%; gap: 8px; }
-.wp-timeline { flex: 1; overflow-y: auto; padding: 8px 12px; background: #fafbfc; border-radius: 8px; border: 1px solid #e4e7ed; min-height: 200px; max-height: calc(100vh - 320px); }
-.wp-empty { text-align: center; color: #bbb; padding: 60px 0; font-size: 14px; }
-.wp-entry { display: flex; align-items: flex-start; gap: 6px; padding: 3px 0; font-size: 13px; line-height: 1.5; }
-.wp-entry.wp-tool { color: #555; }
-.wp-entry.wp-result { flex-wrap: wrap; padding: 4px 0; }
-.wp-entry.wp-error { color: #ef4444; }
-.wp-icon { flex-shrink: 0; width: 18px; text-align: center; }
-.wp-time { flex-shrink: 0; color: #bbb; font-size: 10px; margin-left: auto; min-width: 45px; text-align: right; }
-.wp-text { color: #444; }
-.wp-detail { color: #999; font-size: 11px; }
-.wp-conclusion { width: 100%; margin-top: 4px; padding: 6px 8px; background: #fff; border-radius: 4px; font-size: 12px; color: #666; white-space: pre-wrap; word-break: break-all; }
+.wp-root {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  gap: 12px;
+}
+
+/* ── Timeline ── */
+.wp-timeline {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  background: var(--bg-timeline, #fafbfc);
+  border-radius: var(--radius-lg, 16px);
+  border: 1px solid var(--line, #e8eaed);
+  min-height: 200px;
+  max-height: calc(100vh - 260px);
+}
+.wp-timeline::-webkit-scrollbar { width: 4px; }
+.wp-timeline::-webkit-scrollbar-thumb { background: #d4d6db; border-radius: 4px; }
+
+/* ── Empty State ── */
+.wp-empty {
+  text-align: center;
+  padding: 80px 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.wp-empty-icon {
+  font-size: 32px;
+  color: var(--accent, #6366f1);
+  opacity: .35;
+}
+.wp-empty-text {
+  color: var(--text-muted, #9aa0a6);
+  font-size: 14px;
+}
+
+/* ── Entry ── */
+.wp-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 13px;
+  line-height: 1.6;
+  border-bottom: 1px solid var(--line-light, #f0f1f3);
+}
+.wp-entry:last-child { border-bottom: none; }
+
+.wp-entry.wp-tool { color: var(--text-secondary, #5f6368); }
+.wp-entry.wp-result { flex-wrap: wrap; padding: 8px 0; }
+.wp-entry.wp-error { color: var(--danger, #ef4444); }
+.wp-entry.wp-planner { color: var(--accent, #6366f1); }
+.wp-entry.wp-user { color: var(--text-primary, #1a1d23); font-weight: 500; }
+
+/* ── Icon ── */
+.wp-icon-wrap {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  border-radius: 6px;
+  background: var(--line-light, #f0f1f3);
+}
+.wp-icon-tool { background: #eef2ff; }
+.wp-icon-result { background: transparent; font-size: 15px; }
+
+.wp-time {
+  flex-shrink: 0;
+  color: var(--text-muted, #9aa0a6);
+  font-size: 10px;
+  margin-left: auto;
+  min-width: 50px;
+  text-align: right;
+  padding-top: 2px;
+}
+.wp-text { color: var(--text-secondary, #5f6368); }
+.wp-entry.wp-user .wp-text { color: var(--text-primary, #1a1d23); }
+.wp-detail { color: var(--text-muted, #9aa0a6); font-size: 11px; }
 .wp-result-text { font-weight: 600; }
 
-/* thinking spinner */
-.wp-spinner { width: 12px; height: 12px; border: 2px solid #e0e0e0; border-top-color: #409eff; border-radius: 50%; animation: spin 0.6s linear infinite; flex-shrink: 0; margin-top: 2px; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.wp-entry.wp-thinking { color: #409eff; }
+/* ── Conclusion ── */
+.wp-conclusion {
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  background: #fff;
+  border-radius: var(--radius-sm, 8px);
+  font-size: 12px;
+  color: var(--text-secondary, #5f6368);
+  white-space: pre-wrap;
+  word-break: break-all;
+  border: 1px solid var(--line-light, #f0f1f3);
+  line-height: 1.6;
+}
 
-/* 输入区 */
-.wp-input-row { padding: 4px 0; }
+/* ── Thinking Spinner ── */
+.wp-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #e0e2e8;
+  border-top-color: var(--accent, #6366f1);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.wp-entry.wp-thinking { color: var(--accent, #6366f1); }
+.wp-entry.wp-thinking .wp-text { color: var(--accent, #6366f1); font-weight: 500; }
+
+/* ── Input Area ── */
+.wp-input-area {
+  padding: 4px 0;
+  flex-shrink: 0;
+}
+.wp-input-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.wp-input-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.wp-input-hint {
+  font-size: 11px;
+  color: var(--text-muted, #9aa0a6);
+}
+
+/* ── Textarea focus glow ── */
+.wp-textarea :deep(.el-textarea__inner:focus) {
+  box-shadow: var(--shadow-focus, 0 0 0 3px rgba(99,102,241,.18));
+  border-color: var(--accent, #6366f1);
+}
+.wp-textarea :deep(.el-textarea__inner) {
+  border-radius: var(--radius-md, 12px) !important;
+  border: 1.5px solid var(--line, #e8eaed);
+  padding: 12px 16px;
+  font-size: 14px;
+  line-height: 1.6;
+  resize: none;
+  transition: border-color var(--duration, .2s) var(--ease, ease),
+              box-shadow var(--duration, .2s) var(--ease, ease);
+}
 </style>
