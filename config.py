@@ -76,6 +76,14 @@ class TestConfig:
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
 
+        # ── 加载本地敏感配置（API Key 等，已在 .gitignore 中）──
+        local_path = str(Path(path).parent / "config.local.yaml")
+        if os.path.exists(local_path):
+            with open(local_path, "r", encoding="utf-8") as f:
+                local_data = yaml.safe_load(f) or {}
+            data.update(local_data)
+            logger.info("Loaded local overrides from %s", local_path)
+
         # 只取 dataclass 中定义的字段
         config = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 

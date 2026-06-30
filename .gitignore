@@ -223,3 +223,6 @@ logs/
 storage/case
 storage/screenshots/
 
+# Local sensitive config (API keys)
+config.local.yaml
+

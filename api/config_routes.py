@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/config", tags=["config"])
 
 _CONFIG_PATH = "config.yaml"
+_LOCAL_CONFIG_PATH = "config.local.yaml"
 
 # 可通过前端修改的字段白名单
 _EDITABLE_FIELDS = (
@@ -99,7 +100,7 @@ async def update_config(req: ConfigUpdateRequest):
                      "vision_base_url", "perception_mode"):
             need_rebuild_perceiver = True
 
-    # 写回 YAML
+    # 写回 YAML（敏感字段写 config.local.yaml，非敏感写 config.yaml）
     _save_yaml(updates)
 
     # 热更新 perceiver
@@ -119,15 +120,36 @@ async def update_config(req: ConfigUpdateRequest):
 
 
 def _save_yaml(updates: dict) -> None:
-    """将更新写回 config.yaml，保留已有结构。"""
-    path = Path(_CONFIG_PATH)
-    existing: dict = {}
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            existing = yaml.safe_load(f) or {}
+    """将更新写回配置文件。
+    - 敏感字段（API Key）→ config.local.yaml（已 gitignore）
+    - 非敏感字段 → config.yaml
+    """
+    valid_updates = {k: v for k, v in updates.items() if k in _EDITABLE_FIELDS}
 
-    existing.update({k: v for k, v in updates.items() if k in _EDITABLE_FIELDS})
+    # ── 分离敏感与非敏感字段 ──
+    local_updates = {k: v for k, v in valid_updates.items() if k in _SECRET_FIELDS}
+    public_updates = {k: v for k, v in valid_updates.items() if k not in _SECRET_FIELDS}
 
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(existing, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-    logger.info("config.yaml saved: %s", list(updates.keys()))
+    # ── 非敏感 → config.yaml ──
+    if public_updates:
+        path = Path(_CONFIG_PATH)
+        existing: dict = {}
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                existing = yaml.safe_load(f) or {}
+        existing.update(public_updates)
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.dump(existing, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        logger.info("config.yaml saved: %s", list(public_updates.keys()))
+
+    # ── 敏感 → config.local.yaml ──
+    if local_updates:
+        local_path = Path(_LOCAL_CONFIG_PATH)
+        local_existing: dict = {}
+        if local_path.exists():
+            with open(local_path, "r", encoding="utf-8") as f:
+                local_existing = yaml.safe_load(f) or {}
+        local_existing.update(local_updates)
+        with open(local_path, "w", encoding="utf-8") as f:
+            yaml.dump(local_existing, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        logger.info("config.local.yaml saved: %s", list(local_updates.keys()))
