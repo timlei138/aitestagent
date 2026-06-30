@@ -17,6 +17,7 @@ from api.device_routes import _get_device as _api_get_device
 from api.apps_routes import router as apps_router
 from api.apps_routes import resolve_app as _resolve_app_from_yaml
 from api.knowledge_routes import router as knowledge_router
+from api.config_routes import router as config_router
 from api.knowledge_routes import set_knowledge_base as _set_kb_for_routes
 from api.websocket_manager import WebSocketManager
 from config import TestConfig, resolve_perception_mode
@@ -83,9 +84,7 @@ def reconnect_device() -> dict:
     """尝试重连设备并重建感知器，返回状态字典。"""
     global _device, _perceiver
     try:
-        _device = DeviceController()
-        # 显式确保 ATX 代理已安装并运行（设备可能在服务器运行期间重启过）
-        _device._ensure_atx()
+        _device = DeviceController()  # auto_init=True 已自动检测并安装 ATX
         logging.getLogger(__name__).info("Device reconnected")
     except DeviceUnavailableError as exc:
         _device = None
@@ -118,9 +117,59 @@ orchestrator.set_event_callback(
 )
 set_ws_emit_callback(lambda t, p: ws_manager.broadcast_sync(t, p))
 
+# ── USB 热插拔监听 ──
+def _start_usb_monitor() -> None:
+    """后台线程：adb track-devices 实时监听 USB 插拔，毫秒级响应。"""
+    import subprocess
+    import threading
+
+    def _monitor():
+        global _device, _perceiver
+        logger = logging.getLogger(__name__)
+        prev_has_device = _device is not None
+        while True:
+            try:
+                proc = subprocess.Popen(
+                    ["adb", "track-devices"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, bufsize=1,
+                )
+                for line in proc.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    has_device = "\tdevice" in line and "offline" not in line
+                    if has_device != prev_has_device:
+                        prev_has_device = has_device
+                        if has_device:
+                            logger.info("USB device connected via ADB track-devices")
+                            reconnect_device()
+                        else:
+                            logger.info("USB device disconnected via ADB track-devices")
+                            _device = None
+                            _perceiver = None
+                            _rebuild_tool_context()
+                        try:
+                            ws_manager.broadcast_sync(
+                                "device_status_change",
+                                {"connected": has_device},
+                            )
+                        except Exception:
+                            pass
+                logger.warning("adb track-devices exited, restarting in 2s...")
+            except Exception as exc:
+                logger.warning("adb track-devices error: %s, retrying in 2s...", exc)
+            threading.Event().wait(2)
+
+    t = threading.Thread(target=_monitor, daemon=True, name="usb-monitor")
+    t.start()
+
+_start_usb_monitor()
+
 app.include_router(device_router)
 app.include_router(apps_router)
 app.include_router(knowledge_router)
+app.include_router(config_router)
 _set_kb_for_routes(_kb)
 
 

@@ -1,29 +1,15 @@
-# AI 自动化测试 Agent 配置文件
-# 环境变量: OPENAI_API_KEY / OPENAI_BASE_URL / ZHIPU_API_KEY
-
-# ── LLM ──
-llm_provider: "openai"
-model: "deepseek-v4-pro"
-api_key: "sk-296391b7a893487881d45f2726db67b6"
-base_url: "https://api.deepseek.com"
-
-# ── Vision 模型（SmartPerceiver 截图分析）──
-vision_provider: "zhipu"
-vision_model: "glm-4.6v-flash"
-vision_api_key: "054dc70864266b6e40df256f7cf3d01a.PFY3duz6Hu1KDJu7"
-vision_base_url: null
-
-# ── Embedding（RAG 向量化）──
-embedding_provider: "huggingface"
-embedding_model: "BAAI/bge-large-zh-v1.5"
-embedding_api_key: ""
-embedding_base_url: ""
-
-# ── 感知模式: hybrid(自动切换) | ui_tree(最快) | vision(截图分析) ──
-perception_mode: "ui_tree"
-
-# ── RAG ──
-rag_persist_dir: "storage/knowledge"
-
-# ── 安全 ──
-safety_level: "strict"
+llm_provider: openai
+model: deepseek-v4-pro
+api_key: sk-7ed343d917d547419f86d9d423c4d17b
+base_url: https://api.deepseek.com
+vision_provider: zhipu
+vision_model: glm-4.6v-flash
+vision_api_key: 054d***DJu7
+vision_base_url: ''
+embedding_provider: huggingface
+embedding_model: BAAI/bge-large-zh-v1.5
+embedding_api_key: ''
+embedding_base_url: ''
+perception_mode: ui_tree
+rag_persist_dir: storage/knowledge
+safety_level: strict

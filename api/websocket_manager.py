@@ -41,11 +41,7 @@ class WebSocketManager:
             self.disconnect(websocket)
 
     def broadcast_sync(self, event_type: str, payload: dict) -> None:
-        """同步广播事件 — 供同步执行流（ChatRunner/ReportBuilder）调用。
-
-        将事件包装为 ``{"type": event_type, "content": payload}`` 并通过
-        当前运行的 asyncio event loop 异步广播到所有已连接的 WebSocket。
-        """
+        """同步广播事件 — 供任意线程调用，自动适配 asyncio 跨线程调度。"""
         message = {"type": event_type, "content": payload}
         try:
             loop = asyncio.get_running_loop()
@@ -53,5 +49,7 @@ class WebSocketManager:
             return
         except RuntimeError:
             pass
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.broadcast(message), self._loop)
+        # 非 async 线程 → 用绑定的 loop 或全局 event loop
+        loop = self._loop or asyncio.get_event_loop()
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self.broadcast(message), loop)

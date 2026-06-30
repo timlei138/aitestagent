@@ -23,6 +23,10 @@
           <el-icon><i class="nav-icon">📚</i></el-icon>
           <span>知识库</span>
         </el-menu-item>
+        <el-menu-item index="settings">
+          <el-icon><i class="nav-icon">⚙️</i></el-icon>
+          <span>设置</span>
+        </el-menu-item>
         </el-menu>
       </div>
 
@@ -66,7 +70,7 @@
       <el-header class="topbar">
         <el-breadcrumb separator="/">
           <el-breadcrumb-item>AI 测试平台</el-breadcrumb-item>
-          <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'apps' ? 'APP 管理' : '知识库' }}</el-breadcrumb-item>
+          <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'apps' ? 'APP 管理' : activeMenu === 'settings' ? '设置' : '知识库' }}</el-breadcrumb-item>
         </el-breadcrumb>
         <div class="header-tags">
           <el-tag :type="wsConnected ? 'success' : 'info'" size="small" effect="light" round>
@@ -150,6 +154,101 @@
               </template>
             </el-table-column>
           </el-table>
+        </section>
+      </el-main>
+
+      <!-- ═══════════ 设置 ═══════════ -->
+      <el-main class="main-content" v-show="activeMenu === 'settings'">
+        <section class="panel" v-if="configData">
+          <div class="panel-header">
+            <h3 class="panel-title">系统设置</h3>
+            <el-button type="primary" :loading="configSaving" @click="saveConfig">保存配置</el-button>
+          </div>
+
+          <div class="settings-sections">
+            <!-- LLM 配置 -->
+            <div class="settings-group">
+              <h4 class="settings-group-title">LLM 模型</h4>
+              <el-form label-width="110px" size="default">
+                <el-form-item label="Provider">
+                  <el-select v-model="configData.llm_provider" style="width:100%">
+                    <el-option label="OpenAI (兼容)" value="openai" />
+                    <el-option label="智谱 Zhipu" value="zhipu" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="模型名称">
+                  <el-input v-model="configData.model" placeholder="如: deepseek-v4-pro, gpt-4o" />
+                </el-form-item>
+                <el-form-item label="API Key">
+                  <el-input v-model="configData.api_key" type="password" show-password placeholder="API Key" />
+                </el-form-item>
+                <el-form-item label="Base URL">
+                  <el-input v-model="configData.base_url" placeholder="如: https://api.deepseek.com" />
+                </el-form-item>
+              </el-form>
+            </div>
+
+            <!-- Vision 模型 -->
+            <div class="settings-group">
+              <h4 class="settings-group-title">Vision 模型（截图分析）</h4>
+              <el-form label-width="110px" size="default">
+                <el-form-item label="Provider">
+                  <el-select v-model="configData.vision_provider" style="width:100%">
+                    <el-option label="OpenAI (兼容)" value="openai" />
+                    <el-option label="智谱 Zhipu" value="zhipu" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="模型名称">
+                  <el-input v-model="configData.vision_model" placeholder="如: glm-4.6v-flash" />
+                </el-form-item>
+                <el-form-item label="API Key">
+                  <el-input v-model="configData.vision_api_key" type="password" show-password placeholder="Vision API Key" />
+                </el-form-item>
+                <el-form-item label="Base URL">
+                  <el-input v-model="configData.vision_base_url" placeholder="留空则复用 LLM Base URL" />
+                </el-form-item>
+              </el-form>
+            </div>
+
+            <!-- Embedding -->
+            <div class="settings-group">
+              <h4 class="settings-group-title">Embedding（RAG 向量化）</h4>
+              <el-form label-width="110px" size="default">
+                <el-form-item label="Provider">
+                  <el-select v-model="configData.embedding_provider" style="width:100%">
+                    <el-option label="HuggingFace (本地)" value="huggingface" />
+                    <el-option label="OpenAI (兼容)" value="openai" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="模型名称">
+                  <el-input v-model="configData.embedding_model" placeholder="如: BAAI/bge-large-zh-v1.5" />
+                </el-form-item>
+              </el-form>
+            </div>
+
+            <!-- 感知模式 & 安全等级 -->
+            <div class="settings-group">
+              <h4 class="settings-group-title">运行参数</h4>
+              <el-form label-width="110px" size="default">
+                <el-form-item label="感知模式">
+                  <el-select v-model="configData.perception_mode" style="width:100%">
+                    <el-option label="UI Tree（最快）" value="ui_tree" />
+                    <el-option label="Vision（截图分析）" value="vision" />
+                    <el-option label="Hybrid（自动切换）" value="hybrid" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="安全等级">
+                  <el-select v-model="configData.safety_level" style="width:100%">
+                    <el-option label="Strict（严格）" value="strict" />
+                    <el-option label="Relaxed（宽松）" value="relaxed" />
+                  </el-select>
+                </el-form-item>
+              </el-form>
+            </div>
+          </div>
+        </section>
+        <section class="panel" v-else style="display:flex;align-items:center;justify-content:center;min-height:200px">
+          <span style="color:var(--text-muted)">加载配置中...</span>
         </section>
       </el-main>
   
@@ -364,12 +463,15 @@ const executing = ref(false);
 const wsConnected = ref(false);
 const deviceOnline = ref(false);
 const deviceInfo = ref(null);
-const devicePolling = ref(false);
 const snapshotImage = ref("");
 const pageSummary = ref("");
 const elementList = ref([]);
 const workspaceRef = ref(null);
 const deviceFloatRef = ref(null);
+
+// 配置管理
+const configData = ref(null);
+const configSaving = ref(false);
 
 // 计划审阅
 const planReviewVisible = ref(false);
@@ -499,7 +601,6 @@ function fmtDuration(ms) {
 let ws = null;
 let snapshotTimer = null;
 let snapshotInFlight = false;
-let deviceStatusTimer = null;
 
 
 
@@ -521,6 +622,10 @@ function handleEvent(data) {
     case "step_start": refreshSnapshot(); break;
     case "step_end": refreshSnapshot(); break;
     case "snapshot": if (content.image) snapshotImage.value = content.image; break;
+    case "device_status_change":
+      deviceOnline.value = !!content.connected;
+      if (!content.connected) stopSnapshotPolling();
+      break;
     case "anomaly": wp?.addEntry({ type: "error", icon: "⚠", text: content.message || content.description || "" }); break;
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
@@ -554,6 +659,16 @@ async function startRun(text) {
   text = text.trim();
   if (!deviceOnline.value) {
     ElMessage.warning("Android 设备未连接，请先连接设备");
+    return;
+  }
+  // 检查 LLM 是否已配置
+  const cfg = configData.value;
+  if (!cfg || !cfg.api_key || cfg.api_key === '' || !cfg.model) {
+    ElMessageBox.confirm(
+      "首次使用请先配置 LLM 模型和 API Key，否则无法执行测试。",
+      "未配置 LLM",
+      { confirmButtonText: "去配置", cancelButtonText: "稍后再说", type: "warning" }
+    ).then(() => { activeMenu.value = 'settings'; }).catch(() => {});
     return;
   }
   if (workspaceRef.value) workspaceRef.value.addEntry({ type: "user", icon: "🧑", text });
@@ -677,23 +792,19 @@ async function refreshSnapshot(force = false) {
     const res = await fetch(`/api/device/snapshot?t=${Date.now()}`, { cache: "no-store" });
     if (res.status === 503) {
       deviceOnline.value = false;
-      startDevicePolling();
-      return;
+            return;
     }
     const data = await res.json();
     if (data.status === "error") {
       deviceOnline.value = false;
-      startDevicePolling();
-      return;
+            return;
     }
     deviceOnline.value = true;
-    stopDevicePolling();
-    snapshotImage.value = (data.screen || {}).image_base64 || "";
+        snapshotImage.value = (data.screen || {}).image_base64 || "";
     pageSummary.value = (data.understanding || {}).summary || "";
     elementList.value = (data.understanding || {}).elements || [];
   } catch (e) {
     deviceOnline.value = false;
-    startDevicePolling();
   } finally {
     snapshotInFlight = false;
   }
@@ -1023,15 +1134,12 @@ async function checkDeviceStatus() {
     if (data.connected && wasOffline) {
       fetchDeviceInfo();
       if (deviceFloatRef.value?.isVisible) refreshSnapshot(true);
-      stopDevicePolling();
-    } else if (!data.connected) {
+    } else if (!data.connected && !wasOffline) {
       deviceInfo.value = null;
-      startDevicePolling();
     }
   } catch (e) {
     deviceOnline.value = false;
     deviceInfo.value = null;
-    startDevicePolling();
   }
 }
 
@@ -1052,8 +1160,7 @@ async function reconnectDevice() {
     if (data.connected) {
       deviceOnline.value = true;
       fetchDeviceInfo();
-      stopDevicePolling();
-      if (deviceFloatRef.value?.isVisible) refreshSnapshot(true);
+            if (deviceFloatRef.value?.isVisible) refreshSnapshot(true);
     } else {
       ElMessage.warning(data.detail || "设备重连失败");
     }
@@ -1062,32 +1169,53 @@ async function reconnectDevice() {
   }
 }
 
-function startDevicePolling() {
-  if (deviceStatusTimer) return;
-  devicePolling.value = true;
-  deviceStatusTimer = window.setInterval(checkDeviceStatus, 5000);
+// ═══════════ 配置管理 ═══════════
+
+async function fetchConfig() {
+  try {
+    const res = await fetch("/api/config", { cache: "no-store" });
+    configData.value = await res.json();
+  } catch (e) {
+    ElMessage.error("加载配置失败");
+  }
 }
 
-function stopDevicePolling() {
-  if (!deviceStatusTimer) return;
-  clearInterval(deviceStatusTimer);
-  deviceStatusTimer = null;
-  devicePolling.value = false;
+async function saveConfig() {
+  if (!configData.value) return;
+  configSaving.value = true;
+  try {
+    const res = await fetch("/api/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(configData.value),
+    });
+    const data = await res.json();
+    if (data.status === "success") {
+      ElMessage.success("配置已保存");
+      // 重新加载以获取脱敏后的 API Key
+      await fetchConfig();
+    } else {
+      ElMessage.error("保存失败");
+    }
+  } catch (e) {
+    ElMessage.error("保存配置失败");
+  } finally {
+    configSaving.value = false;
+  }
 }
 
 onMounted(() => {
   connectWS();
   checkDeviceStatus();
-  startDevicePolling();  // 始终开启轮询监控设备状态
   loadReports();
   loadApps();
   loadKbList();
+  fetchConfig();
 });
 
 onBeforeUnmount(() => {
   stopSnapshotPolling();
-  stopDevicePolling();
-});
+  });
 </script>
 
 <style scoped src="./App.css"></style>

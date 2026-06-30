@@ -244,3 +244,25 @@
   max-height: 200px; overflow-y: auto; margin: 0;
   font-family: 'JetBrains Mono', monospace;
 }
+
+/* ═══════════ Settings Panel ═══════════ */
+.settings-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 680px;
+}
+.settings-group {
+  background: #fafbfc;
+  border: 1px solid var(--line-light);
+  border-radius: var(--radius-md);
+  padding: 16px 20px;
+}
+.settings-group-title {
+  margin: 0 0 12px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line-light);
+}
