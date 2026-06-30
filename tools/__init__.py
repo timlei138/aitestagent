@@ -1473,7 +1473,7 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
         if not hasattr(ctx, '_verifications'):
             ctx._verifications = []
         shot_path = ""
-        if result == "failed" and ctx.device:
+        if ctx.device:
             try:
                 import os
                 from datetime import datetime
