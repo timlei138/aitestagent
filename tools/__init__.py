@@ -1467,25 +1467,31 @@ def assert_element_exists(label: str) -> str:
 def assert_verification(condition: str, result: str, detail: str = "") -> str:
     """逐条报告验证条件的结果。condition 对应 goal.verification 中的验证项，
     result 为 "passed" 或 "failed"，detail 可选补充说明。
-    失败时自动截图存入 verification 记录。"""
+    截图策略：passed 复用 perceive() 缓存截图（零额外截图），failed 实时截图保存证据。"""
     ctx = get_tool_context()
     if ctx:
         if not hasattr(ctx, '_verifications'):
             ctx._verifications = []
-        shot_path = ""
-        if ctx.device:
+        normalized = result if result in ("passed", "failed") else "unknown"
+        shot_path = getattr(ctx, '_last_screenshot_path', '') or ''
+
+        # failed 或 缓存为空时实时截图
+        if (normalized == "failed" or not shot_path) and ctx.device:
             try:
-                import os
-                from datetime import datetime
                 os.makedirs("storage/screenshots", exist_ok=True)
                 safe_cond = re.sub(r"[^\w一-鿿-]", "_", condition[:30])
-                shot_path = f"storage/screenshots/verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_cond}.png"
-                ctx.device.screenshot().save(shot_path)
+                new_path = os.path.join(
+                    "storage/screenshots",
+                    f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_cond}.png"
+                )
+                ctx.device.screenshot().save(new_path)
+                shot_path = new_path
             except Exception:
                 pass
+
         ctx._verifications.append({
             "item": condition,
-            "result": result if result in ("passed", "failed") else "unknown",
+            "result": normalized,
             "detail": detail,
             "screenshot": shot_path,
         })

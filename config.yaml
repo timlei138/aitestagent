@@ -1,5 +1,5 @@
 llm_provider: openai
-model: deepseek-v4-pro
+model: deepseek-v4-flash
 base_url: https://api.deepseek.com
 vision_provider: zhipu
 vision_model: glm-4.6v-flash

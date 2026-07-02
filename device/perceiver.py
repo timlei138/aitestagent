@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -124,6 +125,23 @@ class SmartPerceiver:
         elements = self.parse_elements(xml)
         page_title = self._extract_page_title(xml)
         snapshot = self.device.snapshot()
+        # ── 截图存盘：perceive cache miss 时顺带存磁盘，供 assert_verification 复用（零额外截图调用）
+        try:
+            if snapshot.image_base64:
+                os.makedirs("storage/screenshots", exist_ok=True)
+                from datetime import datetime as _dt
+                _shot_path = os.path.join(
+                    "storage/screenshots",
+                    f"perceive_{_dt.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+                )
+                with open(_shot_path, "wb") as _f:
+                    _f.write(base64.b64decode(snapshot.image_base64))
+                from tools import get_tool_context as _gtc
+                _ctx = _gtc()
+                if _ctx is not None:
+                    _ctx._last_screenshot_path = _shot_path
+        except Exception:
+            pass
         understanding = self._heuristic_understand(
             elements=elements,
             package=snapshot.package,

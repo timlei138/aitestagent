@@ -176,6 +176,25 @@ def _run_agent(
                 output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"
             except Exception as e:
                 output = f"ERROR: {e}"
+            # 设备断开快速终止：工具执行后立即检测，避免继续执行无意义操作
+            try:
+                _live_ctx = get_tool_context()
+                if _live_ctx.device is None:
+                    output = "ERROR: 设备已断开连接"
+                    outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
+                    # 为剩余未执行的 tool_calls 补占位 ToolMessage，避免 LangChain 报错
+                    _remaining = (last_ai.tool_calls or [])
+                    _idx = _remaining.index(tc) + 1 if tc in _remaining else -1
+                    if _idx > 0:
+                        for _skipped in _remaining[_idx:]:
+                            outputs.append(ToolMessage(
+                                content="SKIPPED: 设备已断开",
+                                tool_call_id=_skipped["id"]
+                            ))
+                    logger.warning("设备在工具执行中断开，终止剩余工具调用")
+                    break
+            except Exception:
+                pass
             if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
                 try: _ctx._ws_emit("tool_end", {"name": name, "output": output[:200]})
                 except Exception: pass
@@ -239,6 +258,38 @@ def _detect_termination(result: str) -> tuple[bool, bool]:
         return (False, False)
     m = matches[-1]
     return (m.group(1).upper() == "DONE", m.group(1).upper() == "ABORT")
+
+
+def _ensure_device_alive(max_retries: int = 2, wait_sec: float = 5.0) -> bool:
+    """检测设备是否存活。断开时等待 USB monitor 自动重连，最多重试 max_retries 次。
+
+    USB monitor（server.py _start_usb_monitor）在检测到 USB 断开时会将
+    ToolContext.device 置为 None，重连后自动重建 ToolContext。
+    本函数只需轮询 get_tool_context().device 即可。
+    """
+    import time as _time
+    try:
+        ctx = get_tool_context()
+        if ctx.device is not None:
+            return True
+    except Exception:
+        pass
+
+    for attempt in range(1, max_retries + 1):
+        logger.warning(
+            "设备已断开，等待自动重连 (%d/%d)...", attempt, max_retries
+        )
+        _time.sleep(wait_sec)
+        try:
+            ctx = get_tool_context()
+            if ctx.device is not None:
+                logger.info("设备已自动重连 (第 %d 次尝试)", attempt)
+                return True
+        except Exception:
+            pass
+
+    logger.error("设备重连失败，已达最大重试次数 %d", max_retries)
+    return False
 
 
 def _call_retry(provider, fn, *a, **kw):
@@ -383,6 +434,26 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
 def agent_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     llm = _llm_cfg(cfg)
+
+    # ── 设备健康检查：断开时等待重连，重试 2 次仍失败则直接终止 ──
+    if not _ensure_device_alive(max_retries=2, wait_sec=5.0):
+        history = state.get("step_history", [])
+        si = len(history) + 1
+        conclusion = "ABORT: 设备在测试过程中断开连接，尝试重连 2 次失败，无法继续"
+        logger.warning("Agent #%d: device lost, aborting", si)
+        nh = list(history) + [
+            {
+                "index": si, "intent": conclusion[:80],
+                "action_type": "device_lost", "target": "",
+                "page_from": "", "page_to": "",
+                "duration_ms": 0, "status": "fail",
+                "observation": conclusion, "raw_observation": conclusion,
+                "screenshot_path": "", "anomaly": None,
+            }
+        ]
+        return Command(update={
+            "step_history": nh, "status": "fail", "conclusion": conclusion,
+        })
 
     # Page info
     ctx = get_tool_context()
