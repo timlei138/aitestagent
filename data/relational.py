@@ -24,8 +24,11 @@ class RelationalBackend(ABC):
 
     @abstractmethod
     def select(
-        self, table: str, where: dict[str, Any] | None = None,
-        order_by: str = "", limit: int = 100,
+        self,
+        table: str,
+        where: dict[str, Any] | None = None,
+        order_by: str = "",
+        limit: int = 100,
     ) -> list[dict[str, Any]]:
         """查询数据，返回行字典列表。"""
         ...
@@ -148,8 +151,13 @@ class SqliteBackend(RelationalBackend):
         self._conn.commit()
         return cursor.lastrowid or 0
 
-    def select(self, table: str, where: dict[str, Any] | None = None,
-               order_by: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    def select(
+        self,
+        table: str,
+        where: dict[str, Any] | None = None,
+        order_by: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
         sql = f"SELECT * FROM {table}"
         params: tuple = ()
         if where:
@@ -167,8 +175,10 @@ class SqliteBackend(RelationalBackend):
         columns = ", ".join(data.keys())
         placeholders = ", ".join("?" for _ in data)
         updates = ", ".join(f"{k} = excluded.{k}" for k in data if k != key)
-        sql = (f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) "
-               f"ON CONFLICT({key}) DO UPDATE SET {updates}")
+        sql = (
+            f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT({key}) DO UPDATE SET {updates}"
+        )
         cursor = self._conn.execute(sql, tuple(data.values()))
         self._conn.commit()
         return cursor.lastrowid or 0
@@ -182,37 +192,54 @@ class SqliteBackend(RelationalBackend):
             params = tuple(where.values())
         return self._conn.execute(sql, params).fetchone()[0]
 
-    def record_test_run(self, run_id: str, user_request: str, app_package: str,
-                        app_name: str, status: str, conclusion: str,
-                        steps: list[dict], duration_seconds: float = 0,
-                        execution_status: str = "", test_verdict: str = "",
-                        verification_json: str = "[]") -> None:
+    def record_test_run(
+        self,
+        run_id: str,
+        user_request: str,
+        app_package: str,
+        app_name: str,
+        status: str,
+        conclusion: str,
+        steps: list[dict],
+        duration_seconds: float = 0,
+        execution_status: str = "",
+        test_verdict: str = "",
+        verification_json: str = "[]",
+    ) -> None:
         """快捷方法：记录一次测试执行。"""
-        self.upsert("test_runs", {
-            "id": run_id,
-            "user_request": user_request,
-            "app_package": app_package,
-            "app_name": app_name,
-            "status": status,
-            "conclusion": str(conclusion)[:2000],
-            "steps_json": json.dumps(steps, ensure_ascii=False),
-            "duration_seconds": duration_seconds,
-            "execution_status": execution_status,
-            "test_verdict": test_verdict,
-            "verification_json": verification_json,
-            "created_at": datetime.now().isoformat(),
-        }, key="id")
+        self.upsert(
+            "test_runs",
+            {
+                "id": run_id,
+                "user_request": user_request,
+                "app_package": app_package,
+                "app_name": app_name,
+                "status": status,
+                "conclusion": str(conclusion)[:2000],
+                "steps_json": json.dumps(steps, ensure_ascii=False),
+                "duration_seconds": duration_seconds,
+                "execution_status": execution_status,
+                "test_verdict": test_verdict,
+                "verification_json": verification_json,
+                "created_at": datetime.now().isoformat(),
+            },
+            key="id",
+        )
 
-    def record_human_decision(self, run_id: str, step_index: int,
-                              question: str, decision: str) -> None:
+    def record_human_decision(
+        self, run_id: str, step_index: int, question: str, decision: str
+    ) -> None:
         """快捷方法：记录一次人工决策。"""
-        self.insert("human_decisions", {
-            "run_id": run_id,
-            "step_index": step_index,
-            "question": question[:500],
-            "decision": decision,
-            "created_at": datetime.now().isoformat(),
-        })
+        self.insert(
+            "human_decisions",
+            {
+                "run_id": run_id,
+                "step_index": step_index,
+                "question": question[:500],
+                "decision": decision,
+                "created_at": datetime.now().isoformat(),
+            },
+        )
 
     def list_test_runs(self, limit: int = 30) -> list[dict[str, Any]]:
         """查询最近的测试执行记录列表。"""
@@ -220,22 +247,29 @@ class SqliteBackend(RelationalBackend):
             "SELECT id, user_request, app_package, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
             "execution_status, test_verdict FROM test_runs "
-            "ORDER BY created_at DESC LIMIT ?", (limit,)
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
         ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             d = dict(row)
             steps = json.loads(d.pop("steps_json", "[]") or "[]")
-            pass_count = sum(1 for s in steps if s.get("status") in ("success", "continue"))
+            pass_count = sum(
+                1 for s in steps if s.get("status") in ("success", "continue")
+            )
             fail_count = sum(1 for s in steps if s.get("status") == "fail")
             d["pass_count"] = pass_count
             d["fail_count"] = fail_count
             d["total_steps"] = len(steps)
             # 旧数据兼容：无新列时从 status 推导
             if not d.get("execution_status"):
-                d["execution_status"] = "completed" if d["status"] == "success" else "error"
+                d["execution_status"] = (
+                    "completed" if d["status"] == "success" else "error"
+                )
             if not d.get("test_verdict"):
-                d["test_verdict"] = "passed" if d["status"] == "success" else "inconclusive"
+                d["test_verdict"] = (
+                    "passed" if d["status"] == "success" else "inconclusive"
+                )
             result.append(d)
         return result
 
@@ -245,7 +279,7 @@ class SqliteBackend(RelationalBackend):
             "SELECT id, user_request, app_package, app_name, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
             "execution_status, test_verdict, verification_json FROM test_runs WHERE id = ?",
-            (run_id,)
+            (run_id,),
         ).fetchone()
         if not row:
             return None
@@ -262,65 +296,119 @@ class SqliteBackend(RelationalBackend):
             d["execution_status"] = "completed" if d["status"] == "success" else "error"
         if not d.get("test_verdict"):
             d["test_verdict"] = "passed" if d["status"] == "success" else "inconclusive"
-        d["verification_results"] = json.loads(d.pop("verification_json", "[]") or "[]")
+        verification_results = json.loads(d.pop("verification_json", "[]") or "[]")
+        if isinstance(verification_results, list):
+            for item in verification_results:
+                if isinstance(item, dict) and item.get("screenshot"):
+                    item["screenshot"] = str(item["screenshot"]).replace("\\", "/")
+        d["verification_results"] = verification_results
         return d
 
     # ── 元素身份 ──
 
-    def save_element_identity(self, app_package: str, page_signature: str,
-                              alias: str, resource_id: str = "", class_name: str = "",
-                              role: str = "", region: str = "", text_hint: str = "",
-                              bounds_json: str = "", screen_width: int = 0,
-                              screen_height: int = 0,
-                              candidates_count: int = 1) -> None:
+    def save_element_identity(
+        self,
+        app_package: str,
+        page_signature: str,
+        alias: str,
+        resource_id: str = "",
+        class_name: str = "",
+        role: str = "",
+        region: str = "",
+        text_hint: str = "",
+        bounds_json: str = "",
+        screen_width: int = 0,
+        screen_height: int = 0,
+        candidates_count: int = 1,
+    ) -> None:
         """保存或更新元素身份映射。click_count 递增。"""
-        existing = self.select("element_identities", {
-            "app_package": app_package, "page_signature": page_signature, "alias": alias,
-        }, limit=1)
+        existing = self.select(
+            "element_identities",
+            {
+                "app_package": app_package,
+                "page_signature": page_signature,
+                "alias": alias,
+            },
+            limit=1,
+        )
         now = datetime.now().isoformat()
         if existing:
             row = existing[0]
-            self.insert("element_identities", {
-                "app_package": app_package, "page_signature": page_signature, "alias": alias,
-                "resource_id": resource_id or row.get("resource_id", ""),
-                "class_name": class_name or row.get("class_name", ""),
-                "role": role or row.get("role", ""),
-                "region": region or row.get("region", ""),
-                "text_hint": text_hint or row.get("text_hint", ""),
-                "bounds_json": bounds_json or row.get("bounds_json", ""),
-                "screen_width": screen_width or row.get("screen_width", 0),
-                "screen_height": screen_height or row.get("screen_height", 0),
-                "candidates_count": candidates_count,
-                "click_count": int(row.get("click_count", 0)) + 1,
-                "last_used_at": now,
-                "updated_at": now,
-                "created_at": row.get("created_at", now),
-            })
+            self.insert(
+                "element_identities",
+                {
+                    "app_package": app_package,
+                    "page_signature": page_signature,
+                    "alias": alias,
+                    "resource_id": resource_id or row.get("resource_id", ""),
+                    "class_name": class_name or row.get("class_name", ""),
+                    "role": role or row.get("role", ""),
+                    "region": region or row.get("region", ""),
+                    "text_hint": text_hint or row.get("text_hint", ""),
+                    "bounds_json": bounds_json or row.get("bounds_json", ""),
+                    "screen_width": screen_width or row.get("screen_width", 0),
+                    "screen_height": screen_height or row.get("screen_height", 0),
+                    "candidates_count": candidates_count,
+                    "click_count": int(row.get("click_count", 0)) + 1,
+                    "last_used_at": now,
+                    "updated_at": now,
+                    "created_at": row.get("created_at", now),
+                },
+            )
         else:
-            self.insert("element_identities", {
-                "app_package": app_package, "page_signature": page_signature, "alias": alias,
-                "resource_id": resource_id, "class_name": class_name,
-                "role": role, "region": region, "text_hint": text_hint,
-                "bounds_json": bounds_json, "screen_width": screen_width,
-                "screen_height": screen_height,
-                "candidates_count": candidates_count, "click_count": 1,
-                "last_used_at": now, "created_at": now, "updated_at": now,
-            })
+            self.insert(
+                "element_identities",
+                {
+                    "app_package": app_package,
+                    "page_signature": page_signature,
+                    "alias": alias,
+                    "resource_id": resource_id,
+                    "class_name": class_name,
+                    "role": role,
+                    "region": region,
+                    "text_hint": text_hint,
+                    "bounds_json": bounds_json,
+                    "screen_width": screen_width,
+                    "screen_height": screen_height,
+                    "candidates_count": candidates_count,
+                    "click_count": 1,
+                    "last_used_at": now,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
 
-    def query_element_identity(self, app_package: str, alias: str,
-                               page_signature: str = "",
-                               target_screen: tuple[int, int] = (0, 0)
-                               ) -> list[dict[str, Any]]:
+    def query_element_identity(
+        self,
+        app_package: str,
+        alias: str,
+        page_signature: str = "",
+        target_screen: tuple[int, int] = (0, 0),
+    ) -> list[dict[str, Any]]:
         """查询元素身份映射。如果提供 target_screen, 自动将历史 bounds 换算为当前屏幕坐标。"""
         if page_signature:
-            rows = self.select("element_identities", {
-                "app_package": app_package, "page_signature": page_signature, "alias": alias,
-            }, limit=1)
+            rows = self.select(
+                "element_identities",
+                {
+                    "app_package": app_package,
+                    "page_signature": page_signature,
+                    "alias": alias,
+                },
+                limit=1,
+            )
             if rows:
-                return [_convert_bounds(r, target_screen) for r in self._apply_expiry(rows)]
-        rows = self.select("element_identities", {
-            "app_package": app_package, "alias": alias,
-        }, order_by="click_count DESC", limit=3)
+                return [
+                    _convert_bounds(r, target_screen) for r in self._apply_expiry(rows)
+                ]
+        rows = self.select(
+            "element_identities",
+            {
+                "app_package": app_package,
+                "alias": alias,
+            },
+            order_by="click_count DESC",
+            limit=3,
+        )
         return [_convert_bounds(r, target_screen) for r in self._apply_expiry(rows)]
 
     def _apply_expiry(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -336,24 +424,35 @@ class SqliteBackend(RelationalBackend):
                     pass
         return rows
 
-    def list_element_identities(self, app_package: str = "",
-                                limit: int = 50) -> list[dict[str, Any]]:
+    def list_element_identities(
+        self, app_package: str = "", limit: int = 50
+    ) -> list[dict[str, Any]]:
         """列出元素身份映射。"""
         if app_package:
-            return self.select("element_identities", {"app_package": app_package},
-                              order_by="click_count DESC", limit=limit)
-        return self.select("element_identities", order_by="click_count DESC", limit=limit)
+            return self.select(
+                "element_identities",
+                {"app_package": app_package},
+                order_by="click_count DESC",
+                limit=limit,
+            )
+        return self.select(
+            "element_identities", order_by="click_count DESC", limit=limit
+        )
 
-    def find_successful_plan(self, app_package: str, user_request: str) -> dict[str, Any] | None:
+    def find_successful_plan(
+        self, app_package: str, user_request: str
+    ) -> dict[str, Any] | None:
         """查找最近一次有成功步骤的测试执行, 返回其结果。
         用于 replay_mode: 全量回归时复用历史计划（从第 1 步开始）。
         匹配时对 user_request 规范化，提高命中率。
         """
         normalized = _normalize_request(user_request)
         # 先精确匹配原始文本
-        sql = ("SELECT id, status, steps_json, created_at "
-               "FROM test_runs WHERE app_package = ? AND user_request = ? "
-               "ORDER BY created_at DESC LIMIT 10")
+        sql = (
+            "SELECT id, status, steps_json, created_at "
+            "FROM test_runs WHERE app_package = ? AND user_request = ? "
+            "ORDER BY created_at DESC LIMIT 10"
+        )
         rows = self._conn.execute(sql, (app_package, user_request)).fetchall()
         # 精确匹配失败时，用规范化后的文本模糊匹配
         if not rows:
@@ -361,10 +460,13 @@ class SqliteBackend(RelationalBackend):
                 "SELECT id, status, steps_json, created_at, user_request "
                 "FROM test_runs WHERE app_package = ? "
                 "ORDER BY created_at DESC LIMIT 50",
-                (app_package,)
+                (app_package,),
             ).fetchall()
-            rows = [r for r in all_runs
-                    if _normalize_request(dict(r).get("user_request", "")) == normalized]
+            rows = [
+                r
+                for r in all_runs
+                if _normalize_request(dict(r).get("user_request", "")) == normalized
+            ]
         if not rows:
             return None
         # 找最近的有最多成功步骤的记录
@@ -376,13 +478,17 @@ class SqliteBackend(RelationalBackend):
             success_count = sum(1 for s in steps if s.get("status") == "success")
             if success_count > best_success:
                 best_success = success_count
-                best = {"run_id": d["id"], "steps": steps,
-                        "success_count": success_count,
-                        "total_count": len(steps)}
+                best = {
+                    "run_id": d["id"],
+                    "steps": steps,
+                    "success_count": success_count,
+                    "total_count": len(steps),
+                }
         return best
 
 
 # ── 模块级辅助函数 ──
+
 
 def _normalize_request(text: str) -> str:
     """规范化 user_request，提高精确匹配命中率。
@@ -390,15 +496,17 @@ def _normalize_request(text: str) -> str:
     例: '打开WLAN设置， 开启开关' -> '打开wlan设置 开启开关'
     """
     # 去标点符号
-    text = re.sub(r'[\uff0c\u3002\uff01\uff1f\u3001,.!?;\uff1b]', ' ', text)
+    text = re.sub(r"[\uff0c\u3002\uff01\uff1f\u3001,.!?;\uff1b]", " ", text)
     # 统一空格 + strip
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
     # 去掉常见前缀冗余词
-    text = re.sub(r'^(请|帮我|帮忙)', '', text).strip()
+    text = re.sub(r"^(请|帮我|帮忙)", "", text).strip()
     return text.lower()
 
 
-def _convert_bounds(row: dict[str, Any], target_screen: tuple[int, int]) -> dict[str, Any]:
+def _convert_bounds(
+    row: dict[str, Any], target_screen: tuple[int, int]
+) -> dict[str, Any]:
     """将历史 bounds 按百分比换算到目标屏幕尺寸。
 
     注意：Android 布局不是简单等比缩放，状态栏/导航栏高度不同会导致线性换算偏差。
@@ -430,8 +538,10 @@ def _convert_bounds(row: dict[str, Any], target_screen: tuple[int, int]) -> dict
             # 置信度评估：屏幕比例差异越大，置信度越低
             aspect_src = src_w / src_h
             aspect_tgt = tgt_w / tgt_h
-            confidence = "high" if abs(aspect_src - aspect_tgt) < 0.1 else (
-                "medium" if abs(aspect_src - aspect_tgt) < 0.3 else "low"
+            confidence = (
+                "high"
+                if abs(aspect_src - aspect_tgt) < 0.1
+                else ("medium" if abs(aspect_src - aspect_tgt) < 0.3 else "low")
             )
             result["bounds_pct"] = pct
             result["bounds_converted"] = converted

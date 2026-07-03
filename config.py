@@ -11,6 +11,9 @@ from typing import Any
 import yaml
 
 logger = logging.getLogger(__name__)
+_LOG_DIR = Path("logs")
+_LOG_RUN_DIR = Path("logs") / "runs"
+_LOG_SERVICE_FILE = _LOG_DIR / "service.log"
 
 
 @dataclass
@@ -53,17 +56,7 @@ class TestConfig:
                 level=logging.INFO,
                 format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
             )
-        # ── 文件日志：每次启动生成新文件 ──
-        _log_dir = Path("logs")
-        _log_dir.mkdir(exist_ok=True)
-        _log_file = _log_dir / f"app_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        _fh = logging.FileHandler(_log_file, encoding="utf-8")
-        _fh.setLevel(logging.INFO)
-        _fh.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-        )
-        logging.getLogger().addHandler(_fh)
-        logger.info("Log file: %s", _log_file)
+        cls._ensure_service_log_handler()
 
         data: dict[str, Any] = {}
         if os.path.exists(path):
@@ -107,45 +100,14 @@ class TestConfig:
             return
         os.environ["LANGCHAIN_DEBUG"] = "true"
 
-        log_dir = Path("logs")
-        log_dir.mkdir(exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = log_dir / f"langchain_{timestamp}.log"
-
-        # LangChain [chain/end] 等日志通过 print() 直接输出，不走 logging 模块
-        # 所以需要 tee stdout 到文件才能捕获
-        # utf-8-sig 写入 BOM，防止编辑器（如 VSCode）误判编码导致中文乱码
-        _stdout_log = open(log_file, "w", encoding="utf-8-sig")
-
-        _orig_stdout = sys.stdout
-        _orig_encoding = getattr(_orig_stdout, "encoding", "utf-8") or "utf-8"
-
-        class _Tee:
-            def __init__(self, *files):
-                self.files = files
-
-            @property
-            def encoding(self):
-                return _orig_encoding
-
-            def write(self, obj):
-                for f in self.files:
-                    f.write(obj)
-                    f.flush()
-
-            def flush(self):
-                for f in self.files:
-                    f.flush()
-
-        sys.stdout = _Tee(_orig_stdout, _stdout_log)
-
-        # logging 模块也加上 langchain / langgraph 的 handler（捕获少数走 logger 的消息）
+        # LangChain 的逐次运行日志由 start_run_log() tee 到 logs/runs/*_langchain.log。
+        # 这里仅打开调试开关，不在进程启动时创建单独 boot 日志文件。
         for name in ("langchain", "langgraph"):
             lg = logging.getLogger(name)
-            lg.setLevel(logging.DEBUG)
+            lg.setLevel(logging.WARNING)
         # langchain_core callbacks 会产生 KeyError('input') 冗余警告，抑制到 ERROR
         logging.getLogger("langchain_core.callbacks.manager").setLevel(logging.ERROR)
-        logging.getLogger("langchain_core").setLevel(logging.INFO)
+        logging.getLogger("langchain_core").setLevel(logging.WARNING)
 
         try:
             from langchain_core.globals import set_debug, set_verbose
@@ -174,6 +136,33 @@ class TestConfig:
             cls._mask_secret(config.api_key),
         )
 
+    @classmethod
+    def _ensure_service_log_handler(cls) -> None:
+        """确保服务状态日志仅写入 logs/service.log，且避免重复注册 handler。"""
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        root = logging.getLogger()
+
+        for h in root.handlers:
+            if getattr(h, "_service_log_handler", False):
+                return
+
+        class _ExcludeLangchainLogs(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                return not (
+                    record.name.startswith("langchain")
+                    or record.name.startswith("langgraph")
+                )
+
+        fh = logging.FileHandler(_LOG_SERVICE_FILE, encoding="utf-8")
+        fh._service_log_handler = True
+        fh.setLevel(logging.INFO)
+        fh.addFilter(_ExcludeLangchainLogs())
+        fh.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        )
+        root.addHandler(fh)
+        logger.info("Service log file: %s", _LOG_SERVICE_FILE)
+
 
 def resolve_perception_mode(config: TestConfig) -> tuple[str, bool]:
     """根据 perception_mode 配置解析 Perceiver 参数。
@@ -194,25 +183,15 @@ def resolve_perception_mode(config: TestConfig) -> tuple[str, bool]:
 
 
 def start_run_log(run_id: str) -> dict:
-    """为单次测试运行创建独立的 app + langchain 日志文件。
-    返回 {"app_handler": FileHandler, "langchain_file": Path, "cleanup": callable}
+    """为单次测试运行创建独立 langchain 日志文件。
+    返回 {"langchain_file": Path, "cleanup": callable}
     """
     import re
-    from pathlib import Path
 
-    run_dir = Path("logs/runs")
+    run_dir = _LOG_RUN_DIR
     run_dir.mkdir(parents=True, exist_ok=True)
     safe_id = re.sub(r"[<>:\"/\\|?* ]", "_", run_id)[:60]
     ts = datetime.now().strftime("%H%M%S")
-
-    # ── app 日志 ──
-    app_path = run_dir / f"{ts}_{safe_id}_app.log"
-    app_fh = logging.FileHandler(app_path, encoding="utf-8")
-    app_fh.setLevel(logging.INFO)
-    app_fh.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    )
-    logging.getLogger().addHandler(app_fh)
 
     # ── langchain 日志 ──
     lc_path = run_dir / f"{ts}_{safe_id}_langchain.log"
@@ -245,9 +224,7 @@ def start_run_log(run_id: str) -> dict:
     sys.stdout = _Tee()
 
     def cleanup():
-        logging.getLogger().removeHandler(app_fh)
-        app_fh.close()
         sys.stdout = _orig_stdout
         lc_file.close()
 
-    return {"app_handler": app_fh, "langchain_file": lc_path, "cleanup": cleanup}
+    return {"langchain_file": lc_path, "cleanup": cleanup}

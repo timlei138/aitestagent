@@ -19,10 +19,10 @@
     <!-- 验证清单 -->
     <div v-if="report.verification_results && report.verification_results.length" class="rd-verification">
       <div class="rd-section-title">验证清单</div>
-      <div v-for="(v, i) in report.verification_results" :key="i" class="rd-verify-item">
+      <div v-for="(v, i) in report.verification_results" :key="v.screenshot || i" class="rd-verify-item">
         <span class="rd-verify-icon" :class="v.result">{{ v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?' }}</span>
         <span class="rd-verify-text">{{ v.item }}</span>
-        <el-image v-if="v.screenshot" :src="'/' + v.screenshot" :preview-src-list="['/' + v.screenshot]"
+        <el-image v-if="v.screenshot" :src="shotUrl(v.screenshot, i)" :preview-src-list="[shotUrl(v.screenshot, i)]"
                   fit="cover" class="verify-shot" title="点击查看大图" />
       </div>
     </div>
@@ -104,6 +104,11 @@ function fmtDuration(ms) {
   const m = Math.floor(ms / 60000)
   const s = Math.round((ms % 60000) / 1000)
   return s > 0 ? `${m}m${s}s` : `${m}m`
+}
+
+function shotUrl(path, index) {
+  const normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '')
+  return `/${normalized}?v=${props.report?.id || 'report'}_${index}`
 }
 </script>
 

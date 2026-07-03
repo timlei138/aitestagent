@@ -51,6 +51,22 @@ _SKIP_EMIT = {"get_screen_info", "check_page_health", "query_app_knowledge"}
 # ═══ Prompt ═══
 
 
+def _build_tool_target(name: str, args: dict) -> str:
+    """从工具参数中提取可读的目标描述。"""
+    if not args:
+        return ""
+    # 优先使用显式的 label / target 参数
+    label = args.get("label", "") or args.get("target", "")
+    if label:
+        return str(label)
+    # 按优先级从其他参数中提取
+    for key in ("key", "text", "direction", "panel", "package", "seconds", "orientation"):
+        val = args.get(key, "")
+        if val:
+            return str(val)
+    return ""
+
+
 def _load_prompt(name: str) -> str:
     _dir = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(_dir, "prompts", name)
@@ -169,7 +185,7 @@ def _run_agent(
             name = tc["name"]
             args = tc.get("args", {}) or {}
             if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
-                try: _ctx._ws_emit("tool_start", {"name": name, "input": {"label": args.get("label", "") or args.get("target", "")}})
+                try: _ctx._ws_emit("tool_start", {"name": name, "input": {"label": _build_tool_target(name, args)}})
                 except Exception: pass
             t = _tool_map.get(name)
             try:
@@ -229,7 +245,7 @@ def _run_agent(
                 args = tc.get("args", {}) or {}
                 _tool_calls_log.append({
                     "name": name,
-                    "target": args.get("label", "") or args.get("target", "") or "",
+                    "target": _build_tool_target(name, args),
                 })
 
     # Phase 1.1: 静默截断检测 —— 当 turn 耗尽时注入明确标记
@@ -566,7 +582,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             if _tn not in ("get_screen_info", "check_page_health", "query_app_knowledge"):
                 _tool_name = _tn
                 _args = _last.get("args", {}) or {}
-                _tool_target = _args.get("label", "") or _args.get("target", "") or ""
+                _tool_target = _build_tool_target(_tn, _args)
             break
     # 尝试捕获 page_to（本步骤之后下一次感知的页面）
     try:

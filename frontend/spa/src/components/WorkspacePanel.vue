@@ -98,7 +98,7 @@ function addTool(name, target) {
 function finishTool(name, elapsedMs) {
   console.log('[WP] finishTool:', name, elapsedMs)
   const last = [...timeline.value].reverse().find(e => e.type === 'tool')
-  if (last) last.detail = elapsedMs ? `${name} ${elapsedMs}ms` : name
+  if (last && elapsedMs) last.detail = `${name} ${elapsedMs}ms`
 }
 
 function addResult(execStatus, verdict, conclusion, verificationResults) {

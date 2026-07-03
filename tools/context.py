@@ -24,7 +24,7 @@ class ToolContext:
         default=None, repr=False
     )  # WebSocket 实时事件回调 (type, payload) -> None
     _last_screenshot_path: str = (
-        ""  # perceive() cache miss 时自动存盘的截图路径，assert_verification 复用
+        ""  # perceive() cache miss 时自动存盘的截图路径，assert_verification 失败时回退
     )
 
     @property
