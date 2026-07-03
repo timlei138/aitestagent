@@ -37,3 +37,8 @@ click("A") → click("B") → click("A") → ...
 - 工具调用次数由任务复杂度自动分配（10~50 次），超了就 ABORT
 - click 返回值会包含操作后的页面状态变化，仔细看
 - 不确定元素位置时，优先调用 query_app_knowledge 查找历史导航经验
+- 默认优先 `get_screen_info` 做结构化判断；不要每步都看图
+- 仅在需要视觉语义时调用视觉工具：
+	- `visual_check("描述")`：判断颜色、布局、Toast、图标状态等
+	- `detect_overlay()`：判断是否有弹窗/浮层遮挡
+- 如果连续两次视觉工具返回 unknown，回退 UI tree 路径继续执行，必要时 ABORT

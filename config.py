@@ -21,12 +21,6 @@ class TestConfig:
     api_key: str | None = None
     base_url: str | None = None
 
-    # ── Vision 模型（SmartPerceiver 截图分析）──
-    vision_model: str = "gpt-4o"
-    vision_provider: str = "openai"
-    vision_api_key: str | None = None
-    vision_base_url: str | None = None
-
     # ── 非 OpenAI 兼容提供方（如智谱）──
     zhipu_api_key: str | None = None
     zhipu_base_url: str | None = None
@@ -37,7 +31,7 @@ class TestConfig:
     embedding_api_key: str | None = None
     embedding_base_url: str | None = None
 
-    # ── 感知模式: "hybrid" | "ui_tree" | "vision" ──
+    # ── 感知模式: "hybrid" | "ui_tree" ──
     perception_mode: str = "hybrid"
 
     # ── RAG ──
@@ -65,9 +59,9 @@ class TestConfig:
         _log_file = _log_dir / f"app_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         _fh = logging.FileHandler(_log_file, encoding="utf-8")
         _fh.setLevel(logging.INFO)
-        _fh.setFormatter(logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-        ))
+        _fh.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+        )
         logging.getLogger().addHandler(_fh)
         logger.info("Log file: %s", _log_file)
 
@@ -99,20 +93,6 @@ class TestConfig:
             config.api_key = config.zhipu_api_key
         if config.llm_provider.lower() == "zhipu":
             config.base_url = config.base_url or config.zhipu_base_url
-
-        # Vision
-        vision_api_key_env = os.getenv("VISION_API_KEY")
-        vision_base_url_env = os.getenv("VISION_BASE_URL")
-        if config.vision_provider.lower() == "zhipu":
-            config.vision_api_key = config.vision_api_key or config.zhipu_api_key
-            config.vision_base_url = config.vision_base_url or config.zhipu_base_url
-        else:
-            config.vision_api_key = (
-                config.vision_api_key or vision_api_key_env or config.api_key
-            )
-            config.vision_base_url = (
-                config.vision_base_url or vision_base_url_env or config.base_url
-            )
 
         config.langchain_debug = str(
             os.getenv("LANGCHAIN_DEBUG", str(config.langchain_debug))
@@ -188,45 +168,30 @@ class TestConfig:
     def _log_provider_summary(cls, config: "TestConfig") -> None:
         logger.info(
             "[llm] provider=%s model=%s base_url=%s api_key=%s",
-            config.llm_provider, config.model,
+            config.llm_provider,
+            config.model,
             config.base_url or "<default>",
             cls._mask_secret(config.api_key),
         )
-        logger.info(
-            "[vision] provider=%s model=%s base_url=%s api_key=%s",
-            config.vision_provider,
-            config.vision_model,
-            config.vision_base_url or "<default>",
-            cls._mask_secret(config.vision_api_key),
-        )
 
 
-def resolve_perception_mode(config: TestConfig) -> tuple[str, bool, Any]:
+def resolve_perception_mode(config: TestConfig) -> tuple[str, bool]:
     """根据 perception_mode 配置解析 Perceiver 参数。
 
-    Returns: (mode, auto_switch, vlm_client_or_none)
+    Returns: (mode, auto_switch)
     """
     from device.perceiver import PerceptionMode
-    from llm.clients import create_vlm_client
 
     mode = config.perception_mode.lower()
     if mode == "ui_tree":
-        return (PerceptionMode.UI_TREE, False, None)
-    elif mode == "vision":
-        vlm = create_vlm_client(
-            provider=config.vision_provider, model=config.vision_model,
-            api_key=config.vision_api_key, base_url=config.vision_base_url,
-        )
-        return (PerceptionMode.VISION, False, vlm)
-    else:  # hybrid (default)
-        vlm = create_vlm_client(
-            provider=config.vision_provider, model=config.vision_model,
-            api_key=config.vision_api_key, base_url=config.vision_base_url,
-        )
-        return (PerceptionMode.HYBRID, True, vlm)
+        return (PerceptionMode.UI_TREE, False)
+    if mode not in {"hybrid", "ui_tree"}:
+        logger.warning("Unknown perception_mode=%s, fallback to hybrid", mode)
+    return (PerceptionMode.HYBRID, True)
 
 
 # ── 单次运行日志 ──
+
 
 def start_run_log(run_id: str) -> dict:
     """为单次测试运行创建独立的 app + langchain 日志文件。
@@ -244,9 +209,9 @@ def start_run_log(run_id: str) -> dict:
     app_path = run_dir / f"{ts}_{safe_id}_app.log"
     app_fh = logging.FileHandler(app_path, encoding="utf-8")
     app_fh.setLevel(logging.INFO)
-    app_fh.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-    ))
+    app_fh.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    )
     logging.getLogger().addHandler(app_fh)
 
     # ── langchain 日志 ──

@@ -46,3 +46,8 @@ apps:
   keywords:
   - google计算器
   - ROW计算器
+- name: 图库
+  package: com.zui.gallery
+  keywords:
+  - 图库
+  - 相册

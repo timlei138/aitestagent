@@ -16,19 +16,25 @@ _LOCAL_CONFIG_PATH = "config.local.yaml"
 
 # 可通过前端修改的字段白名单
 _EDITABLE_FIELDS = (
-    "llm_provider", "model", "api_key", "base_url",
-    "vision_provider", "vision_model", "vision_api_key", "vision_base_url",
-    "embedding_provider", "embedding_model", "embedding_api_key", "embedding_base_url",
+    "llm_provider",
+    "model",
+    "api_key",
+    "base_url",
+    "embedding_provider",
+    "embedding_model",
+    "embedding_api_key",
+    "embedding_base_url",
     "perception_mode",
     "safety_level",
 )
 
-_SECRET_FIELDS = ("api_key", "vision_api_key", "embedding_api_key")
+_SECRET_FIELDS = ("api_key", "embedding_api_key")
 
 
 def _get_config():
     """延迟获取全局 config 对象，避免循环导入。"""
     from api.server import config
+
     return config
 
 
@@ -43,6 +49,7 @@ def _mask(value: str | None) -> str:
 
 
 # ── GET：读取当前配置 ──
+
 
 @router.get("")
 async def get_config():
@@ -59,15 +66,12 @@ async def get_config():
 
 # ── PUT：更新配置 ──
 
+
 class ConfigUpdateRequest(BaseModel):
     llm_provider: str | None = None
     model: str | None = None
     api_key: str | None = None
     base_url: str | None = None
-    vision_provider: str | None = None
-    vision_model: str | None = None
-    vision_api_key: str | None = None
-    vision_base_url: str | None = None
     embedding_provider: str | None = None
     embedding_model: str | None = None
     embedding_api_key: str | None = None
@@ -95,9 +99,8 @@ async def update_config(req: ConfigUpdateRequest):
             continue
         setattr(cfg, field, new_val or None)
         changed[field] = True
-        # Vision / perception_mode 变更需要重建 perceiver
-        if field in ("vision_provider", "vision_model", "vision_api_key",
-                     "vision_base_url", "perception_mode"):
+        # perception_mode 或主 LLM 凭证变更需要重建 perceiver/context
+        if field in ("perception_mode", "llm_provider", "model", "api_key", "base_url"):
             need_rebuild_perceiver = True
 
     # 写回 YAML（敏感字段写 config.local.yaml，非敏感写 config.yaml）
@@ -107,6 +110,7 @@ async def update_config(req: ConfigUpdateRequest):
     if need_rebuild_perceiver:
         try:
             from api.server import reconnect_device
+
             reconnect_device()
             logger.info("Perceiver rebuilt after config change")
         except Exception as exc:
@@ -139,7 +143,13 @@ def _save_yaml(updates: dict) -> None:
                 existing = yaml.safe_load(f) or {}
         existing.update(public_updates)
         with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(existing, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            yaml.dump(
+                existing,
+                f,
+                allow_unicode=True,
+                default_flow_style=False,
+                sort_keys=False,
+            )
         logger.info("config.yaml saved: %s", list(public_updates.keys()))
 
     # ── 敏感 → config.local.yaml ──
@@ -151,5 +161,11 @@ def _save_yaml(updates: dict) -> None:
                 local_existing = yaml.safe_load(f) or {}
         local_existing.update(local_updates)
         with open(local_path, "w", encoding="utf-8") as f:
-            yaml.dump(local_existing, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            yaml.dump(
+                local_existing,
+                f,
+                allow_unicode=True,
+                default_flow_style=False,
+                sort_keys=False,
+            )
         logger.info("config.local.yaml saved: %s", list(local_updates.keys()))

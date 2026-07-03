@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from llm.multimodal import multimodal_vision_call
 from tools.context import ToolContext
 from llm.safety import check_dangerous
 
@@ -29,6 +31,27 @@ def get_tool_context() -> ToolContext:
     if _CONTEXT is None:
         raise RuntimeError("ToolContext 未初始化")
     return _CONTEXT
+
+
+def _run_multimodal_from_context(
+    prompt: str,
+    image_base64: str,
+    purpose: str,
+    strict_json: bool = True,
+    timeout_sec: int = 12,
+) -> dict[str, Any]:
+    ctx = get_tool_context()
+    return multimodal_vision_call(
+        prompt=prompt,
+        image_base64=image_base64,
+        purpose=purpose,
+        strict_json=strict_json,
+        provider=ctx.llm_provider,
+        model=ctx.llm_model,
+        api_key=ctx.llm_api_key,
+        base_url=ctx.llm_base_url,
+        timeout_sec=timeout_sec,
+    )
 
 
 try:
@@ -126,35 +149,34 @@ def find_element(description: str) -> str:
     if ctx.perceiver is None:
         return "NOT_FOUND: perceiver unavailable"
 
-    prev_mode = getattr(ctx.perceiver, "mode", "ui_tree")
-
     # Phase 1: UI_TREE (fast, milliseconds)
     t0 = time.time()
-    try:
-        ctx.perceiver.mode = "ui_tree"
-        understanding = ctx.perceiver.perceive()
-        result = _search_elements(understanding, description)
-        if result:
-            logger.info("find_element[ui_tree] found in %.2fs: %r", time.time() - t0, description)
-            return result
-        logger.info("find_element[ui_tree] MISS in %.2fs: %r (elements=%d paths=%d)",
-                    time.time() - t0, description,
-                    len(understanding.elements) if understanding else 0,
-                    len(understanding.primary_paths) if understanding else 0)
-    finally:
-        ctx.perceiver.mode = prev_mode
-
-    # Phase 2: Vision (slow, seconds. Fallback when UI tree misses)
-    t1 = time.time()
-    try:
-        ctx.perceiver.mode = "vision"
-        understanding = ctx.perceiver.perceive()
-    finally:
-        ctx.perceiver.mode = prev_mode
+    understanding = ctx.perceiver.perceive()
     result = _search_elements(understanding, description)
-    logger.info("find_element[vision] %s in %.2fs: %r (%d candidates)",
-                "HIT" if result else "MISS", time.time() - t1, description,
-                result.count("candidate") if result else 0)
+    if result:
+        logger.info(
+            "find_element[ui_tree] found in %.2fs: %r", time.time() - t0, description
+        )
+        return result
+    logger.info(
+        "find_element[ui_tree] MISS in %.2fs: %r (elements=%d paths=%d)",
+        time.time() - t0,
+        description,
+        len(understanding.elements) if understanding else 0,
+        len(understanding.primary_paths) if understanding else 0,
+    )
+
+    # Phase 2: Vision-augmented hybrid fallback (slow, seconds)
+    t1 = time.time()
+    understanding = ctx.perceiver.perceive(force_vision=True)
+    result = _search_elements(understanding, description)
+    logger.info(
+        "find_element[vision] %s in %.2fs: %r (%d candidates)",
+        "HIT" if result else "MISS",
+        time.time() - t1,
+        description,
+        result.count("candidate") if result else 0,
+    )
     return result
 
 
@@ -216,15 +238,20 @@ def _score_element(el: Any, words: list[str]) -> int:
             continue
         matched = False
         if w in label:
-            score += 3; matched = True
+            score += 3
+            matched = True
         if w in assoc:
-            score += 2; matched = True
+            score += 2
+            matched = True
         if w in rid:
-            score += 3; matched = True
+            score += 3
+            matched = True
         if w in cls:
-            score += 1; matched = True
+            score += 1
+            matched = True
         if w in ctx_path:
-            score += 1; matched = True
+            score += 1
+            matched = True
         # 精确匹配失败 + 含 CJK → 登记为候选 fallback
         if not matched and _has_cjk(w):
             cjk_fallback.append((w, 0))  # weight 稍后统一处理
@@ -237,7 +264,13 @@ def _score_element(el: Any, words: list[str]) -> int:
     # ── CJK 字符重叠 fallback ──
     if score == 0 and cjk_fallback:
         for w, _ in cjk_fallback:
-            for field_text, weight in [(label, 3), (rid, 3), (assoc, 2), (cls, 1), (ctx_path, 1)]:
+            for field_text, weight in [
+                (label, 3),
+                (rid, 3),
+                (assoc, 2),
+                (cls, 1),
+                (ctx_path, 1),
+            ]:
                 if not field_text or not _has_cjk(field_text):
                     continue
                 overlap = _cjk_char_overlap(w, field_text)
@@ -284,8 +317,12 @@ def _search_elements(understanding: Any, description: str) -> str:
         words = raw_words
     expanded_words = _expand_zh_keywords(words)
 
-    logger.debug("_search_elements: desc=%r words=%s total_elements=%d",
-                 description, expanded_words, len(all_elements))
+    logger.debug(
+        "_search_elements: desc=%r words=%s total_elements=%d",
+        description,
+        expanded_words,
+        len(all_elements),
+    )
 
     candidates: list[tuple[int, int, Any]] = []
     for el in all_elements:
@@ -297,12 +334,24 @@ def _search_elements(understanding: Any, description: str) -> str:
         candidates.append((score, role_pri, el))
 
     if not candidates:
-        logger.info("_search_elements: NO candidates for %r (searched %d elements, words=%s)",
-                    description, len(all_elements), expanded_words)
+        logger.info(
+            "_search_elements: NO candidates for %r (searched %d elements, words=%s)",
+            description,
+            len(all_elements),
+            expanded_words,
+        )
         return ""
 
     # 排序：得分 desc → label 长度 asc(短优先=更精确) → role 优先级 asc → 位置
-    candidates.sort(key=lambda x: (-x[0], len(x[2].label or ""), x[1], x[2].bounds[1], x[2].bounds[0]))
+    candidates.sort(
+        key=lambda x: (
+            -x[0],
+            len(x[2].label or ""),
+            x[1],
+            x[2].bounds[1],
+            x[2].bounds[0],
+        )
+    )
 
     lines = [f"{len(candidates)} candidate(s) for '{description}':"]
     for score, role_pri, el in candidates[:10]:
@@ -333,7 +382,8 @@ def _has_cjk(text: str) -> bool:
 
 
 def _disambiguate_container(
-    best_el: Any, all_elements: list[Any],
+    best_el: Any,
+    all_elements: list[Any],
 ) -> Any | None:
     """当最佳匹配是大型容器（list_entry/container）且存在同 label 的 navigation_item
     子元素时，返回子元素替代容器。解决 taskbar_view 等容器遮盖子控件的问题。"""
@@ -366,7 +416,11 @@ def _disambiguate_container(
         if el_area > 0 and el_area < best_area * 0.5:
             logger.info(
                 "_disambiguate: role=%s label=%r → role=%s (area %d→%d)",
-                best_role, best_label, el_role, best_area, el_area,
+                best_role,
+                best_label,
+                el_role,
+                best_area,
+                el_area,
             )
             return el
     return None
@@ -402,8 +456,11 @@ def _find_best_element_with_known(
             if rid:
                 for el in all_elements:
                     if getattr(el, "resource_id", "") == rid and el.clickable:
-                        logger.info("Experience hit: rid=%s (click_count=%d)",
-                                    rid, known["click_count"])
+                        logger.info(
+                            "Experience hit: rid=%s (click_count=%d)",
+                            rid,
+                            known["click_count"],
+                        )
                         return el, known_ids
 
     # ── 正常路径: 语义搜索 + 历史身份加分 ──
@@ -430,7 +487,9 @@ def _find_best_element_with_known(
         role_pri = _ROLE_PRIORITY.get(getattr(el, "role", ""), 50)
         # 短 label 优先（更接近精确匹配），其次 role 优先级
         cur_key = (score, -len(el.label or ""), -role_pri)
-        best_key = (best[0], -len(best[2].label or ""), -best[1]) if best else (-1, 0, 0)
+        best_key = (
+            (best[0], -len(best[2].label or ""), -best[1]) if best else (-1, 0, 0)
+        )
         if best is None or cur_key > best_key:
             best = (score, role_pri, el)
 
@@ -440,12 +499,21 @@ def _find_best_element_with_known(
         if child is not None:
             best = (best[0], best[1], child)
             best_el = child
-        logger.info("_find_best: desc=%r best_score=%d role=%s label=%r (scanned %d clickable)",
-                    description, best[0], getattr(best_el, "role", ""),
-                    getattr(best_el, "label", ""), scanned)
+        logger.info(
+            "_find_best: desc=%r best_score=%d role=%s label=%r (scanned %d clickable)",
+            description,
+            best[0],
+            getattr(best_el, "role", ""),
+            getattr(best_el, "label", ""),
+            scanned,
+        )
     else:
-        logger.info("_find_best: desc=%r NO match (scanned %d clickable, words=%s)",
-                    description, scanned, expanded_words)
+        logger.info(
+            "_find_best: desc=%r NO match (scanned %d clickable, words=%s)",
+            description,
+            scanned,
+            expanded_words,
+        )
     return (best[2] if best else None), known_ids
 
 
@@ -471,14 +539,18 @@ def _query_known_identities(description: str) -> list[dict[str, Any]]:
         if db is None:
             from data import create_relational_db
             from config import TestConfig
+
             cfg = TestConfig()
             db = create_relational_db(cfg)
         package = ctx.device.current_app().get("package", "")
         # 使用缓存的屏幕尺寸（设备分辨率运行期间不变）
         screen_w, screen_h = ctx.screen_size
-        return db.query_element_identity(
-            package, description, target_screen=(screen_w, screen_h)
-        ) or []
+        return (
+            db.query_element_identity(
+                package, description, target_screen=(screen_w, screen_h)
+            )
+            or []
+        )
     except Exception:
         return []
 
@@ -509,7 +581,9 @@ def _score_known_identity(el: Any, known_ids: list[dict[str, Any]]) -> int:
 # ═══════════════════════════════════════════
 
 _session_click_ids: set[str] = set()  # 同一次执行中已记录的 alias，用于 session 去重
-_page_transition_seen: set[str] = set()  # 同一次执行中已记录的 (page, action, to_page)，避免重复写入
+_page_transition_seen: set[str] = (
+    set()
+)  # 同一次执行中已记录的 (page, action, to_page)，避免重复写入
 
 
 def reset_session_click_ids() -> None:
@@ -526,9 +600,15 @@ def _compute_page_signature(understanding: Any) -> str:
     """
     act = (understanding.activity or "").split(".")[-1] or "Unknown"
     clickable = [e for e in understanding.elements if e.clickable]
-    stable = [e for e in clickable
-              if e.label and len(e.label) > 1 and len(e.label) < 10
-              and not e.label.isdigit() and not e.label.startswith("--")]
+    stable = [
+        e
+        for e in clickable
+        if e.label
+        and len(e.label) > 1
+        and len(e.label) < 10
+        and not e.label.isdigit()
+        and not e.label.startswith("--")
+    ]
     # 按 label 排序，取前 5 个最稳定的
     stable.sort(key=lambda e: len(e.label or ""))
     fingerprint = [e.label for e in stable[:5]]
@@ -551,17 +631,26 @@ def _query_known_by_rid(resource_id: str) -> list[dict[str, Any]]:
         if db is None:
             from data import create_relational_db
             from config import TestConfig
+
             db = create_relational_db(TestConfig())
         package = ctx.device.current_app().get("package", "")
-        rows = db.select("element_identities", {
-            "app_package": package, "resource_id": resource_id,
-        }, order_by="click_count DESC", limit=3)
+        rows = db.select(
+            "element_identities",
+            {
+                "app_package": package,
+                "resource_id": resource_id,
+            },
+            order_by="click_count DESC",
+            limit=3,
+        )
         return [dict(r) for r in rows]
     except Exception:
         return []
 
 
-def _save_click_identity(ctx: Any, label: str, best_el: Any, understanding: Any) -> None:
+def _save_click_identity(
+    ctx: Any, label: str, best_el: Any, understanding: Any
+) -> None:
     """click 成功后自动保存元素身份到 SQLite。
 
     session 去重: 同一次执行中同一个 alias 的 click_count 只 +1。
@@ -583,8 +672,9 @@ def _save_click_identity(ctx: Any, label: str, best_el: Any, understanding: Any)
         bounds = getattr(best_el, "bounds", (0, 0, 0, 0))
         bounds_json = ""
         if bounds and bounds != (0, 0, 0, 0):
-            bounds_json = json.dumps({"x1": bounds[0], "y1": bounds[1],
-                                       "x2": bounds[2], "y2": bounds[3]})
+            bounds_json = json.dumps(
+                {"x1": bounds[0], "y1": bounds[1], "x2": bounds[2], "y2": bounds[3]}
+            )
         screen_w, screen_h = ctx.screen_size
         db.save_element_identity(
             app_package=ctx.device.current_app().get("package", ""),
@@ -599,8 +689,9 @@ def _save_click_identity(ctx: Any, label: str, best_el: Any, understanding: Any)
             screen_width=screen_w,
             screen_height=screen_h,
         )
-        logger.info("Saved identity: alias=%r rid=%s page_sig=%s",
-                    label, resource_id, page_sig)
+        logger.info(
+            "Saved identity: alias=%r rid=%s page_sig=%s", label, resource_id, page_sig
+        )
     except Exception as exc:
         logger.debug("_save_click_identity failed: %s", exc)
 
@@ -613,8 +704,9 @@ def query_app_knowledge(query: str, app_package: str = "") -> str:
         return "未启用知识库"
     package = app_package or ctx.device.current_app().get("package", "")
 
-    exp_results = ctx.knowledge_base.query(query, app_package=package,
-                                           knowledge_type="experience", top_k=5)
+    exp_results = ctx.knowledge_base.query(
+        query, app_package=package, knowledge_type="experience", top_k=5
+    )
     rule_text = ctx.knowledge_base.query_curated_rules(package, top_k=3)
 
     parts = []
@@ -642,12 +734,14 @@ def query_element_identity(alias: str, app_package: str = "") -> str:
     db = None
     try:
         from agents.graph import _relational_db as _gdb
+
         db = _gdb
     except ImportError:
         pass
     if db is None:
         from data import create_relational_db
         from config import TestConfig
+
         db = create_relational_db(TestConfig())
 
     try:
@@ -703,21 +797,32 @@ def click(label: str, alternatives: str = "") -> str:
         try:
             understanding = ctx.perceiver.perceive()
             # 更新 _pre_title 为更精确的页面标识
-            act = understanding.activity.split(".")[-1] if understanding.activity else "?"
-            _pre_title = act + "「" + (understanding.page_title or "") + "」" if understanding.page_title else act
+            act = (
+                understanding.activity.split(".")[-1] if understanding.activity else "?"
+            )
+            _pre_title = (
+                act + "「" + (understanding.page_title or "") + "」"
+                if understanding.page_title
+                else act
+            )
         except Exception as exc:
             logger.warning("click: perceive failed | %s", exc)
             understanding = None
 
         for target in search_targets:
             try:
-                best_el, known_ids = _find_best_element_with_known(understanding, target)
+                best_el, known_ids = _find_best_element_with_known(
+                    understanding, target
+                )
                 if best_el is not None:
                     matched_label = target
-                    logger.info("click: hit target=%r (primary=%r) role=%s label=%r",
-                                target, label,
-                                getattr(best_el, "role", ""),
-                                getattr(best_el, "label", ""))
+                    logger.info(
+                        "click: hit target=%r (primary=%r) role=%s label=%r",
+                        target,
+                        label,
+                        getattr(best_el, "role", ""),
+                        getattr(best_el, "label", ""),
+                    )
                     break
                 logger.info("click: miss target=%r (alt for %r)", target, label)
             except Exception as exc:
@@ -739,7 +844,10 @@ def click(label: str, alternatives: str = "") -> str:
             new_checked = _check_switch_state(ctx, best_el)
             if new_checked is not None:
                 state_cn = "开启" if new_checked else "关闭"
-                result = _format_click_log(matched_label, best_el, strategy="bounds") + f" | 开关状态: {state_cn}"
+                result = (
+                    _format_click_log(matched_label, best_el, strategy="bounds")
+                    + f" | 开关状态: {state_cn}"
+                )
             else:
                 result = _format_click_log(matched_label, best_el, strategy="bounds")
             _record_page_transition(ctx, _pre_page, label)
@@ -747,14 +855,20 @@ def click(label: str, alternatives: str = "") -> str:
         # 其他可点击元素 — resource_id > text > bounds（rid 唯一稳定，优先）
         if best_el.resource_id and ctx.device.click_resource_id(best_el.resource_id):
             _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(_format_click_log(matched_label, best_el, strategy="resource_id"))
+            return _with_snapshot(
+                _format_click_log(matched_label, best_el, strategy="resource_id")
+            )
         if best_el.text and ctx.device.click_text(best_el.text):
             _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(_format_click_log(matched_label, best_el, strategy="text"))
+            return _with_snapshot(
+                _format_click_log(matched_label, best_el, strategy="text")
+            )
         if best_el.bounds != (0, 0, 0, 0):
             ctx.device.click_bounds(best_el.bounds)
             _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(_format_click_log(matched_label, best_el, strategy="bounds"))
+            return _with_snapshot(
+                _format_click_log(matched_label, best_el, strategy="bounds")
+            )
 
     # 兆底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):
@@ -769,7 +883,9 @@ def click(label: str, alternatives: str = "") -> str:
         if rid and ctx.device.click_resource_id(rid):
             _save_click_identity(ctx, label, None, understanding)
             _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)")
+            return _with_snapshot(
+                f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)"
+            )
     # 百分比 bounds 兜底
     for known in known_ids:
         converted = known.get("bounds_converted")
@@ -777,11 +893,21 @@ def click(label: str, alternatives: str = "") -> str:
         if confidence == "low":
             continue
         if converted and all(k in converted for k in ("x1", "y1", "x2", "y2")):
-            bounds = (converted["x1"], converted["y1"], converted["x2"], converted["y2"])
+            bounds = (
+                converted["x1"],
+                converted["y1"],
+                converted["x2"],
+                converted["y2"],
+            )
             screen_w, screen_h = ctx.screen_size
-            if (screen_w > 0 and screen_h > 0
-                    and 0 <= bounds[0] < screen_w and 0 <= bounds[1] < screen_h
-                    and bounds[2] <= screen_w and bounds[3] <= screen_h):
+            if (
+                screen_w > 0
+                and screen_h > 0
+                and 0 <= bounds[0] < screen_w
+                and 0 <= bounds[1] < screen_h
+                and bounds[2] <= screen_w
+                and bounds[3] <= screen_h
+            ):
                 ctx.device.click_bounds(bounds)
                 _save_click_identity(ctx, label, None, understanding)
                 _clicked = True
@@ -789,7 +915,8 @@ def click(label: str, alternatives: str = "") -> str:
                 return _with_snapshot(
                     f"已点击历史坐标: {label} "
                     f"bounds=({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) "
-                    f"(strategy=pct-bounds-fallback)")
+                    f"(strategy=pct-bounds-fallback)"
+                )
     if ctx.device.click_resource_id(label):
         _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(ctx, _pre_page, label)
@@ -825,7 +952,8 @@ def _format_click_log(query: str, el: Any, strategy: str) -> str:
     q = query.strip().lower()
     # 检测模糊匹配：搜索词 != 实际标签，或者嵌在长标签里 (如 "时区" 嵌在 "自动确定时区")
     mismatch = (
-        el_label and q != el_label.lower()
+        el_label
+        and q != el_label.lower()
         and (q not in el_label or len(q) < len(el_label) * 0.5)
     )
     prefix = "已点击(WARNING: 模糊匹配): " if mismatch else "已点击: "
@@ -880,11 +1008,15 @@ def _post_click_snapshot(ctx: Any, pre_title: str, label: str) -> str:
             lines.append(f"页面变化: {pre_title} → {post_title}")
         # 收集可点击元素 + 含数字的叶子节点（计算器显示、设置值等）
         clickables = [e for e in u.elements if e.clickable and e.label]
-        text_leaves = [e for e in u.elements
-                       if not e.clickable and e.text
-                       and any(c.isdigit() for c in (e.text or ""))
-                       and e.role not in ("container", "text")
-                       and len(e.text or "") < 20]
+        text_leaves = [
+            e
+            for e in u.elements
+            if not e.clickable
+            and e.text
+            and any(c.isdigit() for c in (e.text or ""))
+            and e.role not in ("container", "text")
+            and len(e.text or "") < 20
+        ]
         nearby = (clickables + text_leaves)[:15]
         value_hints = []
         for e in nearby:
@@ -925,7 +1057,9 @@ def _record_page_transition(ctx: Any, pre_page: str, label: str) -> None:
                     to_page=post_page,
                     outcome="成功",
                 )
-                logger.info("KB page transition: %s → %s (click %r)", pre_page, post_page, label)
+                logger.info(
+                    "KB page transition: %s → %s (click %r)", pre_page, post_page, label
+                )
     except Exception as exc:
         logger.debug("Page transition recording skipped: %s", exc)
 
@@ -958,19 +1092,41 @@ def scroll_find_and_click(label: str, max_swipes: int = 3, panel: str = "") -> s
                 if best_el is not None:
                     _save_click_identity(ctx, label, best_el, understanding)
                     if best_el.text and ctx.device.click_text(best_el.text):
-                        logger.info("scroll_find[%d]: semantic hit label=%r text=%r",
-                                    attempt, label, best_el.text)
-                        return _format_click_log(label, best_el, strategy="scroll-semantic-text")
-                    if best_el.resource_id and ctx.device.click_resource_id(best_el.resource_id):
-                        logger.info("scroll_find[%d]: semantic hit label=%r rid=%r",
-                                    attempt, label, best_el.resource_id)
-                        return _format_click_log(label, best_el, strategy="scroll-semantic-rid")
+                        logger.info(
+                            "scroll_find[%d]: semantic hit label=%r text=%r",
+                            attempt,
+                            label,
+                            best_el.text,
+                        )
+                        return _format_click_log(
+                            label, best_el, strategy="scroll-semantic-text"
+                        )
+                    if best_el.resource_id and ctx.device.click_resource_id(
+                        best_el.resource_id
+                    ):
+                        logger.info(
+                            "scroll_find[%d]: semantic hit label=%r rid=%r",
+                            attempt,
+                            label,
+                            best_el.resource_id,
+                        )
+                        return _format_click_log(
+                            label, best_el, strategy="scroll-semantic-rid"
+                        )
                     ctx.device.click_bounds(best_el.bounds)
-                    logger.info("scroll_find[%d]: semantic hit label=%r bounds=%s",
-                                attempt, label, best_el.bounds)
-                    return _format_click_log(label, best_el, strategy="scroll-semantic-bounds")
+                    logger.info(
+                        "scroll_find[%d]: semantic hit label=%r bounds=%s",
+                        attempt,
+                        label,
+                        best_el.bounds,
+                    )
+                    return _format_click_log(
+                        label, best_el, strategy="scroll-semantic-bounds"
+                    )
                 # 检测元素是否无变化（已到末尾）
-                cur_labels = {e.label for e in understanding.elements if e.label and e.clickable}
+                cur_labels = {
+                    e.label for e in understanding.elements if e.label and e.clickable
+                }
                 if attempt > 0 and cur_labels == pre_labels:
                     return f"滑动后仍未找到: {label}（已到末尾，无新元素出现）"
                 pre_labels = cur_labels
@@ -991,7 +1147,9 @@ def scroll_find_and_click(label: str, max_swipes: int = 3, panel: str = "") -> s
             else:
                 ctx.device.swipe("up")
 
-    logger.warning("scroll_find: exhausted %d swipes, NOT found label=%r", max_swipes, label)
+    logger.warning(
+        "scroll_find: exhausted %d swipes, NOT found label=%r", max_swipes, label
+    )
     return f"滑动后仍未找到: {label}"
 
 
@@ -1016,7 +1174,12 @@ def long_press(label: str, duration: float = 0.8) -> str:
         for el in understanding.elements:
             el_label = (el.label or "").lower()
             el_rid = (el.resource_id or "").lower()
-            if (label_lower in el_label or label_lower in el_rid) and el.bounds != (0, 0, 0, 0):
+            if (label_lower in el_label or label_lower in el_rid) and el.bounds != (
+                0,
+                0,
+                0,
+                0,
+            ):
                 ctx.device.long_click_bounds(el.bounds, duration)
                 _save_click_identity(ctx, label, el, understanding)
                 msg = _format_click_log(label, el, strategy="long_press_nonclickable")
@@ -1049,7 +1212,7 @@ def paste() -> str:
     strategy = ctx.device.paste()
     msg = f"已粘贴 (strategy={strategy})"
     if strategy == "paste_ctrl_v":
-        msg += " | 请用 get_screen_info 确认内容已出现在输入框，如未出现则手动 long_press 输入框后 click(\"粘贴\")"
+        msg += ' | 请用 get_screen_info 确认内容已出现在输入框，如未出现则手动 long_press 输入框后 click("粘贴")'
     return msg
 
 
@@ -1227,7 +1390,105 @@ def launch_app(
         ctx.device.app_start(package)
     # 记录页面跳转
     _record_page_transition(ctx, _pre_page, f"launch_app({package})")
-    return f"已启动: {package}/{target_activity}" if target_activity else f"已启动: {package}"
+    return (
+        f"已启动: {package}/{target_activity}"
+        if target_activity
+        else f"已启动: {package}"
+    )
+
+
+@tool
+def visual_check(description: str) -> str:
+    """基于截图进行视觉判断，返回结构化 JSON：decision/reason/evidence/confidence。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return json.dumps(
+            {
+                "decision": "unknown",
+                "reason": "未连接设备",
+                "evidence": "",
+                "confidence": "low",
+            },
+            ensure_ascii=False,
+        )
+    snap = ctx.device.snapshot()
+    prompt = (
+        "请根据截图判断描述是否成立，并只返回 JSON。"
+        "字段: decision(yes/no/unknown), reason, evidence, confidence(high/medium/low)。"
+        f"描述: {description}"
+    )
+    result = _run_multimodal_from_context(
+        prompt=prompt,
+        image_base64=snap.image_base64,
+        purpose="visual_check",
+        strict_json=True,
+        timeout_sec=12,
+    )
+    payload = {
+        "decision": (
+            result.get("decision", "unknown") if result.get("ok") else "unknown"
+        ),
+        "reason": result.get("reason", "vision unavailable"),
+        "evidence": result.get("evidence", ""),
+        "confidence": "medium" if result.get("ok") else "low",
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+@tool
+def detect_overlay() -> str:
+    """检测截图中的弹窗/Toast/浮层遮挡，返回结构化 JSON。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return json.dumps(
+            {
+                "has_overlay": False,
+                "overlay_type": "none",
+                "reason": "未连接设备",
+                "evidence": "",
+                "blocking": False,
+            },
+            ensure_ascii=False,
+        )
+    snap = ctx.device.snapshot()
+    prompt = (
+        "请分析截图是否存在遮挡层（toast/dialog/popup/sheet）。"
+        "只返回 JSON，字段: has_overlay(boolean), overlay_type(toast/dialog/popup/sheet/unknown/none),"
+        " reason, evidence, blocking(boolean)。"
+    )
+    result = _run_multimodal_from_context(
+        prompt=prompt,
+        image_base64=snap.image_base64,
+        purpose="detect_overlay",
+        strict_json=True,
+        timeout_sec=12,
+    )
+    # _mk_result 在 strict_json 成功解析时已将完整 dict 放入 data 字段
+    raw_data = result.get("data") or {}
+    if not isinstance(raw_data, dict):
+        raw_data = {}
+    has_overlay = False
+    if result.get("ok"):
+        raw_has_overlay = raw_data.get("has_overlay")
+        if isinstance(raw_has_overlay, bool):
+            has_overlay = raw_has_overlay
+        else:
+            # JSON 非标准或解析缺字段时，回退到 decision 语义
+            has_overlay = str(result.get("decision", "unknown")).lower() == "yes"
+    overlay_type = raw_data.get("overlay_type")
+    if not isinstance(overlay_type, str) or not overlay_type:
+        overlay_type = "unknown" if has_overlay else "none"
+    blocking = raw_data.get("blocking")
+    if not isinstance(blocking, bool):
+        blocking = has_overlay
+    payload = {
+        "has_overlay": has_overlay,
+        "overlay_type": overlay_type,
+        "reason": result.get("reason", "vision unavailable"),
+        "evidence": result.get("evidence", ""),
+        "blocking": blocking,
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @tool
@@ -1290,15 +1551,13 @@ def wait_seconds(seconds: float = 1.0) -> str:
 
 @tool
 def switch_perception_mode(mode: str) -> str:
-    """切换感知模式：ui_tree / vision / hybrid。"""
+    """切换感知模式：ui_tree / hybrid。"""
     from device.perceiver import PerceptionMode
 
     ctx = get_tool_context()
-    if mode not in {
-        PerceptionMode.UI_TREE,
-        PerceptionMode.VISION,
-        PerceptionMode.HYBRID,
-    }:
+    if ctx.perceiver is None:
+        return "不支持切换感知模式: perceiver unavailable"
+    if mode not in {PerceptionMode.UI_TREE, PerceptionMode.HYBRID}:
         return f"不支持的感知模式: {mode}"
     ctx.perceiver.mode = mode
     return f"已切换感知模式: {mode}"
@@ -1470,10 +1729,10 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
     截图策略：passed 复用 perceive() 缓存截图（零额外截图），failed 实时截图保存证据。"""
     ctx = get_tool_context()
     if ctx:
-        if not hasattr(ctx, '_verifications'):
+        if not hasattr(ctx, "_verifications"):
             ctx._verifications = []
         normalized = result if result in ("passed", "failed") else "unknown"
-        shot_path = getattr(ctx, '_last_screenshot_path', '') or ''
+        shot_path = getattr(ctx, "_last_screenshot_path", "") or ""
 
         # failed 或 缓存为空时实时截图
         if (normalized == "failed" or not shot_path) and ctx.device:
@@ -1482,19 +1741,49 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
                 safe_cond = re.sub(r"[^\w一-鿿-]", "_", condition[:30])
                 new_path = os.path.join(
                     "storage/screenshots",
-                    f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_cond}.png"
+                    f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{safe_cond}.png",
                 )
                 ctx.device.screenshot().save(new_path)
                 shot_path = new_path
             except Exception:
                 pass
 
-        ctx._verifications.append({
-            "item": condition,
-            "result": normalized,
-            "detail": detail,
-            "screenshot": shot_path,
-        })
+        # failed 时追加视觉分析（短超时，不阻塞主流程）
+        if (
+            normalized == "failed"
+            and ctx.verification_auto_vision
+            and shot_path
+            and os.path.exists(shot_path)
+        ):
+            try:
+                with open(shot_path, "rb") as fh:
+                    image_b64 = base64.b64encode(fh.read()).decode("utf-8")
+                prompt = (
+                    "请分析该失败截图，说明此验证项失败的可能原因。"
+                    "只返回 JSON，字段: decision(yes/no/unknown), reason, evidence。"
+                    f"验证项: {condition}"
+                )
+                vres = _run_multimodal_from_context(
+                    prompt=prompt,
+                    image_base64=image_b64,
+                    purpose="verification_fail_analyze",
+                    strict_json=True,
+                    timeout_sec=10,
+                )
+                if vres.get("ok"):
+                    vis = f"vision={vres.get('decision', 'unknown')}: {vres.get('reason', '')}"
+                    detail = f"{detail} | {vis}" if detail else vis
+            except Exception:
+                pass
+
+        ctx._verifications.append(
+            {
+                "item": condition,
+                "result": normalized,
+                "detail": detail,
+                "screenshot": shot_path,
+            }
+        )
     return f"记录完成: {condition} → {result}"
 
 
@@ -1537,17 +1826,40 @@ PLANNER_TOOLS: list[Any] = [
 ]
 
 AGENT_TOOLS: list[Any] = [
-    get_screen_info, query_app_knowledge, query_element_identity,
-    click, navigate_to, scroll_find_and_click, long_press, copy, scroll_panel,
-    type_input, press_key, paste, swipe, open_notification, open_quick_settings,
-    unlock_screen, set_orientation, toggle_auto_rotate, check_desktop_mode,
+    get_screen_info,
+    query_app_knowledge,
+    query_element_identity,
+    click,
+    navigate_to,
+    scroll_find_and_click,
+    long_press,
+    copy,
+    scroll_panel,
+    type_input,
+    press_key,
+    paste,
+    swipe,
+    open_notification,
+    open_quick_settings,
+    unlock_screen,
+    set_orientation,
+    toggle_auto_rotate,
+    check_desktop_mode,
     launch_app,
-    detect_popup, dismiss_popup, wait_seconds,
-    check_page_health, recover_from_anomaly,
-    assert_page_contains, assert_element_exists, assert_verification,
+    visual_check,
+    detect_overlay,
+    detect_popup,
+    dismiss_popup,
+    wait_seconds,
+    check_page_health,
+    recover_from_anomaly,
+    assert_page_contains,
+    assert_element_exists,
+    assert_verification,
 ]
 
 # ── 内部辅助 ──
+
 
 def _try_click_by_associated_label(ctx: ToolContext, label: str) -> str | None:
     """通过 find_element 查找与 label 匹配的元素，再用 bounds 进行坐标点击。

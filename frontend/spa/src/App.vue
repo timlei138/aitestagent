@@ -188,28 +188,6 @@
               </el-form>
             </div>
 
-            <!-- Vision 模型 -->
-            <div class="settings-group">
-              <h4 class="settings-group-title">Vision 模型（截图分析）</h4>
-              <el-form label-width="110px" size="default">
-                <el-form-item label="Provider">
-                  <el-select v-model="configData.vision_provider" style="width:100%">
-                    <el-option label="OpenAI (兼容)" value="openai" />
-                    <el-option label="智谱 Zhipu" value="zhipu" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="模型名称">
-                  <el-input v-model="configData.vision_model" placeholder="如: glm-4.6v-flash" />
-                </el-form-item>
-                <el-form-item label="API Key">
-                  <el-input v-model="configData.vision_api_key" type="password" show-password placeholder="Vision API Key" />
-                </el-form-item>
-                <el-form-item label="Base URL">
-                  <el-input v-model="configData.vision_base_url" placeholder="留空则复用 LLM Base URL" />
-                </el-form-item>
-              </el-form>
-            </div>
-
             <!-- Embedding -->
             <div class="settings-group">
               <h4 class="settings-group-title">Embedding（RAG 向量化）</h4>
@@ -233,7 +211,6 @@
                 <el-form-item label="感知模式">
                   <el-select v-model="configData.perception_mode" style="width:100%">
                     <el-option label="UI Tree（最快）" value="ui_tree" />
-                    <el-option label="Vision（截图分析）" value="vision" />
                     <el-option label="Hybrid（自动切换）" value="hybrid" />
                   </el-select>
                 </el-form-item>

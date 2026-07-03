@@ -9,14 +9,11 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
-from typing import Any
-
-from llm.clients import VLMClient
+from typing import Any, Callable
 
 
 class PerceptionMode:
     UI_TREE = "ui_tree"
-    VISION = "vision"
     HYBRID = "hybrid"
 
 
@@ -37,7 +34,7 @@ class UIElement:
     priority: int = 100
     safe_to_click: bool = True
     associated_label: str = ""  # 关联文本标签（来自兄弟 TextView 或 Vision 语义标注）
-    context_path: str = ""      # 上下文路径，例如 'right_content > WLAN > toggle_switch'
+    context_path: str = ""  # 上下文路径，例如 'right_content > WLAN > toggle_switch'
     is_container: bool = False  # 是否为结构性容器（LinearLayout/ViewGroup 等）
     has_switch_child: bool = False  # 是否包裹 Switch 类子控件（合并标记）
 
@@ -86,18 +83,18 @@ class PageUnderstanding:
 
 
 class SmartPerceiver:
-    """UI 树 + 可选 Vision 的页面语义理解器，UI树卡住时自动切换到 Vision。"""
+    """UI 树 + 按需视觉补充的页面语义理解器。"""
 
     def __init__(
         self,
         device,
-        llm_client: VLMClient | None = None,
+        vision_call: Callable[[str, str, str, bool], dict[str, Any]] | None = None,
         mode: str = PerceptionMode.HYBRID,
         auto_switch: bool = True,
         stuck_threshold: int = 2,
     ):
         self.device = device
-        self.vlm = llm_client
+        self._vision_call = vision_call
         self.mode = mode
         self.auto_switch = auto_switch
         self.stuck_threshold = stuck_threshold
@@ -110,16 +107,20 @@ class SmartPerceiver:
         self._cache_sig: str = ""
         self._cache_ts: float = 0.0
         self._cache_result: PageUnderstanding | None = None
-        # VLM 专用缓存：截图不变时不重复调用 VLM（VLM 耗时 10-40s）
+        # 视觉补充缓存：截图不变时不重复调用
         self._vision_cache_img_hash: str = ""
         self._vision_cache_text: str = ""
 
-    def perceive(self) -> PageUnderstanding:
+    def perceive(self, force_vision: bool = False) -> PageUnderstanding:
         # 短时缓存：相同页面+相同mode + 3秒内直接返回
         xml = self.device.dump_hierarchy()
         sig = hashlib.md5(f"{xml}|{self.mode}".encode()).hexdigest()
         now = time.monotonic()
-        if sig == self._cache_sig and (now - self._cache_ts) < 5.0 and self._cache_result is not None:
+        if (
+            sig == self._cache_sig
+            and (now - self._cache_ts) < 5.0
+            and self._cache_result is not None
+        ):
             self.logger.debug("Perceive cache hit sig=%s", sig[:8])
             return self._cache_result
         elements = self.parse_elements(xml)
@@ -130,13 +131,15 @@ class SmartPerceiver:
             if snapshot.image_base64:
                 os.makedirs("storage/screenshots", exist_ok=True)
                 from datetime import datetime as _dt
+
                 _shot_path = os.path.join(
                     "storage/screenshots",
-                    f"perceive_{_dt.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+                    f"perceive_{_dt.now().strftime('%Y%m%d_%H%M%S_%f')}.png",
                 )
                 with open(_shot_path, "wb") as _f:
                     _f.write(base64.b64decode(snapshot.image_base64))
                 from tools import get_tool_context as _gtc
+
                 _ctx = _gtc()
                 if _ctx is not None:
                     _ctx._last_screenshot_path = _shot_path
@@ -150,13 +153,31 @@ class SmartPerceiver:
             width=snapshot.width,
             height=snapshot.height,
         )
-        if self.mode in {PerceptionMode.VISION, PerceptionMode.HYBRID} and self.vlm:
-            # VLM 缓存：截图不变时复用上次 VLM 结果（图像 hash）
+        should_use_vision = (
+            self.mode == PerceptionMode.HYBRID
+            and (force_vision or self._stuck_count >= self.stuck_threshold)
+            and self._vision_call is not None
+        )
+        if should_use_vision:
+            indexed_elements = understanding.primary_paths[:20]
+            # 视觉缓存：截图不变时复用上次视觉结果（图像 hash）
             import hashlib as _hashlib
-            img_hash = _hashlib.md5(snapshot.image_base64.encode()).hexdigest() if snapshot.image_base64 else ""
-            if img_hash and img_hash == self._vision_cache_img_hash and self._vision_cache_text:
-                self.logger.info("VLM cache hit (img sig=%s)", img_hash[:8])
+
+            img_hash = (
+                _hashlib.md5(snapshot.image_base64.encode()).hexdigest()
+                if snapshot.image_base64
+                else ""
+            )
+            if (
+                img_hash
+                and img_hash == self._vision_cache_img_hash
+                and self._vision_cache_text
+            ):
+                self.logger.info("Vision cache hit (img sig=%s)", img_hash[:8])
                 understanding.raw_vision = self._vision_cache_text
+                self._apply_vision_annotations(
+                    indexed_elements, self._vision_cache_text
+                )
             else:
                 self._vision_calls += 1
                 understanding.raw_vision = self._vision_describe(
@@ -165,8 +186,8 @@ class SmartPerceiver:
                 self._vision_cache_img_hash = img_hash
                 self._vision_cache_text = understanding.raw_vision
 
-        # 检测是否卡在相同页面，自动切换模式
-        if self.auto_switch and self.mode != PerceptionMode.VISION:
+        # 检测是否卡在相同页面，供 hybrid 模式按需触发视觉补充
+        if self.auto_switch:
             self._update_stuck(understanding.summary)
         # 存入缓存
         self._cache_sig = sig
@@ -237,22 +258,24 @@ class SmartPerceiver:
 
             should_keep = False
             if text or desc or rid:
-                should_keep = True            # 规则 1：有名控件
+                should_keep = True  # 规则 1：有名控件
             elif clickable:
-                should_keep = True            # 规则 2：可点击容器
+                should_keep = True  # 规则 2：可点击容器
             elif is_switch_like:
-                should_keep = True            # 规则 3：开关类控件
+                should_keep = True  # 规则 3：开关类控件
             elif is_structural:
-                should_keep = True            # 规则 4：结构容器（用户选 A，全保留）
+                should_keep = True  # 规则 4：结构容器（用户选 A，全保留）
 
             if not should_keep:
                 continue
 
             bounds = self._parse_bounds(node.get("bounds", ""))
             # 跳过零面积节点（无意义）
-            if bounds == (0, 0, 0, 0) or (bounds[2] - bounds[0]) <= 0 or (
-                bounds[3] - bounds[1]
-            ) <= 0:
+            if (
+                bounds == (0, 0, 0, 0)
+                or (bounds[2] - bounds[0]) <= 0
+                or (bounds[3] - bounds[1]) <= 0
+            ):
                 continue
 
             el = UIElement(
@@ -316,7 +339,7 @@ class SmartPerceiver:
 
         # 策略 2: resource_id 含 title
         for node in root.iter():
-            rid = (node.get("resource_id", "") or "")
+            rid = node.get("resource_id", "") or ""
             if "title" in rid.lower() and not rid.endswith("_title"):
                 continue
             if "title" in rid.lower():
@@ -327,7 +350,7 @@ class SmartPerceiver:
         # 策略 3: 顶部区域有文本的非导航元素
         top_texts = []
         for node in root.iter():
-            bounds_str = (node.get("bounds", "") or "")
+            bounds_str = node.get("bounds", "") or ""
             m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str)
             if not m:
                 continue
@@ -338,7 +361,7 @@ class SmartPerceiver:
                 t = (node.get("text", "") or "").strip()
                 cls = (node.get("class", "") or "").lower()
                 if t and 2 <= len(t) <= 40 and "textview" in cls:
-                    rid = (node.get("resource_id", "") or "")
+                    rid = node.get("resource_id", "") or ""
                     # 排除导航按钮
                     if "back" not in rid.lower() and "home" not in rid.lower():
                         top_texts.append((y1, t))
@@ -429,7 +452,11 @@ class SmartPerceiver:
         breadcrumb = f"{title_part}" if title_part else act_short
         return PageUnderstanding(
             layout=layout,
-            summary=f"{breadcrumb} — {layout} 页面，识别到 {len(primary)} 个主要路径入口" if breadcrumb else f"{layout} 页面，识别到 {len(primary)} 个主要路径入口",
+            summary=(
+                f"{breadcrumb} — {layout} 页面，识别到 {len(primary)} 个主要路径入口"
+                if breadcrumb
+                else f"{layout} 页面，识别到 {len(primary)} 个主要路径入口"
+            ),
             package=package,
             activity=activity,
             page_title=page_title,
@@ -529,12 +556,8 @@ class SmartPerceiver:
             e.priority = 100
 
     def switch_mode(self, mode: str) -> None:
-        """手动切换感知模式，重置卡住计数。"""
-        if mode in {
-            PerceptionMode.UI_TREE,
-            PerceptionMode.VISION,
-            PerceptionMode.HYBRID,
-        }:
+        """手动切换感知模式（ui_tree/hybrid），重置卡住计数。"""
+        if mode in {PerceptionMode.UI_TREE, PerceptionMode.HYBRID}:
             self.mode = mode
         self._stuck_count = 0
 
@@ -543,26 +566,20 @@ class SmartPerceiver:
         return {"current_mode": self.mode, "vision_calls": self._vision_calls}
 
     def _update_stuck(self, current_result: str) -> None:
-        """检测是否卡在相同页面，自动从 UI_TREE 切换到 VISION。"""
+        """检测是否卡在相同页面，维护卡住计数给 hybrid 触发条件使用。"""
         import hashlib
 
         result_hash = hashlib.md5(current_result.encode()).hexdigest()[:8]
         if result_hash == self._last_hash:
             self._stuck_count += 1
-            if (
-                self._stuck_count >= self.stuck_threshold
-                and self.mode == PerceptionMode.UI_TREE
-            ):
-                self.mode = PerceptionMode.VISION
         else:
-            # 页面变化，如果之前在 VISION 模式且卡住过，切回 UI_TREE
-            if self.mode == PerceptionMode.VISION and self._stuck_count > 0:
-                self.mode = PerceptionMode.UI_TREE
             self._stuck_count = 0
         self._last_hash = result_hash
 
     def _vision_describe(self, image_base64: str, base: PageUnderstanding) -> str:
-        """调用 Vision LLM 对截图进行语义描述。将 UI 树元素列表传给 Vision，让其为无文本的控件补充语义标签。"""
+        """调用统一视觉 helper 对截图进行语义描述。"""
+        if not self._vision_call:
+            return ""
         # 构建 UI 树元素列表作为 context（含 bounds，Vision 无法输出坐标但可以引用序号）
         indexed_elements = base.primary_paths[:20]
         el_lines = ["UI tree elements (with exact bounds):"]
@@ -588,11 +605,18 @@ class SmartPerceiver:
             f"{element_context}"
         )
         try:
-            answer = self.vlm.describe(
-                prompt=prompt,
-                image_base64=image_base64,
-                context="",
+            result = self._vision_call(
+                prompt,
+                image_base64,
+                "perceiver_annotate",
+                False,
             )
+            answer = str(result.get("raw", "") or result.get("reason", ""))
+            if not result.get("ok", False):
+                self.logger.warning(
+                    "vision helper failed | reason=%s", result.get("reason", "")
+                )
+                return answer or f"Vision 解析失败: {result.get('error', '')}"
             # 将 Vision 语义标注映射回 UI 元素
             self._apply_vision_annotations(indexed_elements, answer)
 

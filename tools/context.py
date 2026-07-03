@@ -12,11 +12,20 @@ class ToolContext:
     perceiver: Any
     report_logger: Any | None = None
     knowledge_base: Any | None = None
-    relational_db: Any = None          # V2: 注入已有的 SqliteBackend 实例，避免重复创建连接
+    relational_db: Any = None  # V2: 注入已有的 SqliteBackend 实例，避免重复创建连接
     safety_level: str = "strict"
+    llm_provider: str = ""
+    llm_model: str = ""
+    llm_api_key: str | None = None
+    llm_base_url: str | None = None
+    verification_auto_vision: bool = True
     _screen_size: tuple[int, int] | None = field(default=None, repr=False)
-    _ws_emit: Any = field(default=None, repr=False)  # WebSocket 实时事件回调 (type, payload) -> None
-    _last_screenshot_path: str = ""  # perceive() cache miss 时自动存盘的截图路径，assert_verification 复用
+    _ws_emit: Any = field(
+        default=None, repr=False
+    )  # WebSocket 实时事件回调 (type, payload) -> None
+    _last_screenshot_path: str = (
+        ""  # perceive() cache miss 时自动存盘的截图路径，assert_verification 复用
+    )
 
     @property
     def screen_size(self) -> tuple[int, int]:

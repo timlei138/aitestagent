@@ -27,6 +27,7 @@ from agents.graph import set_relational_db, set_ws_emit_callback
 from data.knowledge import KnowledgeBase
 from agents.orchestrator import TestOrchestrator
 from device.perceiver import SmartPerceiver
+from llm.multimodal import multimodal_vision_call, reset_vision_capability_state
 from tools.context import ToolContext
 from tools import set_tool_context
 
@@ -44,6 +45,24 @@ _device: DeviceController | None = None
 _perceiver: SmartPerceiver | None = None
 _kb: KnowledgeBase | None = None
 
+
+def _build_vision_call(cfg: TestConfig):
+    def _vision_call(prompt: str, image_base64: str, purpose: str, strict_json: bool):
+        return multimodal_vision_call(
+            prompt=prompt,
+            image_base64=image_base64,
+            purpose=purpose,
+            strict_json=strict_json,
+            provider=cfg.llm_provider,
+            model=cfg.model,
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+            timeout_sec=12,
+        )
+
+    return _vision_call
+
+
 # 1) 设备连接
 try:
     _device = DeviceController()
@@ -54,29 +73,56 @@ except (DeviceUnavailableError, Exception) as exc:
 # 2) 感知器（设备在线时才创建）
 if _device is not None:
     try:
-        mode, auto_switch, vlm = resolve_perception_mode(config)
-        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=mode, auto_switch=auto_switch)
-        logging.getLogger(__name__).info("SmartPerceiver initialized (mode=%s)", _perceiver.mode)
+        reset_vision_capability_state()
+        mode, auto_switch = resolve_perception_mode(config)
+        _perceiver = SmartPerceiver(
+            _device,
+            vision_call=_build_vision_call(config),
+            mode=mode,
+            auto_switch=auto_switch,
+        )
+        logging.getLogger(__name__).info(
+            "SmartPerceiver initialized (mode=%s)", _perceiver.mode
+        )
     except Exception as exc:
         logging.getLogger(__name__).warning("SmartPerceiver init failed: %s", exc)
 
 # 3) 知识库（始终可用）
 _kb = KnowledgeBase(create_vector_store(config))
 
-_ctx = ToolContext(device=_device, perceiver=_perceiver, knowledge_base=_kb, safety_level=config.safety_level)
+_ctx = ToolContext(
+    device=_device,
+    perceiver=_perceiver,
+    knowledge_base=_kb,
+    safety_level=config.safety_level,
+    llm_provider=config.llm_provider,
+    llm_model=config.model,
+    llm_api_key=config.api_key,
+    llm_base_url=config.base_url,
+)
 set_tool_context(_ctx)
 
 
 def _get_relational_db():
     """获取关系型数据库实例。"""
     from agents.graph import _relational_db
+
     return _relational_db
 
 
 def _rebuild_tool_context() -> None:
     """重新构建 ToolContext 并更新全局引用。"""
     global _ctx
-    _ctx = ToolContext(device=_device, perceiver=_perceiver, knowledge_base=_kb, safety_level=config.safety_level)
+    _ctx = ToolContext(
+        device=_device,
+        perceiver=_perceiver,
+        knowledge_base=_kb,
+        safety_level=config.safety_level,
+        llm_provider=config.llm_provider,
+        llm_model=config.model,
+        llm_api_key=config.api_key,
+        llm_base_url=config.base_url,
+    )
     set_tool_context(_ctx)
 
 
@@ -93,15 +139,26 @@ def reconnect_device() -> dict:
         return {"connected": False, "detail": str(exc)}
 
     try:
-        mode, auto_switch, vlm = resolve_perception_mode(config)
-        _perceiver = SmartPerceiver(_device, llm_client=vlm, mode=mode, auto_switch=auto_switch)
-        logging.getLogger(__name__).info("SmartPerceiver reinitialized (mode=%s)", _perceiver.mode)
+        reset_vision_capability_state()
+        mode, auto_switch = resolve_perception_mode(config)
+        _perceiver = SmartPerceiver(
+            _device,
+            vision_call=_build_vision_call(config),
+            mode=mode,
+            auto_switch=auto_switch,
+        )
+        logging.getLogger(__name__).info(
+            "SmartPerceiver reinitialized (mode=%s)", _perceiver.mode
+        )
     except Exception as exc:
         _perceiver = None
-        logging.getLogger(__name__).warning("SmartPerceiver init failed during reconnect: %s", exc)
+        logging.getLogger(__name__).warning(
+            "SmartPerceiver init failed during reconnect: %s", exc
+        )
 
     _rebuild_tool_context()
     return {"connected": True, "detail": "设备重连成功"}
+
 
 # ── 编排器 ──
 orchestrator = TestOrchestrator(config)
@@ -117,6 +174,7 @@ orchestrator.set_event_callback(
 )
 set_ws_emit_callback(lambda t, p: ws_manager.broadcast_sync(t, p))
 
+
 # ── USB 热插拔监听 ──
 def _start_usb_monitor() -> None:
     """后台线程：adb track-devices 实时监听 USB 插拔，毫秒级响应。"""
@@ -131,8 +189,10 @@ def _start_usb_monitor() -> None:
             try:
                 proc = subprocess.Popen(
                     ["adb", "track-devices"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, bufsize=1,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
                 )
                 for line in proc.stdout:
                     line = line.strip()
@@ -164,6 +224,7 @@ def _start_usb_monitor() -> None:
     t = threading.Thread(target=_monitor, daemon=True, name="usb-monitor")
     t.start()
 
+
 _start_usb_monitor()
 
 app.include_router(device_router)
@@ -192,7 +253,10 @@ async def run_test(request: RunRequest):
     """一步式执行（自动解析意图 + 执行）。"""
     # 设备连接前置检查
     if _device is None:
-        return {"status": "device_offline", "message": "Android 设备未连接，请检查 USB/ADB 连接后重试"}
+        return {
+            "status": "device_offline",
+            "message": "Android 设备未连接，请检查 USB/ADB 连接后重试",
+        }
     ws_manager.bind_loop(asyncio.get_running_loop())
 
     # 解析 app_package
@@ -211,15 +275,19 @@ async def run_test(request: RunRequest):
 async def run_test_stream(request: RunRequest):
     """流式执行 — Server-Sent Events。"""
     if _device is None:
+
         async def offline_stream():
             yield f"data: {json.dumps({'type': 'error', 'content': 'Android 设备未连接，请检查 USB/ADB 连接后重试'}, ensure_ascii=False)}\n\n"
+
         return StreamingResponse(offline_stream(), media_type="text/event-stream")
     ws_manager.bind_loop(asyncio.get_running_loop())
     app_package, app_name = _quick_resolve_app(request.message)
 
     async def event_generator():
         async for event in orchestrator.start_stream(
-            user_request=request.message, app_package=app_package, app_name=app_name,
+            user_request=request.message,
+            app_package=app_package,
+            app_name=app_name,
         ):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -234,7 +302,9 @@ async def human_decision(request: HumanDecisionRequest):
         return {"status": "error", "message": "缺少 thread_id"}
 
     result = await asyncio.to_thread(
-        orchestrator.resume, thread_id=request.thread_id, decision=request.decision,
+        orchestrator.resume,
+        thread_id=request.thread_id,
+        decision=request.decision,
     )
     return {"status": result.get("status", "error"), "data": result}
 
@@ -244,9 +314,11 @@ async def confirm_element_identities(request: IdentityConfirmRequest):
     """确认 Level2 元素身份映射，写入 SQLite。"""
     from data import create_relational_db
     from agents.graph import set_relational_db, _relational_db
+
     db = _relational_db
     if not db:
         from config import TestConfig
+
         db = create_relational_db(TestConfig())
     count = 0
     for ident in request.identities:
@@ -280,10 +352,13 @@ async def websocket_chat(websocket: WebSocket):
                 user_input = data.get("message", "")
                 # 设备连接前置检查
                 if _device is None:
-                    await ws_manager.send(websocket, {
-                        "type": "error",
-                        "content": "Android 设备未连接，请检查 USB/ADB 连接后重试",
-                    })
+                    await ws_manager.send(
+                        websocket,
+                        {
+                            "type": "error",
+                            "content": "Android 设备未连接，请检查 USB/ADB 连接后重试",
+                        },
+                    )
                     continue
                 app_package, app_name = _quick_resolve_app(user_input)
                 result = await asyncio.to_thread(
@@ -293,7 +368,9 @@ async def websocket_chat(websocket: WebSocket):
                     app_name=app_name,
                 )
                 try:
-                    await ws_manager.send(websocket, {"type": "result", "content": result})
+                    await ws_manager.send(
+                        websocket, {"type": "result", "content": result}
+                    )
                 except RuntimeError:
                     pass
 
@@ -301,10 +378,14 @@ async def websocket_chat(websocket: WebSocket):
                 thread_id = data.get("thread_id", "")
                 decision = data.get("decision", "跳过")
                 result = await asyncio.to_thread(
-                    orchestrator.resume, thread_id=thread_id, decision=decision,
+                    orchestrator.resume,
+                    thread_id=thread_id,
+                    decision=decision,
                 )
                 try:
-                    await ws_manager.send(websocket, {"type": "result", "content": result})
+                    await ws_manager.send(
+                        websocket, {"type": "result", "content": result}
+                    )
                 except RuntimeError:
                     pass
 
@@ -313,6 +394,7 @@ async def websocket_chat(websocket: WebSocket):
 
 
 # ── 报告 API ──
+
 
 @app.get("/api/reports/list")
 async def list_reports(limit: int = 30):
@@ -339,7 +421,6 @@ async def get_report(run_id: str):
     return {"status": "error", "message": f"报告不存在: {run_id}"}
 
 
-
 # ── 静态文件 ──
 
 app.mount("/storage", StaticFiles(directory=str(BASE_DIR / "storage")), name="storage")
@@ -348,15 +429,19 @@ app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 @app.get("/")
 async def index():
-    return FileResponse(str(INDEX_FILE), headers={
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache", "Expires": "0",
-    })
+    return FileResponse(
+        str(INDEX_FILE),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 # ── 辅助 ──
 
+
 def _quick_resolve_app(text: str) -> tuple[str, str]:
     """从用户输入中解析 (package, name)，优先读取 storage/apps.yaml。"""
     return _resolve_app_from_yaml(text)
-

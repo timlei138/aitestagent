@@ -12,6 +12,7 @@ from tools.context import ToolContext
 from tools import set_tool_context
 from device.controller import DeviceController, DeviceUnavailableError
 from device.perceiver import SmartPerceiver
+from llm.multimodal import multimodal_vision_call, reset_vision_capability_state
 from data.knowledge import KnowledgeBase
 from api.apps_routes import resolve_app as _resolve_app_from_yaml
 
@@ -33,6 +34,7 @@ def main():
 
     if args.mode == "server":
         import uvicorn
+
         uvicorn.run("api.server:app", host=args.host, port=args.port, reload=False)
         return
 
@@ -59,10 +61,38 @@ def main():
 def _init_tool_context(config: TestConfig) -> None:
     try:
         device = DeviceController()
-        mode, auto_switch, vlm = resolve_perception_mode(config)
-        perceiver = SmartPerceiver(device, llm_client=vlm, mode=mode, auto_switch=auto_switch)
+        reset_vision_capability_state()
+        mode, auto_switch = resolve_perception_mode(config)
+
+        def _vision_call(
+            prompt: str, image_base64: str, purpose: str, strict_json: bool
+        ):
+            return multimodal_vision_call(
+                prompt=prompt,
+                image_base64=image_base64,
+                purpose=purpose,
+                strict_json=strict_json,
+                provider=config.llm_provider,
+                model=config.model,
+                api_key=config.api_key,
+                base_url=config.base_url,
+                timeout_sec=12,
+            )
+
+        perceiver = SmartPerceiver(
+            device, vision_call=_vision_call, mode=mode, auto_switch=auto_switch
+        )
         kb = KnowledgeBase(create_vector_store(config))
-        ctx = ToolContext(device=device, perceiver=perceiver, knowledge_base=kb, safety_level=config.safety_level)
+        ctx = ToolContext(
+            device=device,
+            perceiver=perceiver,
+            knowledge_base=kb,
+            safety_level=config.safety_level,
+            llm_provider=config.llm_provider,
+            llm_model=config.model,
+            llm_api_key=config.api_key,
+            llm_base_url=config.base_url,
+        )
         set_tool_context(ctx)
     except DeviceUnavailableError:
         logging.warning("设备不可用，部分功能受限")
