@@ -46,6 +46,7 @@ class TestConfig:
     # ── 安全 / Debug ──
     safety_level: str = "strict"
     langchain_debug: bool = True
+    vision_enabled: bool = True
 
     # ──────────────── YAML 加载 ────────────────
 

@@ -58,6 +58,7 @@ def _build_vision_call(cfg: TestConfig):
             model=cfg.model,
             api_key=cfg.api_key,
             base_url=cfg.base_url,
+            vision_enabled=cfg.vision_enabled,
             timeout_sec=12,
         )
 
@@ -127,6 +128,17 @@ if _device is not None:
 
 # 3) 知识库（始终可用）
 _kb = KnowledgeBase(create_vector_store(config))
+try:
+    added = _kb.ensure_gallery_seed_knowledge()
+    logging.getLogger(__name__).info(
+        "Gallery seed knowledge initialized (added=%d)",
+        added,
+    )
+except Exception as exc:
+    logging.getLogger(__name__).warning(
+        "Gallery seed knowledge init failed: %s",
+        exc,
+    )
 
 _ctx = ToolContext(
     device=_device,
@@ -137,6 +149,7 @@ _ctx = ToolContext(
     llm_model=config.model,
     llm_api_key=config.api_key,
     llm_base_url=config.base_url,
+    llm_vision_enabled=config.vision_enabled,
 )
 set_tool_context(_ctx)
 
@@ -160,6 +173,7 @@ def _rebuild_tool_context() -> None:
         llm_model=config.model,
         llm_api_key=config.api_key,
         llm_base_url=config.base_url,
+        llm_vision_enabled=config.vision_enabled,
     )
     set_tool_context(_ctx)
 

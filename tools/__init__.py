@@ -50,6 +50,7 @@ def _run_multimodal_from_context(
         model=ctx.llm_model,
         api_key=ctx.llm_api_key,
         base_url=ctx.llm_base_url,
+        vision_enabled=ctx.llm_vision_enabled,
         timeout_sec=timeout_sec,
     )
 

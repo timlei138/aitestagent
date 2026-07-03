@@ -185,6 +185,13 @@
                 <el-form-item label="Base URL">
                   <el-input v-model="configData.base_url" placeholder="如: https://api.deepseek.com" />
                 </el-form-item>
+                <el-form-item label="多模态开关">
+                  <el-switch
+                    v-model="configData.vision_enabled"
+                    active-text="开启"
+                    inactive-text="关闭"
+                  />
+                </el-form-item>
               </el-form>
             </div>
 

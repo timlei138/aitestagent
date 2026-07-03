@@ -18,6 +18,7 @@ class ToolContext:
     llm_model: str = ""
     llm_api_key: str | None = None
     llm_base_url: str | None = None
+    llm_vision_enabled: bool = True
     verification_auto_vision: bool = True
     _screen_size: tuple[int, int] | None = field(default=None, repr=False)
     _ws_emit: Any = field(

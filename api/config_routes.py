@@ -26,6 +26,7 @@ _EDITABLE_FIELDS = (
     "embedding_base_url",
     "perception_mode",
     "safety_level",
+    "vision_enabled",
 )
 
 _SECRET_FIELDS = ("api_key", "embedding_api_key")
@@ -78,6 +79,7 @@ class ConfigUpdateRequest(BaseModel):
     embedding_base_url: str | None = None
     perception_mode: str | None = None
     safety_level: str | None = None
+    vision_enabled: bool | None = None
 
 
 @router.put("")
@@ -94,13 +96,25 @@ async def update_config(req: ConfigUpdateRequest):
         # API key 脱敏值回传 → 保留原值
         if field in _SECRET_FIELDS and new_val and "***" in new_val:
             continue
+
+        normalized_val = new_val
+        if isinstance(normalized_val, str):
+            normalized_val = normalized_val.strip() or None
+
         old_val = getattr(cfg, field, None)
-        if str(old_val or "") == str(new_val or ""):
+        if old_val == normalized_val:
             continue
-        setattr(cfg, field, new_val or None)
+        setattr(cfg, field, normalized_val)
         changed[field] = True
         # perception_mode 或主 LLM 凭证变更需要重建 perceiver/context
-        if field in ("perception_mode", "llm_provider", "model", "api_key", "base_url"):
+        if field in (
+            "perception_mode",
+            "llm_provider",
+            "model",
+            "api_key",
+            "base_url",
+            "vision_enabled",
+        ):
             need_rebuild_perceiver = True
 
     # 写回 YAML（敏感字段写 config.local.yaml，非敏感写 config.yaml）

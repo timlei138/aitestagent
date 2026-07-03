@@ -77,6 +77,7 @@ def _init_tool_context(config: TestConfig) -> None:
                 model=config.model,
                 api_key=config.api_key,
                 base_url=config.base_url,
+                vision_enabled=config.vision_enabled,
                 timeout_sec=12,
             )
 
@@ -101,6 +102,7 @@ def _init_tool_context(config: TestConfig) -> None:
             llm_model=config.model,
             llm_api_key=config.api_key,
             llm_base_url=config.base_url,
+            llm_vision_enabled=config.vision_enabled,
         )
         ctx_holder["ctx"] = ctx
         set_tool_context(ctx)

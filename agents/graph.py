@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import hashlib
 from datetime import datetime
 from typing import Any, Annotated
 
@@ -60,7 +61,15 @@ def _build_tool_target(name: str, args: dict) -> str:
     if label:
         return str(label)
     # 按优先级从其他参数中提取
-    for key in ("key", "text", "direction", "panel", "package", "seconds", "orientation"):
+    for key in (
+        "key",
+        "text",
+        "direction",
+        "panel",
+        "package",
+        "seconds",
+        "orientation",
+    ):
         val = args.get(key, "")
         if val:
             return str(val)
@@ -104,11 +113,69 @@ from langgraph.graph.message import add_messages
 class _SubState(_TD):
     messages: Annotated[list, add_messages]
     _turn_count: int
+    _recent_call_sigs: list[str]
+    _loop_break_reason: str
+
+
+_LOOP_BREAK_CONSECUTIVE = 3
+
+
+def _estimate_tokens(text: str) -> int:
+    """粗略 token 估算：CJK 单字 + 英文词。"""
+    if not text:
+        return 0
+    cjk = re.findall(r"[\u4e00-\u9fff]", text)
+    words = re.findall(r"[A-Za-z0-9_]+", text)
+    punct = re.findall(r"[^\sA-Za-z0-9_\u4e00-\u9fff]", text)
+    return len(cjk) + len(words) + max(1, len(punct) // 2)
+
+
+def _clip_to_token_budget(text: str, max_tokens: int) -> tuple[str, bool]:
+    if _estimate_tokens(text) <= max_tokens:
+        return text, False
+    chars = list(text)
+    lo, hi = 0, len(chars)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _estimate_tokens("".join(chars[:mid])) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    clipped = "".join(chars[:lo]).rstrip() + "\n...[truncated by token budget]"
+    return clipped, True
+
+
+def _build_page_signature(ctx: Any) -> str:
+    """页面签名：activity + page_title + visible_labels_hash。"""
+    if not ctx or not getattr(ctx, "perceiver", None):
+        return "unknown"
+    try:
+        u = ctx.perceiver.perceive()
+        act = u.activity or ""
+        title = u.page_title or ""
+        labels = sorted(
+            (e.label or "").strip().lower()
+            for e in (u.elements or [])
+            if getattr(e, "clickable", False) and (e.label or "").strip()
+        )
+        vis = "|".join(labels[:80])
+        vis_hash = hashlib.md5(vis.encode("utf-8")).hexdigest()[:12]
+        return f"{act}|{title}|{vis_hash}"
+    except Exception:
+        return "unknown"
+
+
+def _build_call_signature(name: str, args: dict, page_sig: str) -> str:
+    try:
+        args_norm = json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        args_norm = str(args or {})
+    return f"{name}|{args_norm}|{page_sig}"
 
 
 def _run_agent(
     messages, tools, provider, model, api_key, base_url, max_turns=20
-) -> tuple[str, list]:
+) -> tuple[str, list, dict[str, Any]]:
     try:
         _ctx = get_tool_context()  # 捕获当前 ToolContext 供子图事件发射使用
     except Exception:
@@ -125,8 +192,10 @@ def _run_agent(
 
         def _llm(s: _SubState) -> dict:
             if _ctx and _ctx._ws_emit:
-                try: _ctx._ws_emit("stream_token", "thinking")
-                except Exception: pass
+                try:
+                    _ctx._ws_emit("stream_token", "thinking")
+                except Exception:
+                    pass
             ms = _to_zhipu(s["messages"])
             r = _call_retry(
                 "zhipu",
@@ -168,8 +237,10 @@ def _run_agent(
 
         def _llm(s: _SubState) -> dict:
             if _ctx and _ctx._ws_emit:
-                try: _ctx._ws_emit("stream_token", "thinking")
-                except Exception: pass
+                try:
+                    _ctx._ws_emit("stream_token", "thinking")
+                except Exception:
+                    pass
             r = _call_retry("openai", lc.invoke, s["messages"])
             return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
 
@@ -181,12 +252,23 @@ def _run_agent(
     def _tools_node(s: _SubState) -> dict:
         last_ai = next(m for m in reversed(s["messages"]) if isinstance(m, AIMessage))
         outputs = []
-        for tc in (last_ai.tool_calls or []):
+        recent = list(s.get("_recent_call_sigs", []))
+        loop_break_reason = s.get("_loop_break_reason", "")
+        page_sig_once = _build_page_signature(_ctx)
+        for tc in last_ai.tool_calls or []:
             name = tc["name"]
             args = tc.get("args", {}) or {}
             if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
-                try: _ctx._ws_emit("tool_start", {"name": name, "input": {"label": _build_tool_target(name, args)}})
-                except Exception: pass
+                try:
+                    _ctx._ws_emit(
+                        "tool_start",
+                        {
+                            "name": name,
+                            "input": {"label": _build_tool_target(name, args)},
+                        },
+                    )
+                except Exception:
+                    pass
             t = _tool_map.get(name)
             try:
                 output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"
@@ -199,23 +281,52 @@ def _run_agent(
                     output = "ERROR: 设备已断开连接"
                     outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
                     # 为剩余未执行的 tool_calls 补占位 ToolMessage，避免 LangChain 报错
-                    _remaining = (last_ai.tool_calls or [])
+                    _remaining = last_ai.tool_calls or []
                     _idx = _remaining.index(tc) + 1 if tc in _remaining else -1
                     if _idx > 0:
                         for _skipped in _remaining[_idx:]:
-                            outputs.append(ToolMessage(
-                                content="SKIPPED: 设备已断开",
-                                tool_call_id=_skipped["id"]
-                            ))
+                            outputs.append(
+                                ToolMessage(
+                                    content="SKIPPED: 设备已断开",
+                                    tool_call_id=_skipped["id"],
+                                )
+                            )
                     logger.warning("设备在工具执行中断开，终止剩余工具调用")
                     break
             except Exception:
                 pass
             if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
-                try: _ctx._ws_emit("tool_end", {"name": name, "output": output[:200]})
-                except Exception: pass
+                try:
+                    _ctx._ws_emit("tool_end", {"name": name, "output": output[:200]})
+                except Exception:
+                    pass
             outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
-        return {"messages": outputs}
+
+            # 内层循环断路器：连续 N 次相同 tool+args+page_signature 立即终止。
+            if name not in (
+                "get_screen_info",
+                "check_page_health",
+                "query_app_knowledge",
+            ):
+                call_sig = _build_call_signature(name, args, page_sig_once)
+                recent.append(call_sig)
+                if len(recent) > 8:
+                    recent = recent[-8:]
+                if (
+                    len(recent) >= _LOOP_BREAK_CONSECUTIVE
+                    and len(set(recent[-_LOOP_BREAK_CONSECUTIVE:])) == 1
+                ):
+                    loop_break_reason = (
+                        "LOOP_DETECTED: repeated tool+args+page_signature "
+                        f"for {_LOOP_BREAK_CONSECUTIVE} times ({name})"
+                    )
+                    logger.warning(loop_break_reason)
+                    break
+        return {
+            "messages": outputs,
+            "_recent_call_sigs": recent,
+            "_loop_break_reason": loop_break_reason,
+        }
 
     def _inc(s: _SubState) -> dict:
         return {"_turn_count": s.get("_turn_count", 0) + 1, "messages": []}
@@ -224,6 +335,9 @@ def _run_agent(
         r = tools_condition(s)
         return END if r == "tools" and s.get("_turn_count", 0) >= max_turns else r
 
+    def _after_tools(s: _SubState) -> str:
+        return END if s.get("_loop_break_reason") else "llm"
+
     g = StateGraph(_SubState)
     g.add_node("llm", llm_node)
     g.add_node("tools", _tools_node)
@@ -231,9 +345,17 @@ def _run_agent(
     g.add_edge(START, "llm")
     g.add_conditional_edges("llm", _limit, {"tools": "inc", END: END})
     g.add_edge("inc", "tools")
-    g.add_edge("tools", "llm")
-    result = g.compile().invoke({"messages": list(messages), "_turn_count": 0})
+    g.add_conditional_edges("tools", _after_tools, {"llm": "llm", END: END})
+    result = g.compile().invoke(
+        {
+            "messages": list(messages),
+            "_turn_count": 0,
+            "_recent_call_sigs": [],
+            "_loop_break_reason": "",
+        }
+    )
     turn_count = result.get("_turn_count", 0)
+    loop_break_reason = result.get("_loop_break_reason", "")
 
     # 提取内部工具调用信息（供报告展示用）
     _tool_calls_log = []
@@ -241,30 +363,81 @@ def _run_agent(
         tcs = getattr(m, "tool_calls", None) or []
         for tc in tcs:
             name = tc.get("name", "")
-            if name not in ("get_screen_info", "check_page_health", "query_app_knowledge"):
+            if name not in (
+                "get_screen_info",
+                "check_page_health",
+                "query_app_knowledge",
+            ):
                 args = tc.get("args", {}) or {}
-                _tool_calls_log.append({
-                    "name": name,
-                    "target": _build_tool_target(name, args),
-                })
+                _tool_calls_log.append(
+                    {
+                        "name": name,
+                        "target": _build_tool_target(name, args),
+                    }
+                )
+
+    if loop_break_reason:
+        return (
+            f"ABORT: {loop_break_reason}",
+            _tool_calls_log,
+            {
+                "loop_detected": True,
+                "loop_pattern": loop_break_reason,
+                "loop_break_action": "end_subgraph",
+            },
+        )
 
     # Phase 1.1: 静默截断检测 —— 当 turn 耗尽时注入明确标记
     if turn_count >= max_turns:
         for m in reversed(result["messages"]):
             c = getattr(m, "content", None)
             if c:
-                return str(c) + "\nABORT: MAX_TURNS_EXHAUSTED", _tool_calls_log
-        return "ABORT: MAX_TURNS_EXHAUSTED — 达到最大工具调用次数", _tool_calls_log
+                return (
+                    str(c) + "\nABORT: MAX_TURNS_EXHAUSTED",
+                    _tool_calls_log,
+                    {
+                        "loop_detected": False,
+                        "loop_pattern": "",
+                        "loop_break_action": "",
+                    },
+                )
+        return (
+            "ABORT: MAX_TURNS_EXHAUSTED — 达到最大工具调用次数",
+            _tool_calls_log,
+            {
+                "loop_detected": False,
+                "loop_pattern": "",
+                "loop_break_action": "",
+            },
+        )
 
     for m in reversed(result["messages"]):
         c = getattr(m, "content", None)
         if c:
-            return str(c), _tool_calls_log
-    return "ABORT: No agent response", _tool_calls_log
+            return (
+                str(c),
+                _tool_calls_log,
+                {
+                    "loop_detected": False,
+                    "loop_pattern": "",
+                    "loop_break_action": "",
+                },
+            )
+    return (
+        "ABORT: No agent response",
+        _tool_calls_log,
+        {
+            "loop_detected": False,
+            "loop_pattern": "",
+            "loop_break_action": "",
+        },
+    )
 
 
 # Phase 1.2: 锚定行首的 DONE/ABORT 检测（兼容 ##/### Markdown 标题前缀）
-_DONE_PATTERN = re.compile(r"^(?:#{1,3}\s*)?(DONE|ABORT)\s*[:：]", re.IGNORECASE | re.MULTILINE)
+_DONE_PATTERN = re.compile(
+    r"^(?:#{1,3}\s*)?(DONE|ABORT)\s*[:：]", re.IGNORECASE | re.MULTILINE
+)
 
 
 def _detect_termination(result: str) -> tuple[bool, bool]:
@@ -284,6 +457,7 @@ def _ensure_device_alive(max_retries: int = 2, wait_sec: float = 5.0) -> bool:
     本函数只需轮询 get_tool_context().device 即可。
     """
     import time as _time
+
     try:
         ctx = get_tool_context()
         if ctx.device is not None:
@@ -292,9 +466,7 @@ def _ensure_device_alive(max_retries: int = 2, wait_sec: float = 5.0) -> bool:
         pass
 
     for attempt in range(1, max_retries + 1):
-        logger.warning(
-            "设备已断开，等待自动重连 (%d/%d)...", attempt, max_retries
-        )
+        logger.warning("设备已断开，等待自动重连 (%d/%d)...", attempt, max_retries)
         _time.sleep(wait_sec)
         try:
             ctx = get_tool_context()
@@ -388,7 +560,7 @@ def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
         return ""
     parts = []
     # 1. 人工知识（一次查询，Python 侧自动分组为全局知识 + App 操作前提）
-    rules = kb.query_curated_rules(app_package)
+    rules = kb.query_curated_rules(app_package, user_request=user_request)
     if rules:
         parts.append("## 人工知识\n" + rules)
     # 2. 操作经验
@@ -408,6 +580,10 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     ctx = get_tool_context()
     kb = ctx.knowledge_base if ctx else None
     rag = _rag_ctx(kb, state.get("app_package", ""), state.get("user_request", ""))
+    budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
+    rag, rag_truncated = _clip_to_token_budget(rag, 500)
+    if rag_truncated:
+        budget_violation_count += 1
     msgs = PLANNER_TEMPLATE.format_messages(
         user_request=state.get("user_request", ""),
         app_name=state.get("app_name", ""),
@@ -443,6 +619,7 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
             "messages": [],
             "started_at": datetime.now().isoformat(),
             "step_times": [],
+            "budget_violation_count": budget_violation_count,
         }
     )
 
@@ -459,17 +636,27 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         logger.warning("Agent #%d: device lost, aborting", si)
         nh = list(history) + [
             {
-                "index": si, "intent": conclusion[:80],
-                "action_type": "device_lost", "target": "",
-                "page_from": "", "page_to": "",
-                "duration_ms": 0, "status": "fail",
-                "observation": conclusion, "raw_observation": conclusion,
-                "screenshot_path": "", "anomaly": None,
+                "index": si,
+                "intent": conclusion[:80],
+                "action_type": "device_lost",
+                "target": "",
+                "page_from": "",
+                "page_to": "",
+                "duration_ms": 0,
+                "status": "fail",
+                "observation": conclusion,
+                "raw_observation": conclusion,
+                "screenshot_path": "",
+                "anomaly": None,
             }
         ]
-        return Command(update={
-            "step_history": nh, "status": "fail", "conclusion": conclusion,
-        })
+        return Command(
+            update={
+                "step_history": nh,
+                "status": "fail",
+                "conclusion": conclusion,
+            }
+        )
 
     # Page info
     ctx = get_tool_context()
@@ -516,6 +703,15 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     goal = state.get("goal_description", {})
     goal_str = json.dumps(goal, ensure_ascii=False, indent=2)
     history = state.get("step_history", [])
+    budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
+    rag_summary = _rag_ctx(
+        ctx.knowledge_base if ctx else None,
+        state.get("app_package", ""),
+        state.get("user_request", ""),
+    )
+    rag_summary, rag_truncated = _clip_to_token_budget(rag_summary, 500)
+    if rag_truncated:
+        budget_violation_count += 1
     hist_lines = [
         f"  [{s.get('status','')}] {s.get('intent','')}: {str(s.get('observation',''))[:100]}"
         for s in history[-10:]
@@ -534,6 +730,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             + page_info
             + "\n\nHistory:\n"
             + hist_str
+            + ("\n\nRAG:\n" + rag_summary if rag_summary else "")
         )
     )
 
@@ -545,7 +742,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     )
     _max_turns = min(max(_goal_turns, 10), 200)  # 最少 10，最多 200
 
-    result, tool_calls_log = _run_agent(
+    result, tool_calls_log, loop_meta = _run_agent(
         msgs,
         AGENT_TOOLS,
         llm["provider"],
@@ -556,7 +753,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     )
     # 累积存入 ToolContext 供 _build_display_steps 使用（多轮 Agent 调用需累加）
     if ctx:
-        if not hasattr(ctx, '_tool_calls_log'):
+        if not hasattr(ctx, "_tool_calls_log"):
             ctx._tool_calls_log = []
         ctx._tool_calls_log.extend(tool_calls_log)
     logger.info("Agent #%d: %s", len(history) + 1, result[:200])
@@ -579,7 +776,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         if _tcs:
             _last = _tcs[-1]
             _tn = _last.get("name", "")
-            if _tn not in ("get_screen_info", "check_page_health", "query_app_knowledge"):
+            if _tn not in (
+                "get_screen_info",
+                "check_page_health",
+                "query_app_knowledge",
+            ):
                 _tool_name = _tn
                 _args = _last.get("args", {}) or {}
                 _tool_target = _build_tool_target(_tn, _args)
@@ -613,6 +814,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "raw_observation": result,
             "screenshot_path": "",
             "anomaly": None,
+            "loop_detected": bool(loop_meta.get("loop_detected")),
+            "loop_pattern": str(loop_meta.get("loop_pattern", "")),
+            "loop_break_action": str(loop_meta.get("loop_break_action", "")),
         }
     ]
     um: list[Any] = list(state.get("messages", []))
@@ -643,6 +847,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                     f"验证条件: {verify_hint}\n"
                     "如果页面状态已满足验证条件，请立即输出 DONE: 描述结果。"
                 )
+                post_check, violated = _clip_to_token_budget(post_check, 120)
+                if violated:
+                    budget_violation_count += 1
                 um.append(HumanMessage(content=post_check))
             except Exception:
                 logger.warning("Post-action perceive failed", exc_info=True)
@@ -658,6 +865,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                     "[系统提醒] 你已连续 3 次执行相同的操作，页面可能没有变化。"
                     "请立即调 get_screen_info 检查当前状态，如果目标已达成则 DONE。"
                 )
+                dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
+                if violated:
+                    budget_violation_count += 1
                 um.append(HumanMessage(content=dup_warning))
                 logger.warning(
                     "Agent duplicate action detected, injecting reminder. Recent: %s",
@@ -669,6 +879,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                     "[系统提醒] 检测到可能的循环模式。"
                     "如果目标已达成，请直接输出 DONE，不要再操作。"
                 )
+                dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
+                if violated:
+                    budget_violation_count += 1
                 um.append(HumanMessage(content=dup_warning))
 
     # Phase 1.4: 裁剪时保留 system prompt + 带 Goal 的消息 + 最近消息
@@ -681,9 +894,16 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "messages": um,
                 "status": "success" if done else "fail",
                 "conclusion": result.strip(),
+                "budget_violation_count": budget_violation_count,
             }
         )
-    return Command(update={"step_history": nh, "messages": um})
+    return Command(
+        update={
+            "step_history": nh,
+            "messages": um,
+            "budget_violation_count": budget_violation_count,
+        }
+    )
 
 
 def _determine_execution_status(state: dict) -> str:
@@ -711,7 +931,7 @@ def _determine_execution_status(state: dict) -> str:
 def _collect_verification_results(goal: dict) -> tuple[str, list]:
     """从 ToolContext._verifications 收集 assert_verification 的结构化结果。"""
     ctx = get_tool_context()
-    assertions = getattr(ctx, '_verifications', []) if ctx else []
+    assertions = getattr(ctx, "_verifications", []) if ctx else []
 
     if not assertions:
         verification_items = goal.get("verification", [])
@@ -776,15 +996,21 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     # ── 双维度结果判定 ──
     execution_status = _determine_execution_status(state)
     test_verdict, verification_results = _collect_verification_results(goal)
+    budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
     if execution_status not in ("completed",):
         test_verdict = "inconclusive"
         verification_results = []
     # 向后兼容 status
-    status = "success" if (execution_status == "completed" and test_verdict == "passed") else status
+    status = (
+        "success"
+        if (execution_status == "completed" and test_verdict == "passed")
+        else status
+    )
 
     if _relational_db:
         try:
             from agents.orchestrator import _build_display_steps
+
             dd = _build_display_steps(history)
             _relational_db.record_test_run(
                 run_id=config.get("configurable", {}).get("thread_id", ""),
@@ -803,12 +1029,14 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             pass
 
     logger.info(
-        "Reporter: exec=%s verdict=%s steps(success=%d fail=%d continue=%d) duration=%.1fs conclusion=%s",
-        execution_status, test_verdict,
+        "Reporter: exec=%s verdict=%s steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d conclusion=%s",
+        execution_status,
+        test_verdict,
         pc,
         fc,
         cc,
         duration,
+        budget_violation_count,
         str(conclusion)[:120],
     )
     return Command(
@@ -819,6 +1047,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             "execution_status": execution_status,
             "test_verdict": test_verdict,
             "verification_results": verification_results,
+            "budget_violation_count": budget_violation_count,
         }
     )
 

@@ -9,17 +9,20 @@ logger = logging.getLogger(__name__)
 
 _CAP_STATE = "unknown"  # unknown | supported | unsupported
 _CAP_ERROR = ""
+_CAP_FAIL_STREAK = 0
 _CAP_LOCK = Lock()
 _CLIENT_CACHE_LOCK = Lock()
 _OPENAI_CLIENTS: dict[tuple[str, str, str, int], Any] = {}
 _ZHIPU_CLIENTS: dict[tuple[str, str, int], Any] = {}
+_FAIL_STREAK_UNSUPPORTED_THRESHOLD = 2
 
 
 def reset_vision_capability_state() -> None:
-    global _CAP_STATE, _CAP_ERROR
+    global _CAP_STATE, _CAP_ERROR, _CAP_FAIL_STREAK
     with _CAP_LOCK:
         _CAP_STATE = "unknown"
         _CAP_ERROR = ""
+        _CAP_FAIL_STREAK = 0
 
 
 def _mk_result(
@@ -44,8 +47,30 @@ def _mk_result(
     }
 
 
-def _is_unsupported_error(message: str) -> bool:
+def _is_payload_format_error(message: str) -> bool:
     msg = (message or "").lower()
+    keys = (
+        "unknown variant",
+        "image_url",
+        "expected 'text'",
+        'expected "text"',
+        "failed to deserialize the json body",
+        "invalid_request_error",
+        "400",
+        "bad request",
+    )
+    return any(k in msg for k in keys)
+
+
+def _is_unsupported_error(
+    message: str,
+    provider: str | None = None,
+    model: str | None = None,
+) -> bool:
+    msg = (message or "").lower()
+    name = (provider or "").lower()
+    model_name = (model or "").lower()
+
     keys = (
         "does not support images",
         "image input is not supported",
@@ -53,8 +78,28 @@ def _is_unsupported_error(message: str) -> bool:
         "unsupported image",
         "unsupported content type",
         "invalid image",
+        "unknown variant",
+        "expected 'text'",
+        'expected "text"',
+        "failed to deserialize the json body",
     )
+    # Provider/model specific signatures for OpenAI-compatible backends (e.g. DeepSeek).
+    if "deepseek" in model_name or "deepseek" in msg:
+        keys = keys + ("image_url", "unknown variant 'image_url'")
+    if name == "zhipu":
+        keys = keys + ("unknown variant 'image_url'",)
     return any(k in msg for k in keys)
+
+
+def _record_probe_failure(message: str) -> tuple[int, bool]:
+    global _CAP_FAIL_STREAK
+    with _CAP_LOCK:
+        if _is_payload_format_error(message):
+            _CAP_FAIL_STREAK += 1
+        else:
+            _CAP_FAIL_STREAK = 0
+        streak = _CAP_FAIL_STREAK
+    return streak, streak >= _FAIL_STREAK_UNSUPPORTED_THRESHOLD
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
@@ -186,9 +231,10 @@ def multimodal_vision_call(
     model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
+    vision_enabled: bool = True,
     timeout_sec: int = 12,
 ) -> dict[str, Any]:
-    global _CAP_STATE, _CAP_ERROR
+    global _CAP_STATE, _CAP_ERROR, _CAP_FAIL_STREAK
 
     with _CAP_LOCK:
         cap_state = _CAP_STATE
@@ -202,6 +248,19 @@ def multimodal_vision_call(
             cap_state,
             reason="missing llm credentials",
             error="missing llm credentials",
+        )
+
+    if not vision_enabled:
+        disable_msg = "vision disabled by config (vision_enabled=false)"
+        with _CAP_LOCK:
+            _CAP_STATE = "unsupported"
+            _CAP_ERROR = disable_msg
+            _CAP_FAIL_STREAK = 0
+        return _mk_result(
+            False,
+            "unsupported",
+            reason="vision disabled by config",
+            error=disable_msg,
         )
 
     # unsupported 时快速回退，避免反复调用
@@ -234,13 +293,15 @@ def multimodal_vision_call(
             with _CAP_LOCK:
                 _CAP_STATE = "supported"
                 _CAP_ERROR = ""
+                _CAP_FAIL_STREAK = 0
                 cap_state = _CAP_STATE
         except Exception as exc:
             msg = str(exc)
-            if _is_unsupported_error(msg):
+            if _is_unsupported_error(msg, provider, model):
                 with _CAP_LOCK:
                     _CAP_STATE = "unsupported"
                     _CAP_ERROR = msg
+                    _CAP_FAIL_STREAK = 0
                     cap_state = _CAP_STATE
                 logger.warning("Multimodal unsupported: %s", msg)
                 return _mk_result(
@@ -249,6 +310,28 @@ def multimodal_vision_call(
                     reason="model does not support vision",
                     error=msg,
                 )
+
+            streak, should_mark_unsupported = _record_probe_failure(msg)
+            if should_mark_unsupported:
+                with _CAP_LOCK:
+                    _CAP_STATE = "unsupported"
+                    _CAP_ERROR = msg
+                    _CAP_FAIL_STREAK = 0
+                    cap_state = _CAP_STATE
+                logger.warning(
+                    "Multimodal marked unsupported by repeated probe failures: %s",
+                    msg,
+                )
+                return _mk_result(
+                    False,
+                    "unsupported",
+                    reason=(
+                        "model likely does not support vision "
+                        f"(repeated payload failures={streak})"
+                    ),
+                    error=msg,
+                )
+
             # 网络/限流等临时问题，不标记 unsupported
             with _CAP_LOCK:
                 _CAP_STATE = "unknown"
@@ -294,11 +377,29 @@ def multimodal_vision_call(
         )
     except Exception as exc:
         msg = str(exc)
-        if _is_unsupported_error(msg):
+        if _is_unsupported_error(msg, provider, model):
             with _CAP_LOCK:
                 _CAP_STATE = "unsupported"
                 _CAP_ERROR = msg
+                _CAP_FAIL_STREAK = 0
             return _mk_result(
                 False, "unsupported", reason="model does not support vision", error=msg
             )
+
+        streak, should_mark_unsupported = _record_probe_failure(msg)
+        if should_mark_unsupported:
+            with _CAP_LOCK:
+                _CAP_STATE = "unsupported"
+                _CAP_ERROR = msg
+                _CAP_FAIL_STREAK = 0
+            return _mk_result(
+                False,
+                "unsupported",
+                reason=(
+                    "model likely does not support vision "
+                    f"(repeated payload failures={streak})"
+                ),
+                error=msg,
+            )
+
         return _mk_result(False, cap_state, reason="vision call failed", error=msg)

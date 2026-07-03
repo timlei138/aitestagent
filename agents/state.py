@@ -4,10 +4,10 @@ from typing import Any, TypedDict
 
 from pydantic import BaseModel, Field
 
-
 # ═══════════════════════════════════════════
 #  Planner 结构化输出
 # ═══════════════════════════════════════════
+
 
 class TestGoalOutput(BaseModel):
     goal: str = ""
@@ -22,6 +22,7 @@ class TestGoalOutput(BaseModel):
 #  Graph state
 # ═══════════════════════════════════════════
 
+
 class TestState(TypedDict, total=False):
     user_request: str
     app_package: str
@@ -34,6 +35,9 @@ class TestState(TypedDict, total=False):
     started_at: str
     step_times: list[dict[str, Any]]
     # V2: 双维度结果
-    execution_status: str       # completed / exhausted / error / cancelled / device_offline
-    test_verdict: str           # passed / failed / inconclusive
-    verification_results: list  # [{"item": "...", "result": "passed|failed|unknown", "screenshot": ""}]
+    execution_status: str  # completed / exhausted / error / cancelled / device_offline
+    test_verdict: str  # passed / failed / inconclusive
+    verification_results: (
+        list  # [{"item": "...", "result": "passed|failed|unknown", "screenshot": ""}]
+    )
+    budget_violation_count: int  # P0.4: token budget violations in current run
