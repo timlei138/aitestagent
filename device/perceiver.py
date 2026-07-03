@@ -89,12 +89,14 @@ class SmartPerceiver:
         self,
         device,
         vision_call: Callable[[str, str, str, bool], dict[str, Any]] | None = None,
+        screenshot_sink: Callable[[str], None] | None = None,
         mode: str = PerceptionMode.HYBRID,
         auto_switch: bool = True,
         stuck_threshold: int = 2,
     ):
         self.device = device
         self._vision_call = vision_call
+        self._screenshot_sink = screenshot_sink
         self.mode = mode
         self.auto_switch = auto_switch
         self.stuck_threshold = stuck_threshold
@@ -138,11 +140,8 @@ class SmartPerceiver:
                 )
                 with open(_shot_path, "wb") as _f:
                     _f.write(base64.b64decode(snapshot.image_base64))
-                from tools import get_tool_context as _gtc
-
-                _ctx = _gtc()
-                if _ctx is not None:
-                    _ctx._last_screenshot_path = _shot_path
+                if self._screenshot_sink is not None:
+                    self._screenshot_sink(_shot_path)
         except Exception:
             pass
         understanding = self._heuristic_understand(
@@ -153,10 +152,12 @@ class SmartPerceiver:
             width=snapshot.width,
             height=snapshot.height,
         )
-        should_use_vision = (
-            self.mode == PerceptionMode.HYBRID
-            and (force_vision or self._stuck_count >= self.stuck_threshold)
-            and self._vision_call is not None
+        should_use_vision = self._vision_call is not None and (
+            force_vision
+            or (
+                self.mode == PerceptionMode.HYBRID
+                and self._stuck_count >= self.stuck_threshold
+            )
         )
         if should_use_vision:
             indexed_elements = understanding.primary_paths[:20]

@@ -44,6 +44,7 @@ ws_manager = WebSocketManager()
 _device: DeviceController | None = None
 _perceiver: SmartPerceiver | None = None
 _kb: KnowledgeBase | None = None
+_ctx: ToolContext | None = None
 
 
 def _build_vision_call(cfg: TestConfig):
@@ -63,6 +64,42 @@ def _build_vision_call(cfg: TestConfig):
     return _vision_call
 
 
+def _bind_last_screenshot_path(path: str) -> None:
+    global _ctx
+    if _ctx is not None:
+        _ctx._last_screenshot_path = path
+
+
+def rebuild_perceiver() -> dict:
+    """仅按当前配置重建 perceiver/context，不主动重连设备。"""
+    global _perceiver
+
+    if _device is None:
+        _perceiver = None
+        _rebuild_tool_context()
+        return {"rebuilt": False, "detail": "device offline"}
+
+    try:
+        reset_vision_capability_state()
+        mode, auto_switch = resolve_perception_mode(config)
+        _perceiver = SmartPerceiver(
+            _device,
+            vision_call=_build_vision_call(config),
+            screenshot_sink=_bind_last_screenshot_path,
+            mode=mode,
+            auto_switch=auto_switch,
+        )
+        logging.getLogger(__name__).info(
+            "SmartPerceiver rebuilt (mode=%s)", _perceiver.mode
+        )
+    except Exception as exc:
+        _perceiver = None
+        logging.getLogger(__name__).warning("SmartPerceiver rebuild failed: %s", exc)
+
+    _rebuild_tool_context()
+    return {"rebuilt": _perceiver is not None, "detail": "ok"}
+
+
 # 1) 设备连接
 try:
     _device = DeviceController()
@@ -78,6 +115,7 @@ if _device is not None:
         _perceiver = SmartPerceiver(
             _device,
             vision_call=_build_vision_call(config),
+            screenshot_sink=_bind_last_screenshot_path,
             mode=mode,
             auto_switch=auto_switch,
         )
@@ -144,6 +182,7 @@ def reconnect_device() -> dict:
         _perceiver = SmartPerceiver(
             _device,
             vision_call=_build_vision_call(config),
+            screenshot_sink=_bind_last_screenshot_path,
             mode=mode,
             auto_switch=auto_switch,
         )

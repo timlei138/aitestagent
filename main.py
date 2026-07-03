@@ -63,6 +63,7 @@ def _init_tool_context(config: TestConfig) -> None:
         device = DeviceController()
         reset_vision_capability_state()
         mode, auto_switch = resolve_perception_mode(config)
+        ctx_holder: dict[str, ToolContext | None] = {"ctx": None}
 
         def _vision_call(
             prompt: str, image_base64: str, purpose: str, strict_json: bool
@@ -79,8 +80,16 @@ def _init_tool_context(config: TestConfig) -> None:
                 timeout_sec=12,
             )
 
+        def _screenshot_sink(path: str) -> None:
+            if ctx_holder["ctx"] is not None:
+                ctx_holder["ctx"]._last_screenshot_path = path
+
         perceiver = SmartPerceiver(
-            device, vision_call=_vision_call, mode=mode, auto_switch=auto_switch
+            device,
+            vision_call=_vision_call,
+            screenshot_sink=_screenshot_sink,
+            mode=mode,
+            auto_switch=auto_switch,
         )
         kb = KnowledgeBase(create_vector_store(config))
         ctx = ToolContext(
@@ -93,6 +102,7 @@ def _init_tool_context(config: TestConfig) -> None:
             llm_api_key=config.api_key,
             llm_base_url=config.base_url,
         )
+        ctx_holder["ctx"] = ctx
         set_tool_context(ctx)
     except DeviceUnavailableError:
         logging.warning("设备不可用，部分功能受限")

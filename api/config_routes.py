@@ -109,9 +109,9 @@ async def update_config(req: ConfigUpdateRequest):
     # 热更新 perceiver
     if need_rebuild_perceiver:
         try:
-            from api.server import reconnect_device
+            from api.server import rebuild_perceiver
 
-            reconnect_device()
+            rebuild_perceiver()
             logger.info("Perceiver rebuilt after config change")
         except Exception as exc:
             logger.warning("Failed to rebuild perceiver: %s", exc)
