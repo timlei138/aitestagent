@@ -10,3 +10,4 @@ embedding_base_url: ''
 perception_mode: ui_tree
 rag_persist_dir: storage/knowledge
 safety_level: strict
+vision_enabled: false
