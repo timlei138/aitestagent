@@ -48,6 +48,34 @@ def set_ws_emit_callback(callback) -> None:
 
 _SKIP_EMIT = {"get_screen_info", "check_page_health", "query_app_knowledge"}
 
+_SCREENSHOT_ACTIONS = {
+    "click",
+    "long_press",
+    "scroll_find_and_click",
+    "launch_app",
+    "assert_verification",
+    "swipe",
+}
+
+
+def _take_step_screenshot(ctx, run_id: str, tool_seq: int) -> str:
+    """截取当前屏幕，返回相对路径。
+    路径格式：storage/screenshots/{safe_run_id}/{tool_seq}_{ts}.png
+    """
+    from datetime import datetime as _dt
+
+    # 路径安全清洗：只保留 [a-zA-Z0-9_-]
+    safe_run_id = re.sub(r"[^\w\-]", "_", run_id)
+    if not safe_run_id:
+        safe_run_id = "unknown"
+    shot_dir = os.path.join("storage", "screenshots", safe_run_id)
+    os.makedirs(shot_dir, exist_ok=True)
+    ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = os.path.join(shot_dir, f"{tool_seq}_{ts}.png")
+    img = ctx.device.screenshot()  # 返回 PIL Image（无参）
+    img.save(path)
+    return path
+
 
 # ═══ Prompt ═══
 
@@ -116,10 +144,34 @@ class _SubState(_TD):
     _recent_call_sigs: list[str]
     _loop_break_reason: str
     _no_progress_count: int
+    _no_progress_warned: bool
+    _tool_calls_log: list
+    _run_id: str
 
 
 _LOOP_BREAK_CONSECUTIVE = 3
-_NO_PROGRESS_LIMIT = 8
+_NO_PROGRESS_LIMIT = 16
+_NO_PROGRESS_ACTIONS = {
+    "click",
+    "navigate_to",
+    "scroll_find_and_click",
+    "long_press",
+    "copy",
+    "scroll_panel",
+    "type_input",
+    "press_key",
+    "paste",
+    "swipe",
+    "open_notification",
+    "open_quick_settings",
+    "unlock_screen",
+    "set_orientation",
+    "toggle_auto_rotate",
+    "launch_app",
+    "dismiss_popup",
+    "wait_seconds",
+    "recover_from_anomaly",
+}
 
 
 def _estimate_tokens(text: str) -> int:
@@ -176,7 +228,14 @@ def _build_call_signature(name: str, args: dict, page_sig: str) -> str:
 
 
 def _run_agent(
-    messages, tools, provider, model, api_key, base_url, max_turns=20
+    messages,
+    tools,
+    provider,
+    model,
+    api_key,
+    base_url,
+    max_turns=20,
+    run_id: str = "",
 ) -> tuple[str, list, dict[str, Any]]:
     try:
         _ctx = get_tool_context()  # 捕获当前 ToolContext 供子图事件发射使用
@@ -257,6 +316,8 @@ def _run_agent(
         recent = list(s.get("_recent_call_sigs", []))
         loop_break_reason = s.get("_loop_break_reason", "")
         no_progress_count = int(s.get("_no_progress_count", 0) or 0)
+        no_progress_warned = bool(s.get("_no_progress_warned", False))
+        _current_log = list(s.get("_tool_calls_log", []))
         page_sig_once = _build_page_signature(_ctx)
         for tc in last_ai.tool_calls or []:
             name = tc["name"]
@@ -303,20 +364,45 @@ def _run_agent(
                     _ctx._ws_emit("tool_end", {"name": name, "output": output[:200]})
                 except Exception:
                     pass
+            # 截图：仅关键操作
+            _screenshot_path = ""
+            if name in _SCREENSHOT_ACTIONS and _ctx and _ctx.device:
+                try:
+                    _run_id = s.get("_run_id", "unknown")
+                    _tool_seq = len(_current_log) + 1
+                    _screenshot_path = _take_step_screenshot(_ctx, _run_id, _tool_seq)
+                except Exception as e:
+                    logger.warning("Step screenshot failed for %s: %s", name, e)
+                    _screenshot_path = ""
             outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
 
             # 最小断路器：连续 N 次未进行 assert_verification 判定为空转。
             if name == "assert_verification":
                 no_progress_count = 0
+                no_progress_warned = False
             else:
-                no_progress_count += 1
-                if no_progress_count >= _NO_PROGRESS_LIMIT:
-                    loop_break_reason = (
-                        "NO_PROGRESS: no assert_verification "
-                        f"for {_NO_PROGRESS_LIMIT} tool calls"
-                    )
-                    logger.warning(loop_break_reason)
-                    break
+                if name in _NO_PROGRESS_ACTIONS:
+                    no_progress_count += 1
+                    if no_progress_count >= _NO_PROGRESS_LIMIT:
+                        if not no_progress_warned:
+                            no_progress_warned = True
+                            no_progress_count = 0
+                            outputs.append(
+                                SystemMessage(
+                                    content=(
+                                        "NO_PROGRESS_WARNING: 连续动作未提交验证结果。"
+                                        "请立即调用 assert_verification(condition, result)"
+                                        " 上报当前可验证项；无法确认时上报 failed。"
+                                    )
+                                )
+                            )
+                        else:
+                            loop_break_reason = (
+                                "NO_PROGRESS: no assert_verification "
+                                f"for {_NO_PROGRESS_LIMIT} action tool calls"
+                            )
+                            logger.warning(loop_break_reason)
+                            break
 
             # 内层循环断路器：连续 N 次相同 tool+args+page_signature 立即终止。
             if name not in (
@@ -338,11 +424,25 @@ def _run_agent(
                     )
                     logger.warning(loop_break_reason)
                     break
+            # 实时记录工具调用日志（过滤感知类，不去重）
+            if name not in _SKIP_EMIT:
+                _current_log.append(
+                    {
+                        "name": name,
+                        "target": _build_tool_target(name, args),
+                        "observation": output[:200],
+                        "screenshot_path": _screenshot_path,
+                        "tool_seq": len(_current_log),
+                    }
+                )
+
         return {
             "messages": outputs,
             "_recent_call_sigs": recent,
             "_loop_break_reason": loop_break_reason,
             "_no_progress_count": no_progress_count,
+            "_no_progress_warned": no_progress_warned,
+            "_tool_calls_log": _current_log,
         }
 
     def _inc(s: _SubState) -> dict:
@@ -370,29 +470,16 @@ def _run_agent(
             "_recent_call_sigs": [],
             "_loop_break_reason": "",
             "_no_progress_count": 0,
+            "_no_progress_warned": False,
+            "_tool_calls_log": [],
+            "_run_id": run_id,
         }
     )
     turn_count = result.get("_turn_count", 0)
     loop_break_reason = result.get("_loop_break_reason", "")
 
-    # 提取内部工具调用信息（供报告展示用）
-    _tool_calls_log = []
-    for m in result["messages"]:
-        tcs = getattr(m, "tool_calls", None) or []
-        for tc in tcs:
-            name = tc.get("name", "")
-            if name not in (
-                "get_screen_info",
-                "check_page_health",
-                "query_app_knowledge",
-            ):
-                args = tc.get("args", {}) or {}
-                _tool_calls_log.append(
-                    {
-                        "name": name,
-                        "target": _build_tool_target(name, args),
-                    }
-                )
+    # 从子图 state 获取实时工具调用日志（不再事后从 messages 提取）
+    _tool_calls_log = result.get("_tool_calls_log", [])
 
     if loop_break_reason:
         return (
@@ -768,12 +855,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         llm["api_key"],
         llm["base_url"],
         max_turns=_max_turns,
+        run_id=config.get("configurable", {}).get("thread_id", "unknown"),
     )
-    # 累积存入 ToolContext 供 _build_display_steps 使用（多轮 Agent 调用需累加）
-    if ctx:
-        if not hasattr(ctx, "_tool_calls_log"):
-            ctx._tool_calls_log = []
-        ctx._tool_calls_log.extend(tool_calls_log)
+    # 不再写入 ctx._tool_calls_log（避免 rebuild 丢失），改为存入 state
     logger.info("Agent #%d: %s", len(history) + 1, result[:200])
 
     done, abort = _detect_termination(result)
@@ -913,6 +997,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "status": "success" if done else "fail",
                 "conclusion": result.strip(),
                 "budget_violation_count": budget_violation_count,
+                "_tool_calls_log": list(state.get("_tool_calls_log", []))
+                + tool_calls_log,
             }
         )
     return Command(
@@ -920,6 +1006,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "step_history": nh,
             "messages": um,
             "budget_violation_count": budget_violation_count,
+            "_tool_calls_log": list(state.get("_tool_calls_log", [])) + tool_calls_log,
         }
     )
 
@@ -991,10 +1078,8 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         except:
             pass
 
-    # Count: success = "success", fail = "fail" only (not "continue")
-    pc = sum(1 for s in history if s.get("status") == "success")
-    fc = sum(1 for s in history if s.get("status") == "fail")
-    cc = sum(1 for s in history if s.get("status") == "continue")
+    # dd 初始化（后面 try 块内会覆盖）
+    dd = history
 
     # 失败/截断时，补充已完成的中间步骤摘要到 conclusion
     if status == "fail" and history:
@@ -1029,7 +1114,8 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         try:
             from agents.orchestrator import _build_display_steps
 
-            dd = _build_display_steps(history)
+            tool_log = state.get("_tool_calls_log", [])
+            dd = _build_display_steps(history, tool_log)
             _relational_db.record_test_run(
                 run_id=config.get("configurable", {}).get("thread_id", ""),
                 user_request=state.get("user_request", ""),
@@ -1046,10 +1132,15 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         except:
             pass
 
+    # 统计统一基于 dd（实际展示步骤）
+    pc = sum(1 for s in dd if s.get("status") in ("success", "continue"))
+    fc = sum(1 for s in dd if s.get("status") == "fail")
+    cc = sum(1 for s in dd if s.get("status") == "continue")
     logger.info(
-        "Reporter: exec=%s verdict=%s steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d conclusion=%s",
+        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d conclusion=%s",
         execution_status,
         test_verdict,
+        len(dd),
         pc,
         fc,
         cc,

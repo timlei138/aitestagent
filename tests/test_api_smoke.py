@@ -1,7 +1,9 @@
 from fastapi.testclient import TestClient
 from pathlib import Path
+import json
+import uuid
 
-from api.server import app
+from api.server import app, _get_relational_db, BASE_DIR
 
 client = TestClient(app)
 
@@ -40,3 +42,58 @@ def test_reports_list_endpoint():
     data = response.json()
     assert data["status"] == "success"
     assert isinstance(data["items"], list)
+
+
+def test_report_delete_endpoint_cleans_artifacts():
+    db = _get_relational_db()
+    assert db is not None
+    run_id = f"pytest-delete-{uuid.uuid4().hex[:8]}"
+    shot_rel = f"storage/screenshots/{run_id}/1_test.png"
+    shot_abs = BASE_DIR / shot_rel
+    shot_abs.parent.mkdir(parents=True, exist_ok=True)
+    shot_abs.write_bytes(b"fakepng")
+
+    log_abs = BASE_DIR / "logs" / "runs" / f"000000_{run_id}_langchain.log"
+    log_abs.parent.mkdir(parents=True, exist_ok=True)
+    log_abs.write_text("fake log", encoding="utf-8")
+
+    db.record_test_run(
+        run_id=run_id,
+        user_request="pytest cleanup",
+        app_package="com.demo.app",
+        app_name="demo",
+        status="fail",
+        conclusion="ABORT: pytest",
+        steps=[
+            {
+                "index": 1,
+                "action_type": "click",
+                "status": "fail",
+                "screenshot_path": shot_rel,
+            }
+        ],
+        duration_seconds=1.0,
+        execution_status="error",
+        test_verdict="inconclusive",
+        verification_json=json.dumps(
+            [{"item": "x", "result": "failed", "screenshot": shot_rel}],
+            ensure_ascii=False,
+        ),
+    )
+    db.insert(
+        "human_decisions",
+        {"run_id": run_id, "step_index": 1, "question": "q", "decision": "d", "created_at": "pytest"},
+    )
+
+    response = client.delete(f"/api/reports/{run_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "success"
+
+    assert not shot_abs.exists()
+    assert not log_abs.exists()
+    assert db.get_test_run(run_id) is None
+    left = db.execute(
+        "SELECT COUNT(*) FROM human_decisions WHERE run_id = ?", (run_id,)
+    ).fetchone()[0]
+    assert left == 0

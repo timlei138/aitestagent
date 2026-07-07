@@ -46,6 +46,10 @@
             <span class="rd-step-idx">{{ s.index }}</span>
             <code class="rd-step-action">{{ s.action_type }}</code>
             <span v-if="s.target" class="rd-step-target">→ {{ s.target }}</span>
+            <el-image v-if="s.screenshot_path"
+                      :src="shotUrl(s.screenshot_path, s.index)"
+                      :preview-src-list="[shotUrl(s.screenshot_path, s.index)]"
+                      fit="cover" class="step-shot" title="点击查看大图" />
             <span v-if="s.duration_ms" class="rd-step-time">{{ fmtDuration(s.duration_ms) }}</span>
             <span v-if="s.status === 'fail'" class="rd-step-badge fail">失败</span>
             <span v-if="s.status === 'success'" class="rd-step-badge done">完成</span>
@@ -158,4 +162,7 @@ function shotUrl(path, index) {
 .rd-step-badge.done { background: #bbf7d0; color: #16a34a; }
 .rd-step-pages { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
 .rd-step-obs { font-size: 12px; color: var(--text-secondary); margin-top: 4px; padding: 8px 10px; background: #fff; border-radius: var(--radius-xs); white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow-y: auto; border: 1px solid var(--line-light); }
+
+/* ── 步骤截图 ── */
+.step-shot { width: 40px; height: 30px; border-radius: 4px; cursor: pointer; object-fit: cover; border: 1px solid var(--line); margin-left: 8px; }
 </style>

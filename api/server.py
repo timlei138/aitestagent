@@ -154,6 +154,30 @@ _ctx = ToolContext(
 set_tool_context(_ctx)
 
 
+def _cleanup_old_screenshots(keep_runs: int = 20):
+    """保留最近 N 个 run 的截图目录（按 mtime 排序），删除更早的。"""
+    import os
+    import shutil
+
+    base = os.path.join("storage", "screenshots")
+    if not os.path.isdir(base):
+        return
+    # 只清理符合 run_id 命名规则的目录（必须含连字符，排除纯名称手工目录）
+    _run_dir_re = re.compile(r"^[A-Za-z0-9_\-]*-[A-Za-z0-9_\-]*$")
+    dirs = [
+        (d, os.path.getmtime(os.path.join(base, d)))
+        for d in os.listdir(base)
+        if os.path.isdir(os.path.join(base, d)) and _run_dir_re.match(d)
+    ]
+    dirs.sort(key=lambda x: x[1], reverse=True)
+    for old_dir, _ in dirs[keep_runs:]:
+        shutil.rmtree(os.path.join(base, old_dir), ignore_errors=True)
+
+
+# 启动时清理旧截图
+_cleanup_old_screenshots()
+
+
 def _get_relational_db():
     """获取关系型数据库实例。"""
     from agents.graph import _relational_db
@@ -472,6 +496,86 @@ async def get_report(run_id: str):
         except Exception:
             pass
     return {"status": "error", "message": f"报告不存在: {run_id}"}
+
+
+def _safe_unlink(path: Path) -> bool:
+    try:
+        if path.exists() and path.is_file():
+            path.unlink()
+            return True
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Failed to delete file %s: %s", path, exc)
+    return False
+
+
+@app.delete("/api/reports/{run_id}")
+async def delete_report(run_id: str):
+    db = _get_relational_db()
+    if not db:
+        return {"status": "error", "message": "数据库未初始化"}
+
+    try:
+        report = db.get_test_run(run_id)
+    except Exception:
+        report = None
+    if not report:
+        return {"status": "error", "message": f"报告不存在: {run_id}"}
+
+    deleted_images = 0
+    deleted_logs = 0
+
+    image_paths: set[Path] = set()
+    for step in report.get("steps", []) or []:
+        p = str(step.get("screenshot_path", "") or "").strip()
+        if p:
+            image_paths.add(BASE_DIR / p.replace("/", "\\"))
+    for item in report.get("verification_results", []) or []:
+        p = str(item.get("screenshot", "") or "").strip()
+        if p:
+            image_paths.add(BASE_DIR / p.replace("/", "\\"))
+
+    run_shot_dir = BASE_DIR / "storage" / "screenshots" / run_id
+    if run_shot_dir.exists() and run_shot_dir.is_dir():
+        for f in run_shot_dir.rglob("*"):
+            if f.is_file() and _safe_unlink(f):
+                deleted_images += 1
+        try:
+            run_shot_dir.rmdir()
+        except Exception:
+            pass
+
+    for p in image_paths:
+        try:
+            resolved = p.resolve()
+            if BASE_DIR not in resolved.parents:
+                continue
+        except Exception:
+            continue
+        if _safe_unlink(p):
+            deleted_images += 1
+
+    logs_dir = BASE_DIR / "logs" / "runs"
+    if logs_dir.exists() and logs_dir.is_dir():
+        for lf in logs_dir.glob(f"*{run_id}*langchain.log"):
+            if _safe_unlink(lf):
+                deleted_logs += 1
+
+    deleted_db = False
+    try:
+        deleted_db = db.delete_test_run(run_id)
+    except Exception as exc:
+        return {"status": "error", "message": f"删除数据库记录失败: {exc}"}
+    if not deleted_db:
+        return {"status": "error", "message": f"报告不存在: {run_id}"}
+
+    return {
+        "status": "success",
+        "deleted": {
+            "db_records": 1,
+            "images": deleted_images,
+            "logs": deleted_logs,
+        },
+    }
 
 
 # ── 静态文件 ──

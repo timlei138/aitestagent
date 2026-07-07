@@ -112,6 +112,11 @@
                 </el-tag>
               </template>
             </el-table-column>
+            <el-table-column label="操作" width="90" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" text type="danger" @click.stop="deleteReport(row)">删除</el-button>
+              </template>
+            </el-table-column>
           </el-table>
         </section>
       </el-main>
@@ -830,6 +835,36 @@ async function openReportDetail(row) {
     expandedSteps.value = new Set(failIndices);
   } catch (e) {
     ElMessage.error(`读取失败: ${e}`);
+  }
+}
+
+async function deleteReport(row) {
+  if (!row?.id) return;
+  try {
+    await ElMessageBox.confirm(
+      `确定删除测试报告 "${row.id}"？\n将同时清理关联截图、运行日志和数据库记录。`,
+      "删除确认",
+      { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" }
+    );
+  } catch {
+    return;
+  }
+  try {
+    const res = await fetch(`/api/reports/${encodeURIComponent(row.id)}`, { method: "DELETE" });
+    const data = await res.json();
+    if (!res.ok || data.status !== "success") {
+      ElMessage.error(data.message || "删除失败");
+      return;
+    }
+    if (selectedReport.value && selectedReport.value.id === row.id) {
+      reportDetailVisible.value = false;
+      selectedReport.value = null;
+    }
+    const d = data.deleted || {};
+    ElMessage.success(`删除成功（图片${d.images || 0}，日志${d.logs || 0}）`);
+    await loadReports();
+  } catch (e) {
+    ElMessage.error(`删除失败: ${e}`);
   }
 }
 

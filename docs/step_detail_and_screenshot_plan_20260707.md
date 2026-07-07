@@ -1,5 +1,8 @@
-# 执行步骤细化 + 截图增强计划（2026-07-07 v2）
+# 执行步骤细化 + 截图增强计划（2026-07-07 v6）
 
+> v6 变更：清理白名单放宽为合法目录名、链路分析标注“改造前”。
+> v4 变更：合入第三轮 Review 反馈，明确 run_id 来源与路径清洗、tool_seq 对齐、清理按 mtime 排序、补强验收项。
+> v3 变更：合入第二轮 Review 反馈，补全 `_build_display_steps` 调用点、State 字段初始化、截图目录保证、run_id 归档路径。
 > v2 变更：合入 Review 反馈，修复 ToolContext 重建丢日志、screenshot API、去重冲突、截图清理等问题。
 
 ## 1. 问题描述
@@ -7,7 +10,9 @@
 ### 1.1 报告只有 1 步
 前端测试报告的"执行详情"只显示 1 步（ABORT），但 Agent 实际执行了 8 次工具调用（launch_app、get_screen_info×4、click×3）。
 
-### 1.2 数据链路分析
+### 1.2 数据链路分析（改造前）
+
+> 以下为改造前链路，改造后见 §3。
 
 ```
 _run_agent 内部子图:
@@ -69,6 +74,52 @@ _build_display_steps (orchestrator.py L496):
 
 **文件**：`agents/graph.py`
 
+**前置改动：State 字段补齐**
+
+`_SubState` (L113-118) 和 `TestState` (state.py L26) 都需要增加字段：
+
+```python
+# agents/state.py — TestState
+class TestState(TypedDict, total=False):
+    # ... 现有字段 ...
+    _tool_calls_log: list  # 工具调用实时日志（存入 state，不依赖 ctx）
+
+# agents/graph.py — _SubState
+class _SubState(_TD):
+    messages: Annotated[list, add_messages]
+    _turn_count: int
+    _recent_call_sigs: list[str]
+    _loop_break_reason: str
+    _no_progress_count: int
+    _tool_calls_log: list  # 新增
+    _run_id: str           # 新增（截图目录需要）
+```
+
+**`_run_agent` 入参显式传 run_id**（解决 `_tools_node` 拿不到外层 thread_id 的问题）：
+```python
+# _run_agent 签名增加 run_id
+def _run_agent(messages, tools, ..., run_id: str = "") -> tuple:
+    ...
+    initial_state = {
+        "messages": [HumanMessage(content=human_prompt)],
+        "_turn_count": 0,
+        "_recent_call_sigs": [],
+        "_loop_break_reason": "",
+        "_no_progress_count": 0,
+        "_tool_calls_log": [],  # 新增
+        "_run_id": run_id,      # 新增
+    }
+```
+
+外层 `agent_node` 调用时传入：
+```python
+# TestState 无 thread_id 字段，从 RunnableConfig 取
+thread_id = config.get("configurable", {}).get("thread_id", "unknown")
+result, tool_calls_log, loop_meta = _run_agent(
+    ..., run_id=thread_id
+)
+```
+
 **核心变更**：不再事后从 messages 提取，改为在 `_tools_node` 中实时记录工具调用到 `_SubState`：
 
 ```python
@@ -85,11 +136,9 @@ def _tools_node(s: _SubState) -> dict:
         _screenshot_path = ""
         if name in _SCREENSHOT_ACTIONS and _ctx and _ctx.device:
             try:
-                from datetime import datetime as _dt
-                ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
-                _screenshot_path = f"storage/screenshots/step_{ts}.png"
-                img = _ctx.device.screenshot()  # 返回 PIL Image
-                img.save(_screenshot_path)
+                run_id = s.get("_run_id", "unknown")
+                step_idx = len(_realtime_log) + 1  # tool_seq 序号
+                _screenshot_path = _take_step_screenshot(_ctx, run_id, step_idx)
             except Exception as e:
                 logger.warning("Step screenshot failed for %s: %s", name, e)
                 _screenshot_path = ""
@@ -101,6 +150,7 @@ def _tools_node(s: _SubState) -> dict:
                 "target": _build_tool_target(name, args),
                 "observation": output[:200],
                 "screenshot_path": _screenshot_path,
+                "tool_seq": len(_realtime_log) + 1,  # 工具调用序号（与截图对齐）
             })
         # ... 断路器逻辑 ...
 
@@ -114,8 +164,6 @@ def _tools_node(s: _SubState) -> dict:
 **关键**：`_tool_calls_log` 存入 `_SubState`（graph state），不依赖全局 ToolContext，
 解决 rebuild 导致日志丢失的问题。
 
-需要同时在 `_SubState` 定义中增加 `_tool_calls_log: list` 字段。
-
 ### 3.2 `_build_display_steps` — 丰富字段 + 去掉去重（解决 A+D）
 
 **文件**：`agents/orchestrator.py` L496-552
@@ -124,10 +172,15 @@ def _tools_node(s: _SubState) -> dict:
 1. 传递 `observation` 和 `screenshot_path`
 2. **去掉连续去重 merge**（L510-519），改为保留所有步骤
 3. 从 graph state 获取 `_tool_calls_log`（通过参数传入，不再从全局 ctx 读）
+4. 兼容空参数（保留 `history` 单参签名默认值）
 
 ```python
-def _build_display_steps(history: list, tool_calls_log: list) -> list[dict]:
-    """从工具调用日志生成展示步骤。不再依赖全局 ToolContext。"""
+def _build_display_steps(history: list, tool_calls_log: list | None = None) -> list[dict]:
+    """从工具调用日志生成展示步骤。不再依赖全局 ToolContext。
+    tool_calls_log 为 None 时回退旧行为（兼容调用点未改的场景）。
+    """
+    if tool_calls_log is None:
+        tool_calls_log = []
     # 不再做去重 merge — 每次工具调用都可见
     result = []
     idx = 0
@@ -153,7 +206,13 @@ def _build_display_steps(history: list, tool_calls_log: list) -> list[dict]:
         result.append({**s, "index": idx})
     return result if result else history
 ```
-```
+
+**所有调用点必须同步修改**：
+
+| 调用点 | 文件 | 修改 |
+|--------|------|------|
+| `reporter_node` | `graph.py:L1032` | `dd = _build_display_steps(history, tool_log)` |
+| `_build_result` | `orchestrator.py:L402` | `display_steps = _build_display_steps(state.get("step_history", []), state.get("_tool_calls_log", []))` |
 
 ### 3.3 agent_node → reporter_node — 日志传递链路（解决 B）
 
@@ -181,7 +240,7 @@ fc = sum(1 for s in dd if s.get("status") == "fail")
 logger.info("Reporter: ... display_steps=%d", len(dd))
 ```
 
-需要在 `TestState` 定义中增加 `_tool_calls_log: list` 字段。
+`TestState` 字段已在 §3.1 中补齐。
 
 ### 3.4 前端 ReportDetail.vue — 步骤截图展示
 
@@ -220,20 +279,29 @@ _SCREENSHOT_ACTIONS = {
     "launch_app", "assert_verification", "swipe",
 }
 
-def _take_step_screenshot(ctx) -> str:
-    """截取当前屏幕，返回相对路径（前端可直接访问）。"""
+def _take_step_screenshot(ctx, run_id: str, tool_seq: int) -> str:
+    """截取当前屏幕，返回相对路径（前端可直接访问）。
+    路径格式：storage/screenshots/{safe_run_id}/{tool_seq}_{ts}.png
+    """
+    import os, re
     from datetime import datetime as _dt
+    # 路径安全清洗：只保留 [a-zA-Z0-9_-]
+    safe_run_id = re.sub(r"[^\w\-]", "_", run_id)
+    if not safe_run_id:
+        safe_run_id = "unknown"
+    shot_dir = os.path.join("storage", "screenshots", safe_run_id)
+    os.makedirs(shot_dir, exist_ok=True)  # 确保目录存在
     ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = f"storage/screenshots/step_{ts}.png"
+    path = os.path.join(shot_dir, f"{tool_seq}_{ts}.png")
     img = ctx.device.screenshot()  # 返回 PIL Image（无参）
     img.save(path)
-    return path
+    return path  # 返回相对路径，前端 shotUrl 直接拼接
 ```
 
 **截图失败不影响主流程**：
 ```python
 try:
-    _screenshot_path = _take_step_screenshot(_ctx)
+    _screenshot_path = _take_step_screenshot(_ctx, run_id, tool_seq)
 except Exception as e:
     logger.warning("Step screenshot failed for %s: %s", name, e)
     _screenshot_path = ""
@@ -242,16 +310,27 @@ except Exception as e:
 **清理策略**（在服务启动时执行）：
 ```python
 def _cleanup_old_screenshots(keep_runs: int = 20):
-    """保留最近 N 个 run 的截图，删除更早的。"""
-    import glob, os
-    # 按时间排序，保留最新的
-    files = sorted(glob.glob("storage/screenshots/step_*.png"))
-    if len(files) > keep_runs * 15:  # 每个 run 约 15 张
-        for f in files[:len(files) - keep_runs * 15]:
-            os.remove(f)
+    """保留最近 N 个 run 的截图目录（按 mtime 排序），删除更早的。"""
+    import os, shutil
+    base = os.path.join("storage", "screenshots")
+    if not os.path.isdir(base):
+        return
+    # 只清理符合 run_id 命名规则的目录（合法目录名，排除手工目录）
+    import re
+    _run_dir_re = re.compile(r"^[A-Za-z0-9_\-]+$")
+    dirs = [
+        (d, os.path.getmtime(os.path.join(base, d)))
+        for d in os.listdir(base)
+        if os.path.isdir(os.path.join(base, d)) and _run_dir_re.match(d)
+    ]
+    dirs.sort(key=lambda x: x[1], reverse=True)
+    for old_dir, _ in dirs[keep_runs:]:
+        shutil.rmtree(os.path.join(base, old_dir), ignore_errors=True)
 ```
 
-**截图路径统一为相对路径**（`storage/screenshots/...`），前端 `shotUrl` 可直接拼接访问。
+截图路径统一为 `storage/screenshots/{safe_run_id}/{tool_seq}_{ts}.png` 结构，
+按 run 目录 mtime 排序清理，逻辑更稳、可追踪。
+前端 `shotUrl` 可直接拼接访问。
 
 预估性能影响：
 - 每次截图 ~200ms（`device.screenshot()` + `img.save()`）
@@ -262,28 +341,37 @@ def _cleanup_old_screenshots(keep_runs: int = 20):
 
 | 文件 | 操作 | 行数变化 |
 |------|------|--------|
-| `agents/graph.py` | `_SubState` 增加 `_tool_calls_log` 字段 | +3行 |
+| `agents/state.py` | `TestState` 增加 `_tool_calls_log` 字段 | +2行 |
+| `agents/graph.py` | `_SubState` 增加 `_tool_calls_log` 字段 | +1行 |
 | `agents/graph.py` | `_tools_node` 实时记录 + 截图 | +35行 |
-| `agents/graph.py` | `_run_agent` 返回改用实时日志 | -15行 / +5行 |
-| `agents/graph.py` | `TestState` 增加 `_tool_calls_log` 字段 | +2行 |
+| `agents/graph.py` | `_run_agent` 初始 state + 返回改用实时日志 | -15行 / +8行 |
 | `agents/graph.py` | `agent_node` 写入 state | ~5行 |
 | `agents/graph.py` | `reporter_node` 统计修正 | ~8行 |
 | `agents/orchestrator.py` | `_build_display_steps` 参数化 + 去 merge | -10行 / +15行 |
+| `agents/orchestrator.py` | `_build_result` 调用点传 `tool_calls_log` | ~2行 |
 | `api/server.py` | 启动时 `_cleanup_old_screenshots` | +10行 |
 | `frontend/.../ReportDetail.vue` | 步骤截图展示 | +10行 |
-| **合计** | | **+88行净增** |
+| **合计** | | **+91行净增** |
 
 ## 5. 验收标准
 
+### 前端可见性
 - [ ] 报告"执行详情"显示所有工具调用步骤（≥4 步）
 - [ ] 每步显示 observation（工具输出摘要）
 - [ ] 关键操作（click/launch_app）步骤有截图缩略图
 - [ ] 截图可点击放大预览
 - [ ] 总耗时增加 <5%（截图开销）
-- [ ] Reporter 日志 display_steps 数与实际展示步骤数一致
+
+### 数据一致性
+- [ ] Reporter 日志 display_steps 数与 DB `total_steps` 一致
+- [ ] `test_runs.steps_json` 步骤数 > 1
+- [ ] 至少一条 `screenshot_path` 文件真实存在（`os.path.exists` 验证）
+
+### 健壮性
 - [ ] ToolContext rebuild 后日志不丢失（`_tool_calls_log` 在 state 中）
 - [ ] 截图失败时打 warning 而非静默吞掉
-- [ ] 旧截图按保留策略清理（最近 20 run）
+- [ ] run_id 经路径安全清洗（无非法字符）
+- [ ] 旧截图按 mtime 保留最近 20 run 目录
 
 ## 6. 回滚方案
 
@@ -292,10 +380,28 @@ def _cleanup_old_screenshots(keep_runs: int = 20):
 
 ## 7. Review 问题修复清单
 
+### 第一轮（5 个问题）
 | # | 问题 | 解决位置 | 方案 |
 |---|------|---------|------|
 | A | 步骤字段稀疏 | §3.1 + §3.2 | 实时记录 observation，传递到 display steps |
 | B | ToolContext rebuild 丢日志 | §3.1 + §3.3 | 日志存入 graph state（`_tool_calls_log` 字段），不依赖全局 ctx |
 | C | screenshot() 无参 | §3.5 | `img = device.screenshot(); img.save(path)` |
 | D | 去重 merge 折叠步骤 | §3.2 | 去掉 merge 逻辑，保留所有步骤 |
-| E | 截图无清理 | §3.5 | 服务启动时按时间清理旧文件 |
+| E | 截图无清理 | §3.5 | 服务启动时按 run 目录清理旧文件 |
+
+### 第二轮（4 个问题）
+| # | 问题 | 解决位置 | 方案 |
+|---|------|---------|------|
+| F | `_build_display_steps` 两个调用点 | §3.2 | reporter + `_build_result` 都改为传 `tool_calls_log` |
+| G | State 字段缺失 | §3.1 | `_SubState` + `TestState` 都加 `_tool_calls_log`，`_run_agent` 初始 state 补 `[]` |
+| H | 截图目录不存在 | §3.5 | `os.makedirs(shot_dir, exist_ok=True)` |
+| I | 截图路径平铺不清理 | §3.5 | 改为 `storage/screenshots/{safe_run_id}/{tool_seq}_{ts}.png`，按目录清理 |
+
+### 第三轮（5 个问题）
+| # | 问题 | 解决位置 | 方案 |
+|---|------|---------|------|
+| J | run_id 来源不准确 | §3.1 | 从 `config["configurable"]["thread_id"]` 取（TestState 无该字段），传给 `_run_agent` |
+| K | run_id 路径注入风险 | §3.5 | `re.sub(r"[^\w\-]", "_", run_id)` 清洗为安全目录名 |
+| L | tool_seq 与 display index 错位 | §3.1 + §3.2 | 日志记录 `tool_seq`，截图文件名用 `tool_seq`，前后端用它关联 |
+| M | 验收标准缺强验证 | §5 | 补 DB steps_json > 1、screenshot 文件存在、display_steps 与 total_steps 一致 |
+| N | 清理按名称排序可能删错 | §3.5 | 改为 `os.path.getmtime()` 按目录修改时间排序 |

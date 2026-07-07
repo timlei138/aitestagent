@@ -304,6 +304,19 @@ class SqliteBackend(RelationalBackend):
         d["verification_results"] = verification_results
         return d
 
+    def delete_test_run(self, run_id: str) -> bool:
+        """删除单次测试运行及其关联人工决策记录。"""
+        row = self._conn.execute(
+            "SELECT id FROM test_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if not row:
+            return False
+        self._conn.execute("DELETE FROM human_decisions WHERE run_id = ?", (run_id,))
+        self._conn.execute("DELETE FROM test_runs WHERE id = ?", (run_id,))
+        self._conn.commit()
+        return True
+
     # ── 元素身份 ──
 
     def save_element_identity(

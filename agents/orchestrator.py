@@ -57,8 +57,6 @@ class TestOrchestrator:
         ctx = get_tool_context()
         if ctx and hasattr(ctx, "_verifications"):
             ctx._verifications.clear()
-        if ctx and hasattr(ctx, "_tool_calls_log"):
-            ctx._tool_calls_log.clear()
         if getattr(ctx, "device", None) is None:
             msg = "Android 设备未连接，请检查 USB/ADB 连接后重试"
             self._emit("error", {"message": msg})
@@ -167,8 +165,6 @@ class TestOrchestrator:
         _sctx = _gtc()
         if _sctx and hasattr(_sctx, "_verifications"):
             _sctx._verifications.clear()
-        if _sctx and hasattr(_sctx, "_tool_calls_log"):
-            _sctx._tool_calls_log.clear()
 
         from config import start_run_log
 
@@ -270,8 +266,6 @@ class TestOrchestrator:
         _sctx = _gtc()
         if _sctx and hasattr(_sctx, "_verifications"):
             _sctx._verifications.clear()
-        if _sctx and hasattr(_sctx, "_tool_calls_log"):
-            _sctx._tool_calls_log.clear()
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
@@ -322,8 +316,6 @@ class TestOrchestrator:
         _sctx = _gtc()
         if _sctx and hasattr(_sctx, "_verifications"):
             _sctx._verifications.clear()
-        if _sctx and hasattr(_sctx, "_tool_calls_log"):
-            _sctx._tool_calls_log.clear()
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
@@ -399,7 +391,10 @@ class TestOrchestrator:
     # ── 内部 ──
 
     def _build_result(self, thread_id: str, state: dict) -> dict[str, Any]:
-        display_steps = _build_display_steps(state.get("step_history", []))
+        display_steps = _build_display_steps(
+            state.get("step_history", []),
+            state.get("_tool_calls_log", []),
+        )
         conclusion = state.get("conclusion", "")
         # Command 更新不传播新增 key，从 conclusion 文本推断
         import re
@@ -493,60 +488,33 @@ def _extract_interrupt_info(exc: Exception) -> dict[str, Any]:
     }
 
 
-def _build_display_steps(history: list) -> list[dict]:
-    """从 ToolContext._tool_calls_log 读取工具调用生成展示用细粒度步骤。
-    不影响 graph 路由/去重逻辑，仅用于前端展示。"""
-    from tools import get_tool_context
-
-    ctx = get_tool_context()
-    tool_calls_raw = getattr(ctx, "_tool_calls_log", []) if ctx else []
-
-    # 收集工具调用（已过滤感知类）
-    tool_steps = [
-        {"action_type": t["name"], "target": t.get("target", "")}
-        for t in tool_calls_raw
-    ]
-
-    # 合并连续重复
-    merged = []
-    for ts in tool_steps:
-        if (
-            merged
-            and merged[-1]["action_type"] == ts["action_type"]
-            and merged[-1]["target"] == ts["target"]
-        ):
-            continue
-        merged.append(ts)
-
-    # 构建展示步骤
+def _build_display_steps(history: list, tool_calls_log: list | None = None) -> list[dict]:
+    """从工具调用日志生成展示步骤。不再依赖全局 ToolContext。
+    tool_calls_log 为 None 时回退旧行为（兼容调用点未改的场景）。
+    """
+    if tool_calls_log is None:
+        tool_calls_log = []
+    # 不再做去重 merge — 每次工具调用都可见
     result = []
     idx = 0
-    for ts in merged:
+    for t in tool_calls_log:
         idx += 1
-        result.append(
-            {
-                "index": idx,
-                "intent": (
-                    f"{ts['action_type']}('{ts['target']}')"
-                    if ts["target"]
-                    else ts["action_type"]
-                ),
-                "action_type": ts["action_type"],
-                "target": ts["target"],
-                "page_from": "",
-                "page_to": "",
-                "duration_ms": 0,
-                "status": "continue",
-                "observation": "",
-                "raw_observation": "",
-                "screenshot_path": "",
-                "anomaly": None,
-            }
-        )
-
+        result.append({
+            "index": idx,
+            "intent": f"{t['name']}('{t.get('target', '')}')" if t.get("target") else t["name"],
+            "action_type": t["name"],
+            "target": t.get("target", ""),
+            "page_from": "",
+            "page_to": "",
+            "duration_ms": 0,
+            "status": "continue",
+            "observation": t.get("observation", ""),
+            "raw_observation": t.get("observation", ""),
+            "screenshot_path": t.get("screenshot_path", ""),
+            "anomaly": None,
+        })
     # 追加原始 step_history 中的 Agent 结论步骤
     for s in history:
         idx += 1
         result.append({**s, "index": idx})
-
     return result if result else history

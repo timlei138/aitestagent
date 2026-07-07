@@ -30,6 +30,7 @@ click("A") → click("B") → click("A") → ...
 - 每完成一个 verification 条件，**立刻**调用一次 assert_verification(condition, result) 报告结果，不要全部集中到最后
 - 在调用 assert_verification 前，先确保当前页面就是该验证项的证据页面（避免多项使用同一页面截图）
 - condition 对应 goal.verification 中每一项，result 为 "passed" 或 "failed"
+- 不确定时必须上报 `failed`（可在 detail 说明原因）；禁止不调用 assert_verification 就继续执行
 - 例如：assert_verification("搜索结果显示计算器", "passed")
 - 例如：assert_verification("粘贴内容为不是数字", "failed", "实际粘贴内容为空")
 
