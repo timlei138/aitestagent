@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import logging
 from typing import Any
 
 from data.vector_store import VectorStoreBackend
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,7 +33,7 @@ class KnowledgeBase:
         "curated_rule": ["curated_rule", "app_precondition", "global_knowledge"],
     }
     _EXPERIENCE_LAYER2_MAX_DISTANCE = 1.2
-    _GLOBAL_RULE_MIN_SCORE = 2
+    _GLOBAL_RULE_MIN_SCORE = 3
 
     def __init__(self, backend: VectorStoreBackend):
         self.backend = backend
@@ -240,13 +243,35 @@ class KnowledgeBase:
             content = str(r.get("content", "") or "")
             if not pkg:
                 score = self._global_rule_relevance(content, app_tokens, req_tokens)
+                score_detail = {
+                    "rule_id": meta.get("id", ""),
+                    "score": score,
+                    "min_score": self._GLOBAL_RULE_MIN_SCORE,
+                    "scope": "global",
+                    "app_package": app_package,
+                }
                 applicable = set(
                     str(x).lower() for x in (meta.get("applicable_domains") or [])
                 )
                 if applicable and app_domains and not (app_domains & applicable):
+                    logger.info(
+                        "rule_drop_reason=%s rule_score_detail=%s",
+                        "domain_mismatch",
+                        score_detail,
+                    )
                     continue
                 if score >= self._GLOBAL_RULE_MIN_SCORE:
+                    logger.info(
+                        "rule_score_detail=%s",
+                        {**score_detail, "decision": "keep"},
+                    )
                     global_lines.append((score, f"- {content}"))
+                else:
+                    logger.info(
+                        "rule_drop_reason=%s rule_score_detail=%s",
+                        "score_below_threshold",
+                        {**score_detail, "decision": "drop"},
+                    )
             elif pkg == app_package:
                 app_lines.append(f"- {content}")
             # 其他 app_package 的规则不返回，避免跨 App 泄漏

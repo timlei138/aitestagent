@@ -1,0 +1,141 @@
+diff --git a/agents/graph.py b/agents/graph.py
+index 790fbd7..ecbe7ee 100644
+--- a/agents/graph.py
++++ b/agents/graph.py
+@@ -115,9 +115,11 @@ class _SubState(_TD):
+     _turn_count: int
+     _recent_call_sigs: list[str]
+     _loop_break_reason: str
++    _no_progress_count: int
+ 
+ 
+ _LOOP_BREAK_CONSECUTIVE = 3
++_NO_PROGRESS_LIMIT = 8
+ 
+ 
+ def _estimate_tokens(text: str) -> int:
+@@ -254,6 +256,7 @@ def _run_agent(
+         outputs = []
+         recent = list(s.get("_recent_call_sigs", []))
+         loop_break_reason = s.get("_loop_break_reason", "")
++        no_progress_count = int(s.get("_no_progress_count", 0) or 0)
+         page_sig_once = _build_page_signature(_ctx)
+         for tc in last_ai.tool_calls or []:
+             name = tc["name"]
+@@ -302,6 +305,19 @@ def _run_agent(
+                     pass
+             outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
+ 
++            # 最小断路器：连续 N 次未进行 assert_verification 判定为空转。
++            if name == "assert_verification":
++                no_progress_count = 0
++            else:
++                no_progress_count += 1
++                if no_progress_count >= _NO_PROGRESS_LIMIT:
++                    loop_break_reason = (
++                        "NO_PROGRESS: no assert_verification "
++                        f"for {_NO_PROGRESS_LIMIT} tool calls"
++                    )
++                    logger.warning(loop_break_reason)
++                    break
++
+             # 内层循环断路器：连续 N 次相同 tool+args+page_signature 立即终止。
+             if name not in (
+                 "get_screen_info",
+@@ -326,6 +342,7 @@ def _run_agent(
+             "messages": outputs,
+             "_recent_call_sigs": recent,
+             "_loop_break_reason": loop_break_reason,
++            "_no_progress_count": no_progress_count,
+         }
+ 
+     def _inc(s: _SubState) -> dict:
+@@ -352,6 +369,7 @@ def _run_agent(
+             "_turn_count": 0,
+             "_recent_call_sigs": [],
+             "_loop_break_reason": "",
++            "_no_progress_count": 0,
+         }
+     )
+     turn_count = result.get("_turn_count", 0)
+@@ -734,11 +752,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
+         )
+     )
+ 
+-    # 根据 Goal 复杂度动态计算 max_turns：基础 18 + 每页面 4 + 每验证项 4
++    # 根据 Goal 复杂度动态计算 max_turns：基础 12 + 每页面 7 + 每验证项 6
+     _goal_turns = (
+-        18
+-        + len(goal.get("target_pages", [])) * 10
+-        + len(goal.get("verification", [])) * 10
++        12
++        + len(goal.get("target_pages", [])) * 7
++        + len(goal.get("verification", [])) * 6
+     )
+     _max_turns = min(max(_goal_turns, 10), 200)  # 最少 10，最多 200
+ 
+diff --git a/data/knowledge.py b/data/knowledge.py
+index 1ca71ae..37d70fb 100644
+--- a/data/knowledge.py
++++ b/data/knowledge.py
+@@ -2,11 +2,15 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from datetime import datetime
++import logging
+ from typing import Any
+ 
+ from data.vector_store import VectorStoreBackend
+ 
+ 
++logger = logging.getLogger(__name__)
++
++
+ @dataclass
+ class UIKnowledge:
+     app_package: str
+@@ -30,7 +34,7 @@ class KnowledgeBase:
+         "curated_rule": ["curated_rule", "app_precondition", "global_knowledge"],
+     }
+     _EXPERIENCE_LAYER2_MAX_DISTANCE = 1.2
+-    _GLOBAL_RULE_MIN_SCORE = 2
++    _GLOBAL_RULE_MIN_SCORE = 3
+ 
+     def __init__(self, backend: VectorStoreBackend):
+         self.backend = backend
+@@ -240,13 +244,35 @@ class KnowledgeBase:
+             content = str(r.get("content", "") or "")
+             if not pkg:
+                 score = self._global_rule_relevance(content, app_tokens, req_tokens)
++                score_detail = {
++                    "rule_id": meta.get("id", ""),
++                    "score": score,
++                    "min_score": self._GLOBAL_RULE_MIN_SCORE,
++                    "scope": "global",
++                    "app_package": app_package,
++                }
+                 applicable = set(
+                     str(x).lower() for x in (meta.get("applicable_domains") or [])
+                 )
+                 if applicable and app_domains and not (app_domains & applicable):
++                    logger.info(
++                        "rule_drop_reason=%s rule_score_detail=%s",
++                        "domain_mismatch",
++                        score_detail,
++                    )
+                     continue
+                 if score >= self._GLOBAL_RULE_MIN_SCORE:
++                    logger.info(
++                        "rule_score_detail=%s",
++                        {**score_detail, "decision": "keep"},
++                    )
+                     global_lines.append((score, f"- {content}"))
++                else:
++                    logger.info(
++                        "rule_drop_reason=%s rule_score_detail=%s",
++                        "score_below_threshold",
++                        {**score_detail, "decision": "drop"},
++                    )
+             elif pkg == app_package:
+                 app_lines.append(f"- {content}")
+             # 其他 app_package 的规则不返回，避免跨 App 泄漏

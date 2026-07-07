@@ -115,9 +115,11 @@ class _SubState(_TD):
     _turn_count: int
     _recent_call_sigs: list[str]
     _loop_break_reason: str
+    _no_progress_count: int
 
 
 _LOOP_BREAK_CONSECUTIVE = 3
+_NO_PROGRESS_LIMIT = 8
 
 
 def _estimate_tokens(text: str) -> int:
@@ -254,6 +256,7 @@ def _run_agent(
         outputs = []
         recent = list(s.get("_recent_call_sigs", []))
         loop_break_reason = s.get("_loop_break_reason", "")
+        no_progress_count = int(s.get("_no_progress_count", 0) or 0)
         page_sig_once = _build_page_signature(_ctx)
         for tc in last_ai.tool_calls or []:
             name = tc["name"]
@@ -302,6 +305,19 @@ def _run_agent(
                     pass
             outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
 
+            # 最小断路器：连续 N 次未进行 assert_verification 判定为空转。
+            if name == "assert_verification":
+                no_progress_count = 0
+            else:
+                no_progress_count += 1
+                if no_progress_count >= _NO_PROGRESS_LIMIT:
+                    loop_break_reason = (
+                        "NO_PROGRESS: no assert_verification "
+                        f"for {_NO_PROGRESS_LIMIT} tool calls"
+                    )
+                    logger.warning(loop_break_reason)
+                    break
+
             # 内层循环断路器：连续 N 次相同 tool+args+page_signature 立即终止。
             if name not in (
                 "get_screen_info",
@@ -326,6 +342,7 @@ def _run_agent(
             "messages": outputs,
             "_recent_call_sigs": recent,
             "_loop_break_reason": loop_break_reason,
+            "_no_progress_count": no_progress_count,
         }
 
     def _inc(s: _SubState) -> dict:
@@ -352,6 +369,7 @@ def _run_agent(
             "_turn_count": 0,
             "_recent_call_sigs": [],
             "_loop_break_reason": "",
+            "_no_progress_count": 0,
         }
     )
     turn_count = result.get("_turn_count", 0)
@@ -734,11 +752,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         )
     )
 
-    # 根据 Goal 复杂度动态计算 max_turns：基础 18 + 每页面 4 + 每验证项 4
+    # 根据 Goal 复杂度动态计算 max_turns：基础 12 + 每页面 7 + 每验证项 6
     _goal_turns = (
-        18
-        + len(goal.get("target_pages", [])) * 10
-        + len(goal.get("verification", [])) * 10
+        12
+        + len(goal.get("target_pages", [])) * 7
+        + len(goal.get("verification", [])) * 6
     )
     _max_turns = min(max(_goal_turns, 10), 200)  # 最少 10，最多 200
 
