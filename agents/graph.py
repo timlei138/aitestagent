@@ -436,6 +436,15 @@ def _run_agent(
                     }
                 )
 
+            # report_done: 结构化终止信号，立即终止子图
+            if name == "report_done":
+                _status = (args.get("status", "") or "").lower()
+                _summary = args.get("summary", "") or ""
+                loop_break_reason = (
+                    f"REPORT_{'DONE' if _status == 'done' else 'ABORT'}: {_summary}"
+                )
+                break
+
         return {
             "messages": outputs,
             "_recent_call_sigs": recent,
@@ -482,6 +491,29 @@ def _run_agent(
     _tool_calls_log = result.get("_tool_calls_log", [])
 
     if loop_break_reason:
+        # report_done 结构化终止：提取状态而非当 ABORT 处理
+        if loop_break_reason.startswith("REPORT_DONE:"):
+            _summary = loop_break_reason[len("REPORT_DONE:"):].strip()
+            return (
+                f"DONE: {_summary}",
+                _tool_calls_log,
+                {
+                    "loop_detected": False,
+                    "loop_pattern": "",
+                    "loop_break_action": "report_done",
+                },
+            )
+        if loop_break_reason.startswith("REPORT_ABORT:"):
+            _summary = loop_break_reason[len("REPORT_ABORT:"):].strip()
+            return (
+                f"ABORT: {_summary}",
+                _tool_calls_log,
+                {
+                    "loop_detected": False,
+                    "loop_pattern": "",
+                    "loop_break_action": "report_abort",
+                },
+            )
         return (
             f"ABORT: {loop_break_reason}",
             _tool_calls_log,
@@ -539,9 +571,9 @@ def _run_agent(
     )
 
 
-# Phase 1.2: 锚定行首的 DONE/ABORT 检测（兼容 ##/### Markdown 标题前缀）
+# Phase 1.2: 锚定行首的 DONE/ABORT 检测（兼容 ##/### Markdown 标题 + **/__/bold 前缀）
 _DONE_PATTERN = re.compile(
-    r"^(?:#{1,3}\s*)?(DONE|ABORT)\s*[:：]", re.IGNORECASE | re.MULTILINE
+    r"^(?:#{1,3}\s*)?(?:\*{1,2}|_{1,2})?(DONE|ABORT)\s*[:\uff1a]", re.IGNORECASE | re.MULTILINE
 )
 
 
@@ -861,12 +893,18 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     logger.info("Agent #%d: %s", len(history) + 1, result[:200])
 
     done, abort = _detect_termination(result)
+    # 结构化信号优先：tool call 中的 report_done 已被 _run_agent 转为 "DONE: ..." / "ABORT: ..."
+    # _detect_termination 已覆盖文本兜底，此处仅记录来源
+    _signal_source = "text" if (done or abort) else "none"
+    if loop_meta.get("loop_break_action") in ("report_done", "report_abort"):
+        _signal_source = "tool_call"
     si = len(history) + 1
     st = "success" if done else ("fail" if abort else "continue")
     logger.info(
-        "Agent #%d decision: %s",
+        "Agent #%d decision: %s (source=%s)",
         si,
         "DONE" if done else ("ABORT" if abort else "CONTINUE"),
+        _signal_source,
     )
     # 从 messages 中提取最后一条工具调用的结构化信息
     _tool_name = "agent"
@@ -947,7 +985,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 post_check = (
                     f"\n\n[操作后页面状态]\n当前页面: {time_snapshot}\n"
                     f"验证条件: {verify_hint}\n"
-                    "如果页面状态已满足验证条件，请立即输出 DONE: 描述结果。"
+                    "如果页面状态已满足验证条件，请立即调用 report_done(status=\"done\") 报告结果。"
                 )
                 post_check, violated = _clip_to_token_budget(post_check, 120)
                 if violated:
@@ -965,7 +1003,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             if unique == 1:
                 dup_warning = (
                     "[系统提醒] 你已连续 3 次执行相同的操作，页面可能没有变化。"
-                    "请立即调 get_screen_info 检查当前状态，如果目标已达成则 DONE。"
+                    "请立即调 get_screen_info 检查当前状态，如果目标已达成则调用 report_done(status=\"done\")。"
                 )
                 dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
                 if violated:
@@ -979,7 +1017,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 # 4 步内只有 2 种操作 → 可能在循环
                 dup_warning = (
                     "[系统提醒] 检测到可能的循环模式。"
-                    "如果目标已达成，请直接输出 DONE，不要再操作。"
+                    "如果目标已达成，请直接调用 report_done(status=\"done\") 报告结果。"
                 )
                 dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
                 if violated:

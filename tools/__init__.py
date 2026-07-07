@@ -526,6 +526,69 @@ def _find_best_element(understanding: Any, description: str) -> Any | None:
     return best_el
 
 
+def _promote_to_clickable_parent(best_el: Any, understanding: Any) -> Any | None:
+    """当命中的元素本身不可点击时，提升到包含它的最小可点击父容器。
+
+    通用机制：不依赖特定 label 模式（如时长标签），适用于所有
+    "文本/图标覆盖在可点击容器上"的场景。
+
+    匹配策略：
+    1. best_el 本身 clickable → 无需提升，返回 None
+    2. 在所有元素中查找 bounds 包含 best_el 的可点击元素
+    3. 选面积最小的那个（最贴近的父容器）
+    """
+    if best_el is None or understanding is None:
+        return None
+
+    # 本身可点击 → 无需提升
+    if getattr(best_el, "clickable", False):
+        return None
+
+    bb = getattr(best_el, "bounds", None)
+    if not bb or len(bb) != 4:
+        return None
+
+    all_elements = list(understanding.primary_paths) + [
+        e for e in understanding.elements if e not in understanding.primary_paths
+    ]
+
+    def _contains(parent_bb: tuple, child_bb: tuple) -> bool:
+        return (
+            parent_bb[0] <= child_bb[0]
+            and parent_bb[1] <= child_bb[1]
+            and parent_bb[2] >= child_bb[2]
+            and parent_bb[3] >= child_bb[3]
+        )
+
+    def _area(bounds: tuple) -> int:
+        return max(0, bounds[2] - bounds[0]) * max(0, bounds[3] - bounds[1])
+
+    best_parent = None
+    best_area = float("inf")
+
+    for el in all_elements:
+        if el is best_el or not getattr(el, "clickable", False):
+            continue
+        el_bb = getattr(el, "bounds", None)
+        if not el_bb or len(el_bb) != 4 or el_bb == bb:
+            continue
+        if not _contains(el_bb, bb):
+            continue
+        area = _area(el_bb)
+        if area < best_area:
+            best_area = area
+            best_parent = el
+
+    if best_parent is not None:
+        logger.info(
+            "promote: non-clickable -> clickable parent %r -> %r (rid=%s)",
+            getattr(best_el, "label", ""),
+            getattr(best_parent, "label", ""),
+            getattr(best_parent, "resource_id", ""),
+        )
+    return best_parent
+
+
 def _query_known_identities(description: str) -> list[dict[str, Any]]:
     """查询 SQLite 中已确认的元素身份（设备无关属性: rid/role/region + bounds）。
     通过 ToolContext 获取已有的 DB 实例, 不重复创建连接。
@@ -836,6 +899,10 @@ def click(label: str, alternatives: str = "") -> str:
         return f"{base_result} | {snap}" if snap else base_result
 
     if best_el is not None:
+        promoted = _promote_to_clickable_parent(best_el, understanding)
+        if promoted is not None:
+            best_el = promoted
+
         role = getattr(best_el, "role", "")
         # 开关类控件直接用 bounds 点击（避免 click_text 误点到导航项）
         if role in ("switch", "switch_row"):
@@ -853,6 +920,7 @@ def click(label: str, alternatives: str = "") -> str:
                 result = _format_click_log(matched_label, best_el, strategy="bounds")
             _record_page_transition(ctx, _pre_page, label)
             return _with_snapshot(result)
+
         # 其他可点击元素 — resource_id > text > bounds（rid 唯一稳定，优先）
         if best_el.resource_id and ctx.device.click_resource_id(best_el.resource_id):
             _record_page_transition(ctx, _pre_page, label)
@@ -1689,19 +1757,70 @@ def assert_page_contains(text: str, pattern: bool = False) -> str:
       注意: 传入时需双反斜杠转义
     返回: PASS 或 FAIL: <原因>
     """
+    ctx = get_tool_context()
     info = (
-        get_screen_info.invoke({})
+        get_screen_info.invoke({"mode": "full"})
         if hasattr(get_screen_info, "invoke")
-        else get_screen_info()
+        else get_screen_info(mode="full")
     )
+
+    # 兼容旧行为：没有 perceiver 时仅在 get_screen_info 文本中匹配
+    if ctx.perceiver is None:
+        if pattern:
+            try:
+                if re.search(text, info):
+                    return f"PASS: 页面匹配模式 /{text}/"
+                return f"FAIL: 页面不匹配模式 /{text}/"
+            except re.error as e:
+                return f"FAIL: 正则错误 - {e}"
+        return "PASS" if text in info else f"FAIL: 页面不包含 {text}"
+
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", "", (s or "").lower())
+
+    understanding = ctx.perceiver.perceive()
+    all_elements = list(understanding.primary_paths) + [
+        e for e in understanding.elements if e not in understanding.primary_paths
+    ]
+    element_lines: list[str] = []
+    for el in all_elements:
+        element_lines.append(
+            " | ".join(
+                [
+                    el.label or "",
+                    getattr(el, "associated_label", "") or "",
+                    el.resource_id or "",
+                    el.class_name or "",
+                    getattr(el, "context_path", "") or "",
+                ]
+            )
+        )
+
+    haystack = "\n".join([info] + element_lines)
     if pattern:
         try:
-            if re.search(text, info):
+            if re.search(text, haystack):
                 return f"PASS: 页面匹配模式 /{text}/"
             return f"FAIL: 页面不匹配模式 /{text}/"
         except re.error as e:
             return f"FAIL: 正则错误 - {e}"
-    return "PASS" if text in info else f"FAIL: 页面不包含 {text}"
+
+    needle = text or ""
+    needle_norm = _norm(needle)
+
+    # 1) 原样子串匹配（文本、rid、path）
+    if needle and needle in haystack:
+        return "PASS"
+
+    # 2) 归一化匹配（处理换行/空格/OCR 分段）
+    if needle_norm:
+        if needle_norm in _norm(haystack):
+            return "PASS"
+        for line in element_lines:
+            if needle_norm in _norm(line):
+                return "PASS"
+
+    return f"FAIL: 页面不包含 {text}"
 
 
 @tool
@@ -1794,6 +1913,17 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
     return f"记录完成: {condition} → {result}"
 
 
+@tool
+def report_done(status: str, summary: str = "") -> str:
+    """报告测试完成或无法继续。所有验证完成后必须调用此工具。
+
+    Args:
+        status: "done" 表示所有验证条件已完成，"abort" 表示无法继续执行
+        summary: 简要描述验证结果或无法继续的原因
+    """
+    return f"REPORTED: {status} | {summary}"
+
+
 # ═══════════════════════════════════════════
 #  辅助工具（多个 Agent 共用）
 # ═══════════════════════════════════════════
@@ -1863,6 +1993,7 @@ AGENT_TOOLS: list[Any] = [
     assert_page_contains,
     assert_element_exists,
     assert_verification,
+    report_done,
 ]
 
 # ── 内部辅助 ──
