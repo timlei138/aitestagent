@@ -457,9 +457,9 @@ class SmartPerceiver:
         return PageUnderstanding(
             layout=layout,
             summary=(
-                f"{breadcrumb} — {layout} 页面，识别到 {len(primary)} 个主要路径入口"
+                f"{breadcrumb} — {layout} 页面（结构分区标签，不保证左右方位），识别到 {len(primary)} 个主要路径入口"
                 if breadcrumb
-                else f"{layout} 页面，识别到 {len(primary)} 个主要路径入口"
+                else f"{layout} 页面（结构分区标签，不保证左右方位），识别到 {len(primary)} 个主要路径入口"
             ),
             package=package,
             activity=activity,

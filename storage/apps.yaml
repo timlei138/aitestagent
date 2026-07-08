@@ -22,11 +22,6 @@ apps:
   - 时钟
   - 闹钟
   - clock
-- name: 计算器
-  package: com.android.calculator2
-  keywords:
-  - 计算器
-  - calculator
 - name: 日历
   package: com.android.calendar
   keywords:

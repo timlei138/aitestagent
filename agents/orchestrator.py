@@ -488,7 +488,9 @@ def _extract_interrupt_info(exc: Exception) -> dict[str, Any]:
     }
 
 
-def _build_display_steps(history: list, tool_calls_log: list | None = None) -> list[dict]:
+def _build_display_steps(
+    history: list, tool_calls_log: list | None = None
+) -> list[dict]:
     """从工具调用日志生成展示步骤。不再依赖全局 ToolContext。
     tool_calls_log 为 None 时回退旧行为（兼容调用点未改的场景）。
     """
@@ -499,20 +501,27 @@ def _build_display_steps(history: list, tool_calls_log: list | None = None) -> l
     idx = 0
     for t in tool_calls_log:
         idx += 1
-        result.append({
-            "index": idx,
-            "intent": f"{t['name']}('{t.get('target', '')}')" if t.get("target") else t["name"],
-            "action_type": t["name"],
-            "target": t.get("target", ""),
-            "page_from": "",
-            "page_to": "",
-            "duration_ms": 0,
-            "status": "continue",
-            "observation": t.get("observation", ""),
-            "raw_observation": t.get("observation", ""),
-            "screenshot_path": t.get("screenshot_path", ""),
-            "anomaly": None,
-        })
+        result.append(
+            {
+                "index": idx,
+                "intent": (
+                    f"{t['name']}('{t.get('target', '')}')"
+                    if t.get("target")
+                    else t["name"]
+                ),
+                "intent_text": t.get("intent_text", ""),
+                "action_type": t["name"],
+                "target": t.get("target", ""),
+                "page_from": "",
+                "page_to": "",
+                "duration_ms": 0,
+                "status": "continue",
+                "observation": t.get("observation", ""),
+                "raw_observation": t.get("observation", ""),
+                "screenshot_path": t.get("screenshot_path", ""),
+                "anomaly": None,
+            }
+        )
     # 追加原始 step_history 中的 Agent 结论步骤
     for s in history:
         idx += 1

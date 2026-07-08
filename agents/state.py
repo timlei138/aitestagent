@@ -42,3 +42,4 @@ class TestState(TypedDict, total=False):
     )
     budget_violation_count: int  # P0.4: token budget violations in current run
     _tool_calls_log: list  # 工具调用实时日志（存入 state，不依赖 ctx）
+    _finalization_hint_injected: bool

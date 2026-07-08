@@ -150,18 +150,20 @@ class _SubState(_TD):
     messages: Annotated[list, add_messages]
     _turn_count: int
     _recent_call_sigs: list[str]
+    _recent_action_groups: list[str]
     _loop_break_reason: str
     _no_progress_count: int
     _no_progress_warned: bool
+    _cooldown_map: dict[str, int]
     _tool_calls_log: list
     _run_id: str
 
 
 _LOOP_BREAK_CONSECUTIVE = 3
-_NO_PROGRESS_LIMIT = 16
+_NO_PROGRESS_LIMIT = 8
+_FINALIZATION_REMAINING_TOOL_BUDGET = 5
 _NO_PROGRESS_ACTIONS = {
     "click",
-    "navigate_to",
     "scroll_find_and_click",
     "long_press",
     "copy",
@@ -175,9 +177,6 @@ _NO_PROGRESS_ACTIONS = {
     "unlock_screen",
     "set_orientation",
     "toggle_auto_rotate",
-    "launch_app",
-    "dismiss_popup",
-    "wait_seconds",
     "recover_from_anomaly",
 }
 
@@ -233,6 +232,79 @@ def _build_call_signature(name: str, args: dict, page_sig: str) -> str:
     except Exception:
         args_norm = str(args or {})
     return f"{name}|{args_norm}|{page_sig}"
+
+
+def _safe_len(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    return 0
+
+
+def _calc_budget(goal: dict) -> dict[str, int]:
+    pages = _safe_len(goal.get("target_pages", [])) if isinstance(goal, dict) else 0
+    verifications = (
+        _safe_len(goal.get("verification", [])) if isinstance(goal, dict) else 0
+    )
+    max_tool_calls_total = 16 + pages * 9 + verifications * 8
+    max_agent_iterations = min(max(2 + pages + verifications, 6), 18)
+    max_turns_per_iteration = min(
+        max(
+            (max_tool_calls_total + max_agent_iterations - 1) // max_agent_iterations, 6
+        ),
+        12,
+    )
+    return {
+        "max_tool_calls_total": max_tool_calls_total,
+        "max_agent_iterations": max_agent_iterations,
+        "max_turns_per_iteration": max_turns_per_iteration,
+    }
+
+
+def _calc_budget_from_state(state: dict) -> dict[str, int]:
+    return _calc_budget(state.get("goal_description", {}) or {})
+
+
+def _cooldown_group(name: str, args: dict, target: str = "") -> str:
+    if name == "press_key" and str(args.get("key", "")).lower() == "back":
+        return "nav_back"
+    if name in ("swipe", "scroll_panel"):
+        return "browse"
+    if name == "click":
+        txt = " ".join(
+            [
+                str(args.get("label", "") or ""),
+                str(args.get("target", "") or ""),
+                str(args.get("alternatives", "") or ""),
+                str(target or ""),
+            ]
+        )
+        if any(k in txt for k in ("应用列表", "所有应用")):
+            return "app_entry_retry"
+        # “应用”需要精确边界，避免误命中“应用商店”等复合词
+        if re.search(r"(^|[^\u4e00-\u9fff])应用([^\u4e00-\u9fff]|$)", txt):
+            return "app_entry_retry"
+    return ""
+
+
+def _output_has_page_change(
+    output: str, page_sig_before: str = "", page_sig_after: str = ""
+) -> bool:
+    if page_sig_before and page_sig_after and page_sig_before != page_sig_after:
+        return True
+    m = re.search(r"页面变化:\s*(.+?)\s*→\s*(.+?)(?:\s*\||$)", output or "")
+    if not m:
+        return False
+    return m.group(1).strip() != m.group(2).strip()
+
+
+def _should_skip_hotword_element(element: Any) -> bool:
+    rid = ((getattr(element, "resource_id", "") or "").split("/")[-1]).lower()
+    label = (getattr(element, "label", "") or "").strip()
+    if rid == "search_keyword":
+        return True
+    if rid == "search_bar_bg" and len(label) >= 12:
+        return True
+    return False
 
 
 def _run_agent(
@@ -322,14 +394,32 @@ def _run_agent(
         last_ai = next(m for m in reversed(s["messages"]) if isinstance(m, AIMessage))
         outputs = []
         recent = list(s.get("_recent_call_sigs", []))
+        recent_action_groups = list(s.get("_recent_action_groups", []))
         loop_break_reason = s.get("_loop_break_reason", "")
         no_progress_count = int(s.get("_no_progress_count", 0) or 0)
         no_progress_warned = bool(s.get("_no_progress_warned", False))
+        cooldown_map = dict(s.get("_cooldown_map", {}) or {})
         _current_log = list(s.get("_tool_calls_log", []))
         page_sig_once = _build_page_signature(_ctx)
         for tc in last_ai.tool_calls or []:
             name = tc["name"]
             args = tc.get("args", {}) or {}
+            target_hint = _build_tool_target(name, args)
+            cooldown_group = _cooldown_group(name, args, target_hint)
+            if cooldown_group and int(cooldown_map.get(cooldown_group, 0) or 0) > 0:
+                cooldown_map[cooldown_group] = int(cooldown_map[cooldown_group]) - 1
+                if cooldown_map[cooldown_group] <= 0:
+                    cooldown_map.pop(cooldown_group, None)
+                outputs.append(
+                    ToolMessage(
+                        content=(
+                            f"COOLDOWN_SKIP: {cooldown_group} cooling down, "
+                            "请切换策略并尝试不同操作"
+                        ),
+                        tool_call_id=tc["id"],
+                    )
+                )
+                continue
             if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
                 try:
                     _ctx._ws_emit(
@@ -346,6 +436,7 @@ def _run_agent(
                 output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"
             except Exception as e:
                 output = f"ERROR: {e}"
+            page_sig_after = _build_page_signature(_ctx)
             # 设备断开快速终止：工具执行后立即检测，避免继续执行无意义操作
             try:
                 _live_ctx = get_tool_context()
@@ -432,12 +523,42 @@ def _run_agent(
                     )
                     logger.warning(loop_break_reason)
                     break
+
+            # 语义冷却：处理近似抖动（与签名断路器互补）
+            milestone = name == "assert_verification" or _output_has_page_change(
+                output, page_sig_once, page_sig_after
+            )
+            if milestone:
+                recent_action_groups = []
+            elif cooldown_group:
+                recent_action_groups.append(cooldown_group)
+                if len(recent_action_groups) > 6:
+                    recent_action_groups = recent_action_groups[-6:]
+                if (
+                    len(recent_action_groups) >= 4
+                    and recent_action_groups.count(cooldown_group) >= 4
+                ):
+                    cooldown_map[cooldown_group] = 2
+                    recent_action_groups = []
+                    outputs.append(
+                        SystemMessage(
+                            content=(
+                                f"COOLDOWN_TRIGGERED: {cooldown_group} 连续重复。"
+                                "请改用结构化定位并优先完成验证上报。"
+                            )
+                        )
+                    )
+            page_sig_once = page_sig_after
+
             # 实时记录工具调用日志（过滤感知类，不去重）
             if name not in _SKIP_EMIT:
                 _current_log.append(
                     {
                         "name": name,
-                        "target": _build_tool_target(name, args),
+                        "target": target_hint,
+                        "intent_text": (getattr(last_ai, "content", "") or "").strip()[
+                            :200
+                        ],
                         "observation": output[:200],
                         "screenshot_path": _screenshot_path,
                         "tool_seq": len(_current_log),
@@ -457,6 +578,8 @@ def _run_agent(
             "messages": outputs,
             "_recent_call_sigs": recent,
             "_loop_break_reason": loop_break_reason,
+            "_recent_action_groups": recent_action_groups,
+            "_cooldown_map": cooldown_map,
             "_no_progress_count": no_progress_count,
             "_no_progress_warned": no_progress_warned,
             "_tool_calls_log": _current_log,
@@ -485,7 +608,9 @@ def _run_agent(
             "messages": list(messages),
             "_turn_count": 0,
             "_recent_call_sigs": [],
+            "_recent_action_groups": [],
             "_loop_break_reason": "",
+            "_cooldown_map": {},
             "_no_progress_count": 0,
             "_no_progress_warned": False,
             "_tool_calls_log": [],
@@ -501,7 +626,7 @@ def _run_agent(
     if loop_break_reason:
         # report_done 结构化终止：提取状态而非当 ABORT 处理
         if loop_break_reason.startswith("REPORT_DONE:"):
-            _summary = loop_break_reason[len("REPORT_DONE:"):].strip()
+            _summary = loop_break_reason[len("REPORT_DONE:") :].strip()
             return (
                 f"DONE: {_summary}",
                 _tool_calls_log,
@@ -512,7 +637,7 @@ def _run_agent(
                 },
             )
         if loop_break_reason.startswith("REPORT_ABORT:"):
-            _summary = loop_break_reason[len("REPORT_ABORT:"):].strip()
+            _summary = loop_break_reason[len("REPORT_ABORT:") :].strip()
             return (
                 f"ABORT: {_summary}",
                 _tool_calls_log,
@@ -581,7 +706,8 @@ def _run_agent(
 
 # Phase 1.2: 锚定行首的 DONE/ABORT 检测（兼容 ##/### Markdown 标题 + **/__/bold 前缀）
 _DONE_PATTERN = re.compile(
-    r"^(?:#{1,3}\s*)?(?:\*{1,2}|_{1,2})?(DONE|ABORT)\s*[:\uff1a]", re.IGNORECASE | re.MULTILINE
+    r"^(?:#{1,3}\s*)?(?:\*{1,2}|_{1,2})?(DONE|ABORT)\s*[:\uff1a]",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -821,11 +947,15 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             n_clickable = sum(1 for e in u.elements if e.clickable and e.label)
             lines = [
                 "page=" + pid,
-                "layout=" + u.layout,
+                (
+                    "layout=two_pane（结构分区标签，不保证左右方位）"
+                    if u.layout == "two_pane"
+                    else "layout=" + u.layout
+                ),
                 "clickable=" + str(n_clickable),
             ]
             for e in u.elements:
-                if e.clickable and e.label:
+                if e.clickable and e.label and not _should_skip_hotword_element(e):
                     role = e.role or ""
                     rid = (e.resource_id or "").split("/")[-1] if e.resource_id else ""
                     extra = ""
@@ -846,6 +976,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
 
     # Goal + history
     goal = state.get("goal_description", {})
+    budget = _calc_budget(goal)
     goal_str = json.dumps(goal, ensure_ascii=False, indent=2)
     history = state.get("step_history", [])
     budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
@@ -867,6 +998,22 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     msgs = list(state.get("messages", []))
     if not msgs:
         msgs = [SystemMessage(content=AGENT_SYSTEM)]
+    used_tool_calls_before = len(state.get("_tool_calls_log", []) or [])
+    remaining_tool_budget = budget["max_tool_calls_total"] - used_tool_calls_before
+    finalization_hint_injected = bool(state.get("_finalization_hint_injected", False))
+    if (
+        remaining_tool_budget <= _FINALIZATION_REMAINING_TOOL_BUDGET
+        and not finalization_hint_injected
+    ):
+        msgs.append(
+            SystemMessage(
+                content=(
+                    "FINALIZATION_HINT: 剩余工具预算较低。请优先对可判定项调用 "
+                    "assert_verification；若无法继续，请立即 report_done(status=\"abort\")。"
+                )
+            )
+        )
+        finalization_hint_injected = True
     msgs.append(
         HumanMessage(
             content="Goal:\n"
@@ -879,14 +1026,6 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         )
     )
 
-    # 根据 Goal 复杂度动态计算 max_turns：基础 12 + 每页面 7 + 每验证项 6
-    _goal_turns = (
-        12
-        + len(goal.get("target_pages", [])) * 7
-        + len(goal.get("verification", [])) * 6
-    )
-    _max_turns = min(max(_goal_turns, 10), 200)  # 最少 10，最多 200
-
     result, tool_calls_log, loop_meta = _run_agent(
         msgs,
         AGENT_TOOLS,
@@ -894,13 +1033,21 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         llm["model"],
         llm["api_key"],
         llm["base_url"],
-        max_turns=_max_turns,
+        max_turns=budget["max_turns_per_iteration"],
         run_id=config.get("configurable", {}).get("thread_id", "unknown"),
     )
     # 不再写入 ctx._tool_calls_log（避免 rebuild 丢失），改为存入 state
     logger.info("Agent #%d: %s", len(history) + 1, result[:200])
 
     done, abort = _detect_termination(result)
+    used_tool_calls_total = used_tool_calls_before + len(tool_calls_log)
+    if used_tool_calls_total >= budget["max_tool_calls_total"] and not done:
+        abort = True
+        done = False
+        result = (
+            result.rstrip()
+            + f"\nABORT: MAX_TOOL_CALLS_EXHAUSTED ({used_tool_calls_total}/{budget['max_tool_calls_total']})"
+        )
     # 结构化信号优先：tool call 中的 report_done 已被 _run_agent 转为 "DONE: ..." / "ABORT: ..."
     # _detect_termination 已覆盖文本兜底，此处仅记录来源
     _signal_source = "text" if (done or abort) else "none"
@@ -993,7 +1140,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 post_check = (
                     f"\n\n[操作后页面状态]\n当前页面: {time_snapshot}\n"
                     f"验证条件: {verify_hint}\n"
-                    "如果页面状态已满足验证条件，请立即调用 report_done(status=\"done\") 报告结果。"
+                    '如果页面状态已满足验证条件，请立即调用 report_done(status="done") 报告结果。'
                 )
                 post_check, violated = _clip_to_token_budget(post_check, 120)
                 if violated:
@@ -1011,7 +1158,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             if unique == 1:
                 dup_warning = (
                     "[系统提醒] 你已连续 3 次执行相同的操作，页面可能没有变化。"
-                    "请立即调 get_screen_info 检查当前状态，如果目标已达成则调用 report_done(status=\"done\")。"
+                    '请立即调 get_screen_info 检查当前状态，如果目标已达成则调用 report_done(status="done")。'
                 )
                 dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
                 if violated:
@@ -1025,7 +1172,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 # 4 步内只有 2 种操作 → 可能在循环
                 dup_warning = (
                     "[系统提醒] 检测到可能的循环模式。"
-                    "如果目标已达成，请直接调用 report_done(status=\"done\") 报告结果。"
+                    '如果目标已达成，请直接调用 report_done(status="done") 报告结果。'
                 )
                 dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
                 if violated:
@@ -1043,6 +1190,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "status": "success" if done else "fail",
                 "conclusion": result.strip(),
                 "budget_violation_count": budget_violation_count,
+                "_finalization_hint_injected": finalization_hint_injected,
                 "_tool_calls_log": list(state.get("_tool_calls_log", []))
                 + tool_calls_log,
             }
@@ -1052,6 +1200,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "step_history": nh,
             "messages": um,
             "budget_violation_count": budget_violation_count,
+            "_finalization_hint_injected": finalization_hint_injected,
             "_tool_calls_log": list(state.get("_tool_calls_log", [])) + tool_calls_log,
         }
     )
@@ -1069,12 +1218,13 @@ def _determine_execution_status(state: dict) -> str:
     if done:
         return "completed"
     if abort:
-        if "MAX_TURNS" in conclusion:
+        if "MAX_TURNS" in conclusion or "MAX_TOOL_CALLS" in conclusion:
             return "exhausted"
         # Agent 主动 ABORT 仍算 completed，verdict 由 test_verdict 决定
         return "completed"
+    budget = _calc_budget_from_state(state)
     history = state.get("step_history", [])
-    if len(history) >= 12:
+    if len(history) >= budget["max_agent_iterations"]:
         return "exhausted"
     return "error"
 
@@ -1148,7 +1298,6 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
     if execution_status not in ("completed",):
         test_verdict = "inconclusive"
-        verification_results = []
     # 向后兼容 status
     status = (
         "success"
@@ -1245,10 +1394,11 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
 
 def route_after_agent(state: TestState) -> str:
     n = len(state.get("step_history", []))
+    budget = _calc_budget_from_state(state)
     if state.get("status") in ("success", "fail"):
         logger.info("Route: reporter (status=%s, steps=%d)", state.get("status"), n)
         return "reporter"
-    if n >= 12:
+    if n >= budget["max_agent_iterations"]:
         logger.warning("Route: reporter (max iterations %d)", n)
         return "reporter"
     logger.info("Route: agent (iteration %d)", n + 1)

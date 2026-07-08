@@ -21,7 +21,10 @@
       <div class="rd-section-title">验证清单</div>
       <div v-for="(v, i) in report.verification_results" :key="v.screenshot || i" class="rd-verify-item">
         <span class="rd-verify-icon" :class="v.result">{{ v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?' }}</span>
-        <span class="rd-verify-text">{{ v.item }}</span>
+        <div class="rd-verify-main">
+          <span class="rd-verify-text">{{ v.item }}</span>
+          <div v-if="v.detail" class="rd-verify-reason">理由：{{ v.detail }}</div>
+        </div>
         <el-image v-if="v.screenshot" :src="shotUrl(v.screenshot, i)" :preview-src-list="[shotUrl(v.screenshot, i)]"
                   fit="cover" class="verify-shot" title="点击查看大图" />
       </div>
@@ -55,6 +58,7 @@
             <span v-if="s.status === 'success'" class="rd-step-badge done">完成</span>
           </div>
           <div v-if="s.page_from || s.page_to" class="rd-step-pages">{{ s.page_from || '?' }} → {{ s.page_to || '?' }}</div>
+          <div v-if="stepIntent(s)" class="rd-step-intent">AI意图：{{ stepIntent(s) }}</div>
           <div v-if="s.observation" class="rd-step-obs">{{ stripDONE(s.observation) }}</div>
         </div>
       </div>
@@ -92,6 +96,11 @@ const cleanConclusion = computed(() => {
 
 function stripDONE(s) {
   return (s || '').replace(/^(?:#{1,3}\s*)?(?:DONE|ABORT)\s*[:：]\s*/im, '').trim()
+}
+
+function stepIntent(step) {
+  const t = String(step?.intent_text || step?.intent || '').trim()
+  return t ? stripDONE(t) : ''
 }
 
 const execStatusMap = {
@@ -136,10 +145,12 @@ function shotUrl(path, index) {
 /* ── 验证 ── */
 .rd-verification { margin-bottom: 12px; }
 .rd-section-title { font-size: 13px; font-weight: 700; color: var(--text-secondary); cursor: pointer; padding: 6px 0; border-bottom: 1px solid var(--line-light); margin-bottom: 8px; user-select: none; }
-.rd-verify-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 13px; }
+.rd-verify-item { display: flex; align-items: flex-start; gap: 8px; padding: 4px 0; font-size: 13px; }
 .rd-verify-icon { font-weight: 700; width: 22px; text-align: center; }
 .rd-verify-icon.passed { color: var(--success); } .rd-verify-icon.failed { color: var(--danger); } .rd-verify-icon.unknown { color: var(--warning); }
 .rd-verify-text { flex: 1; color: var(--text-secondary); }
+.rd-verify-main { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.rd-verify-reason { color: var(--text-muted); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
 .verify-shot { width: 48px; height: 36px; border-radius: var(--radius-xs); cursor: pointer; object-fit: cover; border: 1px solid var(--line); }
 
 /* ── 结论 ── */
@@ -165,6 +176,7 @@ function shotUrl(path, index) {
 .rd-step-badge.fail { background: #fecaca; color: #dc2626; }
 .rd-step-badge.done { background: #bbf7d0; color: #16a34a; }
 .rd-step-pages { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.rd-step-intent { font-size: 12px; color: var(--text-primary); margin-top: 4px; padding: 6px 8px; background: #f6f8fa; border-radius: 6px; border: 1px dashed var(--line-light); white-space: pre-wrap; word-break: break-word; }
 .rd-step-obs { font-size: 12px; color: var(--text-secondary); margin-top: 4px; padding: 8px 10px; background: #fff; border-radius: var(--radius-xs); white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow-y: auto; border: 1px solid var(--line-light); }
 
 /* ── 步骤截图 ── */

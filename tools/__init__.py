@@ -92,7 +92,11 @@ def get_screen_info(mode: str = "full") -> str:
     lines = [
         f"page={page_id}",
         understanding.summary,
-        f"layout={understanding.layout}",
+        (
+            "layout=two_pane（结构分区标签，不保证左右方位）"
+            if understanding.layout == "two_pane"
+            else f"layout={understanding.layout}"
+        ),
     ]
 
     if mode == "clickable":
@@ -1863,9 +1867,22 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
     if ctx:
         if not hasattr(ctx, "_verifications"):
             ctx._verifications = []
+        if not hasattr(ctx, "_verification_detail_retries"):
+            ctx._verification_detail_retries = {}
         normalized = result if result in ("passed", "failed") else "unknown"
-        shot_path = ""        # 相对路径（供前端 /storage 挂载解析）
-        shot_abs_path = ""    # 绝对路径（供本地文件操作）
+        if normalized in ("passed", "failed") and not (detail or "").strip():
+            key = (condition or "").strip() or f"#{len(ctx._verifications) + 1}"
+            retries = int(ctx._verification_detail_retries.get(key, 0) or 0)
+            if retries < 2:
+                ctx._verification_detail_retries[key] = retries + 1
+                return f"ERROR: detail is required for assert_verification (attempt {retries + 1}/2)"
+            detail = "detail unavailable after retries"
+        else:
+            key = (condition or "").strip()
+            if key:
+                ctx._verification_detail_retries.pop(key, None)
+        shot_path = ""  # 相对路径（供前端 /storage 挂载解析）
+        shot_abs_path = ""  # 绝对路径（供本地文件操作）
 
         # 每个验证点都尝试实时截图，失败时再回退到最近缓存截图。
         if ctx.device:
@@ -1881,15 +1898,20 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
                 shot_abs_path = new_path
                 # 转为相对于 DATA_DIR 的路径，使前端 /storage 挂载能解析
                 try:
-                    shot_path = os.path.relpath(new_path, app_paths.DATA_DIR_STR).replace("\\", "/")
+                    shot_path = os.path.relpath(
+                        new_path, app_paths.DATA_DIR_STR
+                    ).replace("\\", "/")
                 except Exception:
                     shot_path = new_path.replace("\\", "/")
             except Exception:
                 shot_abs_path = getattr(ctx, "_last_screenshot_path", "") or ""
                 try:
                     shot_path = (
-                        os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace("\\", "/")
-                        if shot_abs_path else ""
+                        os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace(
+                            "\\", "/"
+                        )
+                        if shot_abs_path
+                        else ""
                     )
                 except Exception:
                     shot_path = shot_abs_path
@@ -1897,8 +1919,11 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
             shot_abs_path = getattr(ctx, "_last_screenshot_path", "") or ""
             try:
                 shot_path = (
-                    os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace("\\", "/")
-                    if shot_abs_path else ""
+                    os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace(
+                        "\\", "/"
+                    )
+                    if shot_abs_path
+                    else ""
                 )
             except Exception:
                 shot_path = shot_abs_path

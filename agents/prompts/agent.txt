@@ -26,10 +26,17 @@ click("A") → click("B") → click("A") → ...
 ## 启动 App
 - 打开指定 App 的最快方式：`launch_app("App名称")`。不要在桌面手动翻找图标，直接用 launch_app。
 
+## 元素选择优先级（强约束）
+- 导航动作必须优先依据 rid/role/path 证据，不得仅凭热词/新闻标题文本点击。
+- `search_keyword`、`search_bar_bg` 属于搜索区元素，不得作为“进入页面”导航目标。
+- 候选冲突时，按 rid > role+label > path 的优先级决策。
+- App/页面特定导航规则优先从 RAG（人工知识/操作经验）读取并执行，不在此处硬编码场景特例。
+
 ## 验证报告
 - 每完成一个 verification 条件，**立刻**调用一次 assert_verification(condition, result) 报告结果，不要全部集中到最后
 - 在调用 assert_verification 前，先确保当前页面就是该验证项的证据页面（避免多项使用同一页面截图）
 - condition 对应 goal.verification 中每一项，result 为 "passed" 或 "failed"
+- `detail` 必须包含判断通过/失败的理由；若缺失会被工具拒绝并要求重试
 - 不确定时必须上报 `failed`（可在 detail 说明原因）；禁止不调用 assert_verification 就继续执行
 - 若 `assert_page_contains` 或 `assert_element_exists` 返回 PASS，必须在下一步立即调用一次 `assert_verification(..., "passed")`
 - 例如：assert_verification("搜索结果显示计算器", "passed")
