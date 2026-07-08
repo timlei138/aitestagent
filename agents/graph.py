@@ -830,7 +830,7 @@ def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
         return ""
     parts = []
     # 1. 人工知识（一次查询，Python 侧自动分组为全局知识 + App 操作前提）
-    rules = kb.query_curated_rules(app_package, user_request=user_request)
+    rules = kb.query_curated_rules(app_package)
     if rules:
         parts.append("## 人工知识\n" + rules)
     # 2. 操作经验
@@ -961,6 +961,7 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
             "_rag_last_app_package": "",
             "_knowledge_query_hint_injected": False,
             "_last_page_app_key": "",
+            "_last_clickable_count": 0,
         }
     )
 
@@ -1004,6 +1005,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     page_info = "unknown"
     pid = ""
     current_app_key = ""
+    n_clickable = 0
     t0 = 0
     if ctx and ctx.perceiver:
         try:
@@ -1123,6 +1125,33 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         knowledge_query_hint_injected = True
     elif not force_query_hint:
         knowledge_query_hint_injected = False
+
+    self_doubt_reasons: list[str] = []
+    if pid and len(history) >= 3:
+        recent_hist = history[-3:]
+        if all(
+            str(s.get("page_from", "") or "") == pid and s.get("status") == "continue"
+            for s in recent_hist
+        ):
+            self_doubt_reasons.append("连续 3 步在同一页面无进展")
+    target_pages = [str(x or "").strip() for x in (goal.get("target_pages", []) or []) if str(x or "").strip()]
+    if pid and target_pages and len(history) >= 3:
+        if all(tp not in pid for tp in target_pages):
+            self_doubt_reasons.append("当前页面与 Goal 目标页面长期偏离")
+    last_clickable_count = int(state.get("_last_clickable_count", 0) or 0)
+    if last_clickable_count > 0 and n_clickable > 0:
+        if abs(n_clickable - last_clickable_count) >= max(
+            8, int(last_clickable_count * 0.6)
+        ):
+            self_doubt_reasons.append("页面元素数量突变，可能存在弹窗或页面异常")
+    if self_doubt_reasons:
+        doubt_text = (
+            "SELF_DOUBT_HINT: 检测到不确定状态（"
+            + "；".join(self_doubt_reasons[:2])
+            + "）。下一步先调用 get_screen_info 复核；若仍无法确认路径，请立即 "
+            'report_done(status="abort", summary="页面异常，建议人工确认")。'
+        )
+        msgs.append(SystemMessage(content=doubt_text))
 
     last_page_app_key = str(state.get("_last_page_app_key", "") or "")
     app_switch_hint = ""
@@ -1322,6 +1351,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "_finalization_hint_injected": finalization_hint_injected,
                 "_knowledge_query_hint_injected": knowledge_query_hint_injected,
                 "_last_page_app_key": current_app_key or last_page_app_key,
+                "_last_clickable_count": n_clickable or last_clickable_count,
                 "_rag_injected_once": bool(state.get("_rag_injected_once", False))
                 or bool(rag_summary),
                 "_rag_last_app_package": (
@@ -1341,6 +1371,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "_finalization_hint_injected": finalization_hint_injected,
             "_knowledge_query_hint_injected": knowledge_query_hint_injected,
             "_last_page_app_key": current_app_key or last_page_app_key,
+            "_last_clickable_count": n_clickable or last_clickable_count,
             "_rag_injected_once": bool(state.get("_rag_injected_once", False))
             or bool(rag_summary),
             "_rag_last_app_package": (

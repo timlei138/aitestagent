@@ -488,14 +488,8 @@ def _extract_interrupt_info(exc: Exception) -> dict[str, Any]:
     }
 
 
-def _build_display_steps(
-    history: list, tool_calls_log: list | None = None
-) -> list[dict]:
-    """从工具调用日志生成展示步骤。不再依赖全局 ToolContext。
-    tool_calls_log 为 None 时回退旧行为（兼容调用点未改的场景）。
-    """
-    if tool_calls_log is None:
-        tool_calls_log = []
+def _build_display_steps(history: list, tool_calls_log: list) -> list[dict]:
+    """从工具调用日志生成展示步骤。不再依赖全局 ToolContext。"""
     # 不再做去重 merge — 每次工具调用都可见
     result = []
     idx = 0

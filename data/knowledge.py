@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import logging
+import re
 from typing import Any
 
 from data.vector_store import VectorStoreBackend
@@ -21,18 +22,18 @@ class UIKnowledge:
 class KnowledgeBase:
     """RAG 知识库 —— 业务逻辑（操作经验、人工知识）和底层存储解耦。"""
 
-    # 类型别名映射（旧数据兼容：查询新类型时自动匹配旧类型）
+    # 当前仅保留标准知识类型；历史别名已由迁移脚本归一化。
     _TYPE_ALIASES: dict[str, list[str]] = {
-        # 旧类型名仍可能被查询到（清理前的过渡期），保留别名兼容
-        "experience": [
-            "experience",
-            "navigation_path",
-            "page_structure",
-            "test_experience",
-        ],
-        "curated_rule": ["curated_rule", "app_precondition", "global_knowledge"],
+        "experience": ["experience"],
+        "curated_rule": ["curated_rule"],
     }
     _EXPERIENCE_LAYER2_MAX_DISTANCE = 1.2
+    _EXPERIENCE_MIN_QUALITY = 0.75
+    _DYN_PAGE_PATTERNS = [
+        re.compile(r"\d+\.\d+\s*[KMG]?[Bb]/s", re.IGNORECASE),
+        re.compile(r"\d{1,2}:\d{2}(?::\d{2})?"),
+        re.compile(r"\d+%"),
+    ]
 
     def __init__(self, backend: VectorStoreBackend):
         self.backend = backend
@@ -119,9 +120,12 @@ class KnowledgeBase:
         to_page: str = "",
         outcome: str = "",
         detail: str = "",
-        labels: list[str] | None = None,
         app_version: str = "",
         last_verified_at: str = "",
+        signal_type: str = "",
+        quality_score: float = 1.0,
+        action_semantic: str = "",
+        page_stability: str = "",
     ) -> None:
         """保存操作经验 —— 精简格式: A → action → B"""
 
@@ -132,18 +136,56 @@ class KnowledgeBase:
         if to_page:
             content += f" → {to_page}"
 
-        # 去重：用 get_by_metadata 按 metadata 精确过滤（不走向量搜索）
+        page_norm = self._normalize_page_id(page)
+        to_page_norm = self._normalize_page_id(to_page)
+        action_type, action_label_norm, rid_tail = self._parse_action_signature(action)
+
+        # Phase 1：严格去重（app_package, page_norm, action_label_norm, rid_tail）
         existing = self.backend.get_by_metadata(
-            where={
-                "app_package": app_package,
-                "knowledge_type": "experience",
-                "page": page,
-                "action": action,
-                "to_page": to_page,
-            },
-            limit=1,
+            where={"app_package": app_package, "knowledge_type": "experience"},
+            limit=80,
         )
-        if existing:
+        duplicate = None
+        for row in existing:
+            meta = row.get("metadata", {}) or {}
+            old_page_norm = str(meta.get("page_norm", "") or self._normalize_page_id(meta.get("page", "")))
+            old_action = str(meta.get("action", "") or "")
+            _, old_label_norm, old_rid_tail = self._parse_action_signature(old_action)
+            if (
+                old_page_norm == page_norm
+                and old_label_norm == action_label_norm
+                and old_rid_tail == rid_tail
+            ):
+                duplicate = row
+                break
+
+        now_iso = last_verified_at or datetime.now().isoformat()
+        if duplicate:
+            meta = dict(duplicate.get("metadata", {}) or {})
+            merged = {
+                **meta,
+                "last_verified_at": now_iso,
+                "success_count": int(meta.get("success_count", 1) or 1) + 1,
+                "quality_score": max(float(meta.get("quality_score", 0.0) or 0.0), float(quality_score or 0.0)),
+                "signal_type": str(meta.get("signal_type", "") or signal_type),
+                "action_semantic": str(meta.get("action_semantic", "") or action_semantic),
+                "page_norm": str(meta.get("page_norm", "") or page_norm),
+                "to_page_norm": str(meta.get("to_page_norm", "") or to_page_norm),
+                "action_type": str(meta.get("action_type", "") or action_type),
+                "action_label_norm": str(meta.get("action_label_norm", "") or action_label_norm),
+                "rid_tail": str(meta.get("rid_tail", "") or rid_tail),
+            }
+            dup_id = duplicate.get("id", "")
+            if dup_id:
+                self.backend.delete_by_ids([dup_id])
+                self.save_knowledge(
+                    UIKnowledge(
+                        app_package=app_package,
+                        knowledge_type="experience",
+                        content=duplicate.get("content", content),
+                        metadata=merged,
+                    )
+                )
             return
 
         self.save_knowledge(
@@ -158,7 +200,17 @@ class KnowledgeBase:
                     "outcome": outcome,
                     "timestamp": datetime.now().isoformat(),
                     "app_version": app_version,
-                    "last_verified_at": last_verified_at or datetime.now().isoformat(),
+                    "last_verified_at": now_iso,
+                    "signal_type": signal_type,
+                    "quality_score": float(quality_score or 0.0),
+                    "action_semantic": action_semantic,
+                    "page_stability": page_stability,
+                    "success_count": 1,
+                    "page_norm": page_norm,
+                    "to_page_norm": to_page_norm,
+                    "action_type": action_type,
+                    "action_label_norm": action_label_norm,
+                    "rid_tail": rid_tail,
                 },
             )
         )
@@ -176,9 +228,23 @@ class KnowledgeBase:
                 where={"app_package": app_package, "knowledge_type": "experience"},
                 limit=top_k * 3,
             )
-            # ChromaDB get() 不保证顺序，Python 侧按 timestamp 降序
+            # 仅保留 strong（缺失 quality_score 的历史数据默认 0，排除）
+            precise = [
+                r
+                for r in precise
+                if float((r.get("metadata", {}) or {}).get("quality_score", 0.0) or 0.0)
+                >= self._EXPERIENCE_MIN_QUALITY
+            ]
+            # ChromaDB get() 不保证顺序，Python 侧按质量+时间排序
             precise.sort(
-                key=lambda r: r.get("metadata", {}).get("timestamp", ""),
+                key=lambda r: (
+                    float((r.get("metadata", {}) or {}).get("quality_score", 0.0) or 0.0),
+                    {"exact_click": 2, "semantic_click": 1}.get(
+                        str((r.get("metadata", {}) or {}).get("signal_type", "") or ""),
+                        0,
+                    ),
+                    str((r.get("metadata", {}) or {}).get("last_verified_at", "")),
+                ),
                 reverse=True,
             )
             for r in precise[:top_k]:
@@ -293,11 +359,8 @@ class KnowledgeBase:
             )
         )
 
-    def query_curated_rules(
-        self, app_package: str, user_request: str = "", top_k: int = 5
-    ) -> str:
+    def query_curated_rules(self, app_package: str, top_k: int = 5) -> str:
         """查询人工知识：双路精确 metadata 查询，无评分过滤。"""
-        del user_request  # 接口兼容：当前实现不使用 request 文本做规则筛选
         type_filter = {
             "$or": [
                 {"knowledge_type": t}
@@ -317,18 +380,6 @@ class KnowledgeBase:
             {**type_filter, "app_package": "", "scope": "universal"},
             limit=top_k,
         )
-        # 兜底：兼容历史数据未写入 scope 的全局规则
-        if not universal_rules:
-            fallback_rules = self.backend.get_by_metadata(
-                {**type_filter, "app_package": ""},
-                limit=top_k * 2,
-            )
-            universal_rules = [
-                r
-                for r in fallback_rules
-                if str((r.get("metadata", {}) or {}).get("scope", "") or "").strip()
-                in ("", "universal")
-            ][:top_k]
         universal_lines = [
             f"- {str(r.get('content', '') or '')}" for r in universal_rules
         ]
@@ -340,47 +391,38 @@ class KnowledgeBase:
             parts.append("### App 操作前提\n" + "\n".join(app_lines))
         return "\n\n".join(parts)
 
-    def ensure_gallery_seed_knowledge(self) -> int:
-        """注入图库冷启动种子知识（幂等）。返回新增条数。"""
-        before = self.count
-        gallery_pkg = "com.zui.gallery"
-
-        curated_rules = [
-            "进入图库后，如需批量选择，优先查找‘选择’或‘多选’入口。",
-            "批量选择模式下，选中图片后通常会出现勾选态或顶部计数提示。",
-            "完成选择后，优先点击‘完成/确认/分享’而不是反复点缩略图。",
-        ]
-        experiences = [
-            ("图库首页", "点击 多选/选择", "选择模式"),
-            ("选择模式", "点击 图片项", "图片已选中"),
-            ("选择模式", "点击 完成/确认", "退出选择模式或进入下一步"),
-        ]
-
-        for rule in curated_rules:
-            self.save_curated_rule(
-                gallery_pkg,
-                rule,
-                domain="media",
-                scenario="gallery_selection",
-                quality_score=1.0,
-                app_version="seed",
-                applicable_domains=["media", "gallery"],
-            )
-        for page, action, to_page in experiences:
-            self.save_experience(
-                app_package=gallery_pkg,
-                page=page,
-                action=action,
-                to_page=to_page,
-                outcome="seed",
-                app_version="seed",
-            )
-
-        after = self.count
-        return max(0, after - before)
-
-    # ── 旧类型别名兼容（已删除的类型仍保留别名映射，避免旧数据查询报错） ──
-
     @property
     def count(self) -> int:
         return self.backend.count()
+
+    @classmethod
+    def _normalize_page_id(cls, value: str) -> str:
+        s = str(value or "").strip()
+        if not s:
+            return ""
+        # 去掉标题栏中动态片段（网速/时间/百分比）
+        for p in cls._DYN_PAGE_PATTERNS:
+            s = p.sub("", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        s = s.replace("「」", "")
+        if "「" in s:
+            s = s.split("「", 1)[0].strip()
+        return s
+
+    @staticmethod
+    def _parse_action_signature(action: str) -> tuple[str, str, str]:
+        t = str(action or "").strip()
+        if not t:
+            return "", "", ""
+        action_type = "click_exact" if "click_exact" in t else "click"
+        label = ""
+        m = re.search(r'click(?:_exact)?\("([^"]+)"\)', t)
+        if m:
+            label = m.group(1)
+        elif t.startswith("click(") and t.endswith(")"):
+            label = t[6:-1]
+        rid_tail = ""
+        mr = re.search(r"rid=([^\s,]+)", t)
+        if mr:
+            rid_tail = mr.group(1).split("/")[-1].strip()
+        return action_type, str(label or "").strip().lower(), rid_tail

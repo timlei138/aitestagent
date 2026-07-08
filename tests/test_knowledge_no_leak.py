@@ -8,9 +8,13 @@ from data.knowledge import KnowledgeBase, UIKnowledge
 class _FakeBackend:
     def __init__(self):
         self.records: list[dict] = []
+        self._seq = 0
 
     def add(self, content: str, metadata: dict):
-        self.records.append({"content": content, "metadata": dict(metadata)})
+        self._seq += 1
+        self.records.append(
+            {"id": f"r{self._seq}", "content": content, "metadata": dict(metadata)}
+        )
 
     def search(self, query: str, filter: dict | None = None, top_k: int = 5):
         del query, filter
@@ -47,15 +51,22 @@ class _FakeBackend:
         for r in self.records:
             if _matches(r["metadata"], where):
                 out.append(
-                    {"content": r["content"], "metadata": r["metadata"], "score": 1.0}
+                    {
+                        "id": r.get("id", ""),
+                        "content": r["content"],
+                        "metadata": r["metadata"],
+                        "score": 1.0,
+                    }
                 )
             if len(out) >= limit:
                 break
         return out
 
     def delete_by_ids(self, ids: list[str]) -> int:
-        del ids
-        return 0
+        before = len(self.records)
+        id_set = set(ids or [])
+        self.records = [r for r in self.records if r.get("id", "") not in id_set]
+        return before - len(self.records)
 
 
 def _seed_rules(kb: KnowledgeBase):
@@ -137,7 +148,7 @@ def test_save_knowledge_auto_sets_universal_scope_for_global_curated_rule():
     assert backend.records[0]["metadata"].get("scope") == "universal"
 
 
-def test_query_curated_rules_fallback_reads_global_rules_without_scope():
+def test_query_curated_rules_excludes_global_rules_without_scope():
     backend = _FakeBackend()
     kb = KnowledgeBase(backend)
     backend.add(
@@ -150,7 +161,7 @@ def test_query_curated_rules_fallback_reads_global_rules_without_scope():
         },
     )
     out = kb.query_curated_rules("com.zui.launcher")
-    assert "缺少scope的全局规则" in out
+    assert "缺少scope的全局规则" not in out
 
 
 def test_save_curated_rule_drops_empty_applicable_domains():
@@ -164,3 +175,60 @@ def test_save_curated_rule_drops_empty_applicable_domains():
         applicable_domains=[],
     )
     assert "applicable_domains" not in backend.records[0]["metadata"]
+
+
+def test_save_experience_normalizes_dynamic_page_tokens_and_dedups():
+    backend = _FakeBackend()
+    kb = KnowledgeBase(backend)
+    kb.save_experience(
+        app_package="com.zui.launcher",
+        page="MainActivity「0.12\nK/s」",
+        action='click_exact("应用列表") rid=com.zui.launcher:id/taskbar_view',
+        to_page="MainActivity「0.00\nK/s」",
+        outcome="成功",
+        signal_type="exact_click",
+        quality_score=0.9,
+    )
+    kb.save_experience(
+        app_package="com.zui.launcher",
+        page="MainActivity「0.20\nK/s」",
+        action='click_exact("应用列表") rid=com.zui.launcher:id/taskbar_view',
+        to_page="MainActivity「0.03\nK/s」",
+        outcome="成功",
+        signal_type="exact_click",
+        quality_score=0.95,
+    )
+    rows = backend.get_by_metadata(
+        {"app_package": "com.zui.launcher", "knowledge_type": "experience"},
+        limit=10,
+    )
+    assert len(rows) == 1
+    meta = rows[0]["metadata"]
+    assert meta.get("page_norm") == "MainActivity"
+    assert int(meta.get("success_count", 0) or 0) >= 2
+
+
+def test_query_experience_only_returns_strong_quality():
+    backend = _FakeBackend()
+    kb = KnowledgeBase(backend)
+    kb.save_experience(
+        app_package="com.zui.launcher",
+        page="MainActivity",
+        action='click_exact("应用列表") rid=app_list',
+        to_page="CustomModeLauncher",
+        outcome="成功",
+        signal_type="exact_click",
+        quality_score=0.9,
+    )
+    kb.save_experience(
+        app_package="com.zui.launcher",
+        page="MainActivity",
+        action='click("热门词")',
+        to_page="MainActivity",
+        outcome="成功",
+        signal_type="fallback_click",
+        quality_score=0.3,
+    )
+    out = kb.query_experience("com.zui.launcher", user_request="", top_k=10)
+    assert len(out) == 1
+    assert "应用列表" in out[0]["content"]

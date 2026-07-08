@@ -130,17 +130,6 @@ if _device is not None:
 
 # 3) 知识库（始终可用）
 _kb = KnowledgeBase(create_vector_store(config))
-try:
-    added = _kb.ensure_gallery_seed_knowledge()
-    logging.getLogger(__name__).info(
-        "Gallery seed knowledge initialized (added=%d)",
-        added,
-    )
-except Exception as exc:
-    logging.getLogger(__name__).warning(
-        "Gallery seed knowledge init failed: %s",
-        exc,
-    )
 
 _ctx = ToolContext(
     device=_device,
@@ -257,6 +246,7 @@ set_ws_emit_callback(lambda t, p: ws_manager.broadcast_sync(t, p))
 
 # ── USB 热插拔监听 ──
 _usb_monitor_proc: subprocess.Popen | None = None
+
 
 def _start_usb_monitor() -> None:
     """后台线程：adb track-devices 实时监听 USB 插拔，毫秒级响应。"""
@@ -565,7 +555,10 @@ async def delete_report(run_id: str):
     for p in image_paths:
         try:
             resolved = p.resolve()
-            if PROJECT_ROOT not in resolved.parents and app_paths.DATA_DIR not in resolved.parents:
+            if (
+                PROJECT_ROOT not in resolved.parents
+                and app_paths.DATA_DIR not in resolved.parents
+            ):
                 continue
         except Exception:
             continue
@@ -604,7 +597,11 @@ async def health():
 # ── 静态文件 ──
 
 app.mount("/storage", StaticFiles(directory=str(app_paths.DATA_DIR)), name="storage")
-app.mount("/static", StaticFiles(directory=str(app_paths.FRONTEND_DIST_DIR.parent)), name="static")
+app.mount(
+    "/static",
+    StaticFiles(directory=str(app_paths.FRONTEND_DIST_DIR.parent)),
+    name="static",
+)
 
 
 @app.get("/")

@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 TYPE_ALIASES = ("curated_rule", "app_precondition", "global_knowledge")
+LEGACY_TYPES = ("app_precondition", "global_knowledge")
 MIGRATIONS = {
     "联想计算器历史记录": "com.zui.calculator",
     "联想计算器复制粘贴": "com.zui.calculator",
@@ -172,13 +173,13 @@ def main() -> int:
         before = _load_curated_records(conn)
         _print_stats("Before", before)
 
-        candidates = [
+        global_candidates = [
             r
             for r in before
             if r.app_package == "" and r.knowledge_type in TYPE_ALIASES
         ]
         planned_moves: list[tuple[RuleRecord, str]] = []
-        for r in candidates:
+        for r in global_candidates:
             target = _match_target_pkg(r.content)
             if target:
                 planned_moves.append((r, target))
@@ -194,10 +195,13 @@ def main() -> int:
 
         remaining_universal_ids = [
             r.embedding_id
-            for r in candidates
+            for r in global_candidates
             if r.embedding_id not in {m[0].embedding_id for m in planned_moves}
         ]
         print(f"\nRemaining universal-candidate count: {len(remaining_universal_ids)}")
+
+        legacy_type_records = [r for r in before if r.knowledge_type in LEGACY_TYPES]
+        print(f"Legacy type rows to normalize: {len(legacy_type_records)}")
 
         if args.dry_run:
             return 0
@@ -210,9 +214,25 @@ def main() -> int:
             for r, target in planned_moves:
                 _upsert_metadata_key(conn, r.embedding_id, "app_package", target)
                 _upsert_metadata_key(conn, r.embedding_id, "scope", "app")
+                _upsert_metadata_key(
+                    conn, r.embedding_id, "knowledge_type", "curated_rule"
+                )
 
             for eid in remaining_universal_ids:
                 _upsert_metadata_key(conn, eid, "scope", "universal")
+                _upsert_metadata_key(conn, eid, "knowledge_type", "curated_rule")
+
+            # 全量归一化：遗留类型一律收敛到 curated_rule；并补齐缺失 scope
+            for r in legacy_type_records:
+                _upsert_metadata_key(
+                    conn, r.embedding_id, "knowledge_type", "curated_rule"
+                )
+                if r.app_package:
+                    if not str(r.scope or "").strip():
+                        _upsert_metadata_key(conn, r.embedding_id, "scope", "app")
+                else:
+                    if not str(r.scope or "").strip():
+                        _upsert_metadata_key(conn, r.embedding_id, "scope", "universal")
 
             conn.commit()
         except Exception:
@@ -222,7 +242,12 @@ def main() -> int:
         after = _load_curated_records(conn)
         _print_stats("After", after)
 
-        changed = len(planned_moves) + len(remaining_universal_ids)
+        changed_ids = {
+            *[r.embedding_id for r, _ in planned_moves],
+            *remaining_universal_ids,
+            *[r.embedding_id for r in legacy_type_records],
+        }
+        changed = len(changed_ids)
         print(f"\nChanged rule count: {changed}")
         if changed == 0:
             print("No changes applied. Exiting with code 1.")

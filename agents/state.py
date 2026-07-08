@@ -47,3 +47,4 @@ class TestState(TypedDict, total=False):
     _rag_last_app_package: str
     _knowledge_query_hint_injected: bool
     _last_page_app_key: str
+    _last_clickable_count: int

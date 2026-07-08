@@ -293,3 +293,15 @@ def test_click_exact_mode_with_index_clicks_direct_target(monkeypatch):
     out = tools_module.click.invoke({"label": "应用列表", "index": 1})
     assert "fallback=next_candidate" not in out
     assert d.rid_click_count == 1
+
+
+def test_extract_curated_rule_label_for_conflict_match():
+    assert (
+        tools_module._extract_curated_rule_label("在MainActivity点击“应用列表”时，优先匹配 class=textview")
+        == "应用列表"
+    )
+    assert (
+        tools_module._extract_curated_rule_label('在MainActivity点击"应用"时，优先匹配 class=textview')
+        == "应用"
+    )
+    assert tools_module._extract_curated_rule_label("普通人工规则：先等待页面稳定") == ""

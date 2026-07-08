@@ -226,3 +226,71 @@ action_semantic = ",".join(parts)
 3. 最后做 Phase 4（存量清理）
 
 这样可以先快速止血，再做长期知识质量闭环。
+
+---
+
+## 8. 全局风险补充（Review 合并）
+
+### 8.1 知识冲突仲裁（高优先级）
+
+风险：当前存在三条写入路径（人工 curated、自动 experience、自动升级 curated），同一 label 可能产生冲突规则，Agent 无法自动判别优先级。
+
+改法（纳入 Phase 3）：
+
+1. 在 `tools/__init__.py::_maybe_promote_exact_rule` 升级前，先查同 app 下同 label 的人工 curated。
+2. 若存在人工规则且与自动候选冲突（class/path/rid 不一致）：
+   - 不自动写入 curated；
+   - 仅写 experience；
+   - 打冲突日志（含 rule_id、差异字段）。
+3. 规则优先级明确化：`人工 curated > 自动 curated > experience`。
+
+验收：
+
+- 冲突场景下不出现自动覆盖人工规则；
+- 日志可追踪冲突原因。
+
+### 8.2 Agent“自我怀疑”与主动降级（高优先级）
+
+风险：当前 Agent 常在不确定状态下继续试错，直到 budget 耗尽，耗时且体验差。
+
+改法（纳入 `agents/graph.py::agent_node`，复用已有 SystemMessage 注入模式）：
+
+触发条件（任一命中）：
+
+1. 连续 3 步同页无进展；
+2. 当前 page_info 与 Goal 关键目标长期不对齐；
+3. `get_screen_info` 元素集合突变（疑似弹窗/异常页）。
+
+触发后注入系统指令：
+
+- 明确要求先做一次 `get_screen_info` 复核；
+- 若仍不确定，优先 `report_done(status="abort", summary="页面异常，建议人工确认")`。
+
+验收：
+
+- `MAX_TURNS_EXHAUSTED` 占比下降；
+- “异常页卡死”场景平均步数下降。
+
+### 8.3 端到端黄金用例集（中高优先级）
+
+风险：当前单测覆盖函数逻辑，但缺少真实设备端到端回归，难以防止行为回退。
+
+改法（新增 Phase 5）：
+
+1. 选 5 条历史成功 run（跨不同 App、复杂度）。
+2. 固定 `user_request + goal_description`，形成黄金用例。
+3. 每次核心改动后跑一轮，比较：
+   - 成功率
+   - 总步数
+   - 总耗时
+   - 误点率（WARNING 模糊匹配次数）
+
+落地建议：
+
+- `tests/integration/` 新增用例入口；
+- 通过 `--run-integration` 开关控制（默认本地可选，CI 分层执行）。
+
+验收：
+
+- 黄金集成功率稳定（不低于基线）；
+- 关键场景误点率持续下降。
