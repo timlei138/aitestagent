@@ -37,6 +37,12 @@ click("A") → click("B") → click("A") → ...
 - 候选冲突时，按 rid > role+label > path 的优先级决策。
 - App/页面特定导航规则优先从 RAG（人工知识/操作经验）读取并执行，不在此处硬编码场景特例。
 
+## 精确点击
+- click 支持精确参数：`index`、`rid`、`class_name`、`path_contains`。
+- 当页面有多个同名元素时，必须用这些参数区分，不要只传 label。
+- `index` 与 page_info 的 `[n]` 一一对应，优先使用 index 精确点击。
+- 若返回“`N 个候选匹配`”错误，说明参数不够精确；请在 page_info 中找到唯一区分特征后重试。
+
 ## 验证报告
 - 每完成一个 verification 条件，**立刻**调用一次 assert_verification(condition, result) 报告结果，不要全部集中到最后
 - 在调用 assert_verification 前，先确保当前页面就是该验证项的证据页面（避免多项使用同一页面截图）

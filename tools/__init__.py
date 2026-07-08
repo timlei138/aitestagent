@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -85,6 +86,10 @@ def get_screen_info(mode: str = "full") -> str:
     if ctx.perceiver is None:
         return "Perceiver not available - no Android device connected"
     understanding = ctx.perceiver.perceive()
+    indexed_clickables = [
+        e for e in understanding.elements if getattr(e, "clickable", False) and (e.label or "")
+    ]
+    clickable_index_map = {id(e): i for i, e in enumerate(indexed_clickables)}
     # 页面身份: activity + 标题
     act = understanding.activity.split(".")[-1] if understanding.activity else "?"
     title = understanding.page_title or ""
@@ -112,20 +117,20 @@ def get_screen_info(mode: str = "full") -> str:
                 unique.append(e)
         lines.append(f"clickable_elements={len(unique)}")
         for item in unique[:50]:
-            lines.append(_format_element_line(item))
+            lines.append(_format_element_line(item, clickable_index_map.get(id(item))))
     else:
         # 全量：导航项 + 所有元素
         lines.append(f"primary_paths={len(understanding.primary_paths)}")
         for item in understanding.primary_paths[:40]:
-            lines.append(_format_element_line(item))
+            lines.append(_format_element_line(item, clickable_index_map.get(id(item))))
         lines.append(f"all_elements={len(understanding.elements)}")
         for item in understanding.elements[:60]:
-            lines.append(_format_element_line(item))
+            lines.append(_format_element_line(item, clickable_index_map.get(id(item))))
 
     return "\n".join(lines)
 
 
-def _format_element_line(item: Any) -> str:
+def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
     """格式化单个元素为一行。"""
     rid = item.resource_id or ""
     cls = item.class_name or ""
@@ -143,8 +148,9 @@ def _format_element_line(item: Any) -> str:
         extra += f" switch_state={state}"
     if ctx_path:
         extra += f" path='{ctx_path}'"
+    idx_prefix = f"[{clickable_index}] " if clickable_index is not None else ""
     return (
-        f'- [{item.region}/{item.role}] "{item.label}"{extra}'
+        f'- {idx_prefix}[{item.region}/{item.role}] "{item.label}"{extra}'
         f" bounds={item.bounds}{clickable_mark}"
     )
 
@@ -213,6 +219,13 @@ _ROLE_PRIORITY: dict[str, int] = {
     "container": 9,
 }
 
+_CLICK_PREF_DEFAULT_WEIGHTS = {
+    "textview": 4,
+    "path": 4,
+    "label_role": 3,
+    "avoid_class": 3,
+}
+
 
 def _expand_zh_keywords(words: list[str]) -> list[str]:
     """将中文控件词扩展为英文 class 关键词。
@@ -227,7 +240,94 @@ def _expand_zh_keywords(words: list[str]) -> list[str]:
     return list(dict.fromkeys(words + extras))  # 去重保顺序
 
 
-def _score_element(el: Any, words: list[str]) -> int:
+def _normalize_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _extract_click_preferences_from_rag(rag_summary: str) -> dict[str, Any]:
+    """从 RAG 文本中提取 click 候选偏好（轻量规则解析）。"""
+    text = _normalize_text(rag_summary)
+    if not text:
+        return {}
+    prefs: dict[str, Any] = {
+        "label_contains": [],
+        "role_prefer": [],
+        "class_prefer": [],
+        "path_contains": [],
+        "avoid_class": [],
+        "weights": dict(_CLICK_PREF_DEFAULT_WEIGHTS),
+    }
+
+    if "应用列表" in text:
+        prefs["label_contains"].append("应用列表")
+    if "role=list_entry" in text or "role 为 list_entry" in text:
+        prefs["role_prefer"].append("list_entry")
+    if "textview" in text or "class为textview" in text or "class 是 textview" in text:
+        prefs["class_prefer"].append("textview")
+    if "taskbar_container > taskbar_view" in text:
+        prefs["path_contains"].append("taskbar_container > taskbar_view")
+    if "framelayout" in text and ("避免" in text or "不要" in text or "降级" in text):
+        prefs["avoid_class"].append("framelayout")
+
+    if not any(
+        prefs.get(k)
+        for k in ("label_contains", "role_prefer", "class_prefer", "path_contains")
+    ):
+        return {}
+    return prefs
+
+
+def _prefs_active_for_description(prefs: dict[str, Any] | None, description: str) -> bool:
+    if not prefs:
+        return False
+    labels = [str(x).strip().lower() for x in (prefs.get("label_contains") or []) if x]
+    if not labels:
+        return True
+    desc = _normalize_text(description)
+    return any(lbl in desc for lbl in labels)
+
+
+def _pref_bonus_for_element(
+    el: Any, prefs: dict[str, Any] | None, description: str
+) -> int:
+    if not _prefs_active_for_description(prefs, description):
+        return 0
+    weights = dict(_CLICK_PREF_DEFAULT_WEIGHTS)
+    if isinstance((prefs or {}).get("weights"), dict):
+        weights.update(prefs.get("weights") or {})
+
+    bonus = 0
+    cls = _normalize_text(getattr(el, "class_name", "")).split(".")[-1]
+    role = _normalize_text(getattr(el, "role", ""))
+    label = _normalize_text(getattr(el, "label", ""))
+    path = _normalize_text(getattr(el, "context_path", ""))
+
+    if cls and cls in [str(v).lower() for v in (prefs or {}).get("class_prefer", [])]:
+        bonus += int(weights["textview"])
+    if any(
+        str(v).strip().lower() in path for v in (prefs or {}).get("path_contains", []) if v
+    ):
+        bonus += int(weights["path"])
+    if any(
+        str(v).strip().lower() in label
+        for v in (prefs or {}).get("label_contains", [])
+        if v
+    ) and (
+        not (prefs or {}).get("role_prefer")
+        or role in [str(v).lower() for v in (prefs or {}).get("role_prefer", [])]
+    ):
+        bonus += int(weights["label_role"])
+    if cls and cls in [str(v).lower() for v in (prefs or {}).get("avoid_class", [])]:
+        bonus -= int(weights["avoid_class"])
+    return bonus
+
+
+def _score_element(
+    el: Any,
+    words: list[str],
+    prefs: dict[str, Any] | None = None,
+    description: str = "",
+) -> int:
     """为单个元素计算匹配得分。字段权重：label=3, rid=3, assoc=2, cls=1, ctx_path=1。
     CJK 词精确匹配失败时，退化为字符级重叠计分（阈值 >= 0.67）。
     搜索栏 / 输入框降权，避免被误匹配为导航项。"""
@@ -287,6 +387,7 @@ def _score_element(el: Any, words: list[str]) -> int:
                     score += max(1, int(weight * overlap))
                     break
 
+    score += _pref_bonus_for_element(el, prefs, description)
     return score
 
 
@@ -391,6 +492,8 @@ def _has_cjk(text: str) -> bool:
 def _disambiguate_container(
     best_el: Any,
     all_elements: list[Any],
+    prefs: dict[str, Any] | None = None,
+    description: str = "",
 ) -> Any | None:
     """当最佳匹配是大型容器（list_entry/container）且存在同 label 的 navigation_item
     子元素时，返回子元素替代容器。解决 taskbar_view 等容器遮盖子控件的问题。"""
@@ -407,6 +510,17 @@ def _disambiguate_container(
     if best_area <= 0:
         return None
 
+    allow_list_entry = _prefs_active_for_description(
+        prefs, description
+    ) and "list_entry" in [
+        str(v).lower() for v in (prefs or {}).get("role_prefer", [])
+    ]
+    allowed_roles = {"navigation_item", "button", "tab"}
+    if allow_list_entry:
+        allowed_roles.add("list_entry")
+
+    picked = None
+    picked_key: tuple[int, int] | None = None
     for el in all_elements:
         if not el.clickable or el is best_el:
             continue
@@ -414,27 +528,73 @@ def _disambiguate_container(
         if el_label != best_label:
             continue
         el_role = getattr(el, "role", "")
-        if el_role not in ("navigation_item", "button", "tab"):
+        if el_role not in allowed_roles:
             continue
         eb = el.bounds
         if not eb or len(eb) != 4:
             continue
         el_area = (eb[2] - eb[0]) * (eb[3] - eb[1])
-        if el_area > 0 and el_area < best_area * 0.5:
-            logger.info(
-                "_disambiguate: role=%s label=%r → role=%s (area %d→%d)",
-                best_role,
-                best_label,
-                el_role,
-                best_area,
-                el_area,
-            )
-            return el
-    return None
+        if not (el_area > 0 and el_area < best_area * 0.5):
+            continue
+        pref_bonus = _pref_bonus_for_element(el, prefs, description)
+        key = (pref_bonus, -el_area)
+        if picked is None or (picked_key is not None and key > picked_key):
+            picked = el
+            picked_key = key
+    if picked is not None:
+        logger.info(
+            "_disambiguate: role=%s label=%r → role=%s class=%s",
+            best_role,
+            best_label,
+            getattr(picked, "role", ""),
+            getattr(picked, "class_name", ""),
+        )
+    return picked
+
+
+def _rank_click_candidates(
+    understanding: Any,
+    description: str,
+    known_ids: list[dict[str, Any]] | None = None,
+    prefs: dict[str, Any] | None = None,
+) -> list[tuple[int, int, Any]]:
+    if understanding is None:
+        return []
+    all_elements = list(understanding.primary_paths) + [
+        e for e in understanding.elements if e not in understanding.primary_paths
+    ]
+    desc_lower = description.lower().strip()
+    raw_words = [w for w in re.split(r"\s+", desc_lower) if w] or [desc_lower]
+    words = [w for w in raw_words if (len(w) > 1 or _has_cjk(w))] or raw_words
+    expanded_words = _expand_zh_keywords(words)
+
+    candidates: list[tuple[int, int, Any]] = []
+    for el in all_elements:
+        if not el.clickable:
+            continue
+        score = _score_element(el, expanded_words, prefs, description)
+        if score <= 0:
+            continue
+        if known_ids:
+            score += _score_known_identity(el, known_ids)
+        role_pri = _ROLE_PRIORITY.get(getattr(el, "role", ""), 50)
+        candidates.append((score, role_pri, el))
+    candidates.sort(
+        key=lambda x: (
+            -x[0],
+            len(x[2].label or ""),
+            x[1],
+            x[2].bounds[1],
+            x[2].bounds[0],
+        )
+    )
+    return candidates
 
 
 def _find_best_element_with_known(
-    understanding: Any, description: str
+    understanding: Any,
+    description: str,
+    prefs: dict[str, Any] | None = None,
 ) -> tuple[Any | None, list[dict[str, Any]]]:
     """定位最佳元素并返回经验库查询结果（供 click 兜底复用，避免重复 DB 查询）。
 
@@ -463,6 +623,10 @@ def _find_best_element_with_known(
             if rid:
                 for el in all_elements:
                     if getattr(el, "resource_id", "") == rid and el.clickable:
+                        # 若当前 query 命中了 RAG 偏好，避免容器 rid 抢占。
+                        if _prefs_active_for_description(prefs, description):
+                            if _pref_bonus_for_element(el, prefs, description) <= 0:
+                                continue
                         logger.info(
                             "Experience hit: rid=%s (click_count=%d)",
                             rid,
@@ -471,38 +635,15 @@ def _find_best_element_with_known(
                         return el, known_ids
 
     # ── 正常路径: 语义搜索 + 历史身份加分 ──
-    desc_lower = description.lower().strip()
-    raw_words = [w for w in re.split(r"\s+", desc_lower) if w]
-    if not raw_words:
-        raw_words = [desc_lower]
-    words = [w for w in raw_words if (len(w) > 1 or _has_cjk(w))]
-    if not words:
-        words = raw_words
-    expanded_words = _expand_zh_keywords(words)
-
     best: tuple[int, int, Any] | None = None
-    scanned = 0
-    for el in all_elements:
-        if not el.clickable:
-            continue
-        scanned += 1
-        score = _score_element(el, expanded_words)
-        if score <= 0:
-            continue
-        if known_ids:
-            score += _score_known_identity(el, known_ids)
-        role_pri = _ROLE_PRIORITY.get(getattr(el, "role", ""), 50)
-        # 短 label 优先（更接近精确匹配），其次 role 优先级
-        cur_key = (score, -len(el.label or ""), -role_pri)
-        best_key = (
-            (best[0], -len(best[2].label or ""), -best[1]) if best else (-1, 0, 0)
-        )
-        if best is None or cur_key > best_key:
-            best = (score, role_pri, el)
+    ranked = _rank_click_candidates(understanding, description, known_ids, prefs)
+    scanned = len([e for e in all_elements if getattr(e, "clickable", False)])
+    if ranked:
+        best = ranked[0]
 
     if best is not None:
         best_el = best[2]
-        child = _disambiguate_container(best_el, all_elements)
+        child = _disambiguate_container(best_el, all_elements, prefs, description)
         if child is not None:
             best = (best[0], best[1], child)
             best_el = child
@@ -519,7 +660,10 @@ def _find_best_element_with_known(
             "_find_best: desc=%r NO match (scanned %d clickable, words=%s)",
             description,
             scanned,
-            expanded_words,
+            _expand_zh_keywords(
+                [w for w in re.split(r"\s+", description.lower().strip()) if w]
+                or [description.lower().strip()]
+            ),
         )
     return (best[2] if best else None), known_ids
 
@@ -835,8 +979,191 @@ def query_element_identity(alias: str, app_package: str = "") -> str:
 # ═══════════════════════════════════════════
 
 
+def _is_target_consistent(candidate, original_label: str, click_prefs: dict) -> bool:
+    """回退候选必须与原始目标语义一致，防止乱点到无关元素。"""
+    cand_label = (candidate.label or "").strip()
+    target_words = [w.strip() for w in original_label.split(" ") if w.strip()]
+    if any(w in cand_label for w in target_words if len(w) >= 2):
+        return True
+    if click_prefs:
+        for kw in click_prefs.get("label_contains", []) or []:
+            if kw in cand_label:
+                return True
+    return False
+
+
+def _is_expected_destination(
+    ctx: Any, post_page_id: str, pre_page_id: str, original_label: str
+) -> bool:
+    """页面变化后检查是否到达预期目标（后置特征检测，非关键词泛匹配）。"""
+    if not post_page_id or not pre_page_id or post_page_id == pre_page_id:
+        return False
+    try:
+        u = ctx.perceiver.perceive() if ctx.perceiver else None
+        if u is None:
+            return True
+        labels_lower = [(e.label or "").strip().lower() for e in (u.elements or [])]
+        t = original_label.strip().lower()
+        # 全部应用/应用列表 → 必须出现搜索框（rid=search_input_all_apps）或应用网格
+        if any(k in t for k in ("应用列表", "全部应用", "所有应用")):
+            return any(
+                "search_input_all_apps" in (getattr(e, "resource_id", "") or "").lower()
+                for e in (u.elements or [])
+            )
+        return True
+    except Exception:
+        return True
+
+
+def _rid_matches(actual_rid: str, expected_rid: str) -> bool:
+    actual = _normalize_text(actual_rid)
+    expected = _normalize_text(expected_rid)
+    if not actual or not expected:
+        return False
+    if actual == expected:
+        return True
+    return actual.endswith("/" + expected) or actual.split("/")[-1] == expected
+
+
+def _exact_clickable_candidates(
+    understanding: Any,
+    *,
+    rid: str = "",
+    class_name: str = "",
+    path_contains: str = "",
+    index: int = -1,
+) -> tuple[list[Any], str]:
+    if understanding is None:
+        return [], "ERROR: 页面信息不可用，无法执行精确点击"
+    clickables = [
+        e for e in (understanding.elements or []) if e.clickable and (e.label or "").strip()
+    ]
+    if index >= 0:
+        if index >= len(clickables):
+            return (
+                [],
+                f"ERROR: index={index} 越界（当前可点击元素 {len(clickables)} 个）",
+            )
+        candidates = [clickables[index]]
+    else:
+        candidates = list(clickables)
+
+    rid_filter = (rid or "").strip()
+    cls_filter = _normalize_text(class_name).split(".")[-1]
+    path_filter = _normalize_text(path_contains)
+
+    if rid_filter:
+        candidates = [
+            e
+            for e in candidates
+            if _rid_matches(getattr(e, "resource_id", "") or "", rid_filter)
+        ]
+    if cls_filter:
+        candidates = [
+            e
+            for e in candidates
+            if _normalize_text(getattr(e, "class_name", "")).split(".")[-1] == cls_filter
+        ]
+    if path_filter:
+        candidates = [
+            e
+            for e in candidates
+            if path_filter in _normalize_text(getattr(e, "context_path", ""))
+        ]
+
+    if not candidates:
+        return [], "ERROR: 未找到匹配元素，请调整 rid/class_name/path_contains/index"
+    if len(candidates) > 1:
+        labels = []
+        for e in candidates[:6]:
+            name = (getattr(e, "label", "") or "").strip() or "?"
+            labels.append(name)
+        return (
+            [],
+            f"ERROR: {len(candidates)} 个候选匹配（{'/'.join(labels)}），请追加 path_contains 或 rid 缩小范围",
+        )
+    return candidates, ""
+
+
+def _maybe_promote_exact_rule(
+    ctx: Any,
+    *,
+    label: str,
+    pre_page: str,
+    matched_el: Any,
+) -> None:
+    kb = getattr(ctx, "knowledge_base", None)
+    if not kb or matched_el is None:
+        return
+    app_pkg = (ctx.device.current_app() or {}).get("package", "")
+    if not app_pkg:
+        return
+
+    rid = getattr(matched_el, "resource_id", "") or ""
+    cls = _normalize_text(getattr(matched_el, "class_name", "")).split(".")[-1]
+    path = getattr(matched_el, "context_path", "") or ""
+    post_page = _capture_page_id(ctx)
+    action = f'click_exact("{label}")'
+    if rid:
+        action += f" rid={rid}"
+    if cls:
+        action += f" class={cls}"
+    if path:
+        action += f" path={path}"
+
+    kb.save_experience(
+        app_package=app_pkg,
+        page=pre_page or "",
+        action=action,
+        to_page=post_page or "",
+        outcome="成功",
+        detail="exact_click",
+    )
+
+    if not rid:
+        return
+    evidence = 0
+    for row in _query_known_by_rid(rid):
+        try:
+            evidence = max(evidence, int(row.get("click_count", 0) or 0))
+        except Exception:
+            continue
+    if evidence < 3:
+        return
+
+    page_name = (pre_page or "").split("「")[0] or "当前页面"
+    rule = f"在{page_name}点击“{label}”时，优先匹配"
+    rule_parts = []
+    if cls:
+        rule_parts.append(f"class={cls}")
+    if path:
+        rule_parts.append(f"path={path}")
+    if rid:
+        rule_parts.append(f"rid={rid.split('/')[-1]}")
+    if not rule_parts:
+        return
+    rule += " 且 ".join(rule_parts)
+    existing = kb.query_curated_rules(app_pkg, top_k=20)
+    if rule in existing:
+        return
+    kb.save_curated_rule(
+        app_package=app_pkg,
+        content=rule,
+        scope="app",
+        scenario="auto_exact_click",
+        quality_score=0.8,
+    )
+
+
 @tool
-def click(label: str, alternatives: str = "") -> str:
+def click(
+    label: str,
+    alternatives: str = "",
+    rid: str = "",
+    class_name: str = "",
+    path_contains: str = "",
+    index: int = -1,
+) -> str:
     """点击页面上指定文本, 描述, 资源 id 或关联标签的元素。
 
     点击策略（v2）：
@@ -860,9 +1187,16 @@ def click(label: str, alternatives: str = "") -> str:
     # 收集所有待搜索的目标（label + alternatives 逗号分隔）
     alt_list = [a.strip() for a in (alternatives or "").split(",") if a.strip()]
     search_targets = [label] + alt_list
+    exact_mode = bool((rid or "").strip() or (class_name or "").strip() or (path_contains or "").strip() or index >= 0)
+    click_prefs = {}
+    try:
+        click_prefs = dict(getattr(ctx, "_click_preferences", {}) or {})
+    except Exception:
+        click_prefs = {}
 
-    # 语义搜索 → 最佳元素（内部已查询经验库，复用 known_ids）
+    # 语义搜索/精确搜索 → 最佳元素（内部已查询经验库，复用 known_ids）
     best_el, known_ids, matched_label = None, [], label
+    ranked_candidates: list[tuple[int, int, Any]] = []
     if ctx.perceiver is not None:
         try:
             understanding = ctx.perceiver.perceive()
@@ -879,28 +1213,112 @@ def click(label: str, alternatives: str = "") -> str:
             logger.warning("click: perceive failed | %s", exc)
             understanding = None
 
-        for target in search_targets:
-            try:
-                best_el, known_ids = _find_best_element_with_known(
-                    understanding, target
-                )
-                if best_el is not None:
-                    matched_label = target
-                    logger.info(
-                        "click: hit target=%r (primary=%r) role=%s label=%r",
-                        target,
-                        label,
-                        getattr(best_el, "role", ""),
-                        getattr(best_el, "label", ""),
+        if exact_mode:
+            exact_candidates, err = _exact_clickable_candidates(
+                understanding,
+                rid=rid,
+                class_name=class_name,
+                path_contains=path_contains,
+                index=index,
+            )
+            if err:
+                return err
+            best_el = exact_candidates[0]
+            matched_label = label
+            logger.info(
+                "click exact: label=%r rid=%r class=%r path=%r index=%s -> %r",
+                label,
+                rid,
+                class_name,
+                path_contains,
+                index,
+                getattr(best_el, "label", ""),
+            )
+        else:
+            for target in search_targets:
+                try:
+                    best_el, known_ids = _find_best_element_with_known(
+                        understanding, target, click_prefs
                     )
-                    break
-                logger.info("click: miss target=%r (alt for %r)", target, label)
-            except Exception as exc:
-                logger.warning("click: search failed for %r | %s", target, exc)
+                    if best_el is not None:
+                        matched_label = target
+                        ranked_candidates = _rank_click_candidates(
+                            understanding, target, known_ids, click_prefs
+                        )
+                        logger.info(
+                            "click: hit target=%r (primary=%r) role=%s label=%r",
+                            target,
+                            label,
+                            getattr(best_el, "role", ""),
+                            getattr(best_el, "label", ""),
+                        )
+                        break
+                    logger.info("click: miss target=%r (alt for %r)", target, label)
+                except Exception as exc:
+                    logger.warning("click: search failed for %r | %s", target, exc)
+    else:
+        understanding = None
 
-    def _with_snapshot(base_result: str) -> str:
+    def _is_container_like(el: Any) -> bool:
+        cls = _normalize_text(getattr(el, "class_name", "")).split(".")[-1]
+        role = _normalize_text(getattr(el, "role", ""))
+        return cls in ("framelayout", "viewgroup", "linearlayout") or role in (
+            "container",
+            "list_entry",
+        )
+
+    def _should_skip_rid_fastpath(el: Any, description: str) -> bool:
+        if not _prefs_active_for_description(click_prefs, description):
+            return False
+        rid = _normalize_text(getattr(el, "resource_id", ""))
+        cls = _normalize_text(getattr(el, "class_name", "")).split(".")[-1]
+        label_text = _normalize_text(getattr(el, "label", ""))
+        if "taskbar_view" in rid and cls == "framelayout":
+            return True
+        if cls == "framelayout" and any(
+            t in label_text for t in (click_prefs.get("label_contains") or [])
+        ):
+            return True
+        return False
+
+    def _perform_click_on_element(el: Any, desc: str) -> tuple[bool, str]:
+        role = getattr(el, "role", "")
+        rid = getattr(el, "resource_id", "") or ""
+        rid_is_unique = False
+        if rid and understanding is not None:
+            rid_count = sum(
+                1 for e in (understanding.elements or []) if (e.resource_id or "") == rid
+            )
+            rid_is_unique = rid_count <= 1
+        if role in ("switch", "switch_row"):
+            ctx.device.click_bounds(el.bounds)
+            time.sleep(1.0)
+            new_checked = _check_switch_state(ctx, el)
+            if new_checked is not None:
+                state_cn = "开启" if new_checked else "关闭"
+                return (
+                    True,
+                    _format_click_log(desc, el, strategy="bounds")
+                    + f" | 开关状态: {state_cn}",
+                )
+            return True, _format_click_log(desc, el, strategy="bounds")
+        if (
+            rid_is_unique
+            and rid
+            and (exact_mode or (not _should_skip_rid_fastpath(el, desc)))
+            and ctx.device.click_resource_id(rid)
+        ):
+            return True, _format_click_log(desc, el, strategy="resource_id")
+        if getattr(el, "text", "") and ctx.device.click_text(el.text):
+            return True, _format_click_log(desc, el, strategy="text")
+        if getattr(el, "bounds", (0, 0, 0, 0)) != (0, 0, 0, 0):
+            ctx.device.click_bounds(el.bounds)
+            return True, _format_click_log(desc, el, strategy="bounds")
+        return False, ""
+
+    def _with_snapshot(base_result: str, clicked_el: Any) -> str:
         """为成功的点击结果追加操作后页面状态。"""
-        _save_click_identity(ctx, label, best_el, understanding)
+        _save_click_identity(ctx, label, clicked_el, understanding)
         snap = _post_click_snapshot(ctx, _pre_title, label)
         return f"{base_result} | {snap}" if snap else base_result
 
@@ -909,57 +1327,54 @@ def click(label: str, alternatives: str = "") -> str:
         if promoted is not None:
             best_el = promoted
 
-        role = getattr(best_el, "role", "")
-        # 开关类控件直接用 bounds 点击（避免 click_text 误点到导航项）
-        if role in ("switch", "switch_row"):
-            old_checked = getattr(best_el, "checked", None)
-            ctx.device.click_bounds(best_el.bounds)
-            time.sleep(1.0)
-            new_checked = _check_switch_state(ctx, best_el)
-            if new_checked is not None:
-                state_cn = "开启" if new_checked else "关闭"
-                result = (
-                    _format_click_log(matched_label, best_el, strategy="bounds")
-                    + f" | 开关状态: {state_cn}"
+        ok, result = _perform_click_on_element(best_el, matched_label)
+        if ok:
+            _record_page_transition(ctx, _pre_page, label)
+            if exact_mode:
+                _maybe_promote_exact_rule(
+                    ctx,
+                    label=label,
+                    pre_page=_pre_page,
+                    matched_el=best_el,
                 )
-            else:
-                result = _format_click_log(matched_label, best_el, strategy="bounds")
-            _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(result)
-
-        # 其他可点击元素 — 检查 rid 是否唯一，唯一时优先 resource_id，否则用 bounds
-        rid = best_el.resource_id or ""
-        rid_is_unique = False
-        if rid and understanding is not None:
-            rid_count = sum(
-                1
-                for e in (understanding.elements or [])
-                if (e.resource_id or "") == rid
-            )
-            rid_is_unique = rid_count <= 1
-
-        if rid_is_unique and rid and ctx.device.click_resource_id(rid):
-            _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(
-                _format_click_log(matched_label, best_el, strategy="resource_id")
-            )
-        if best_el.text and ctx.device.click_text(best_el.text):
-            _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(
-                _format_click_log(matched_label, best_el, strategy="text")
-            )
-        if best_el.bounds != (0, 0, 0, 0):
-            ctx.device.click_bounds(best_el.bounds)
-            _record_page_transition(ctx, _pre_page, label)
-            return _with_snapshot(
-                _format_click_log(matched_label, best_el, strategy="bounds")
-            )
+                return _with_snapshot(result, best_el)
+            post_page = _capture_page_id(ctx)
+            if (
+                post_page
+                and _pre_page
+                and post_page == _pre_page
+                and _is_container_like(best_el)
+                and len(ranked_candidates) >= 2
+            ):
+                for _, _, candidate in ranked_candidates[1:4]:
+                    if candidate is best_el:
+                        continue
+                    # 硬门槛：回退候选必须与原始目标语义一致
+                    if not _is_target_consistent(candidate, matched_label, click_prefs):
+                        continue
+                    ok2, result2 = _perform_click_on_element(candidate, matched_label)
+                    if not ok2:
+                        continue
+                    _record_page_transition(ctx, _pre_page, label)
+                    post_page2 = _capture_page_id(ctx)
+                    # 成功条件：RAG prefs 命中时走严格后置特征检查，否则页面变化即成功
+                    if click_prefs:
+                        if not _is_expected_destination(
+                            ctx, post_page2, _pre_page, label
+                        ):
+                            continue
+                    elif not post_page2 or post_page2 == _pre_page:
+                        continue
+                    return _with_snapshot(
+                        result2 + " | fallback=next_candidate", candidate
+                    )
+            return _with_snapshot(result, best_el)
 
     # 兆底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):
         _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(ctx, _pre_page, label)
-        return _with_snapshot(f"已点击: {label} (strategy=text-fallback)")
+        return _with_snapshot(f"已点击: {label} (strategy=text-fallback)", None)
     # 历史身份兜底
     if not known_ids:
         known_ids = _query_known_identities(label)
@@ -969,7 +1384,8 @@ def click(label: str, alternatives: str = "") -> str:
             _save_click_identity(ctx, label, None, understanding)
             _record_page_transition(ctx, _pre_page, label)
             return _with_snapshot(
-                f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)"
+                f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)",
+                None,
             )
     # 百分比 bounds 兜底
     for known in known_ids:
@@ -1000,12 +1416,13 @@ def click(label: str, alternatives: str = "") -> str:
                 return _with_snapshot(
                     f"已点击历史坐标: {label} "
                     f"bounds=({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) "
-                    f"(strategy=pct-bounds-fallback)"
+                    f"(strategy=pct-bounds-fallback)",
+                    None,
                 )
     if ctx.device.click_resource_id(label):
         _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(ctx, _pre_page, label)
-        return _with_snapshot(f"已点击资源: {label} (strategy=rid-fallback)")
+        return _with_snapshot(f"已点击资源: {label} (strategy=rid-fallback)", None)
     return f"未找到可点击元素: {label}"
 
 
@@ -1064,16 +1481,49 @@ def _format_click_log(query: str, el: Any, strategy: str) -> str:
     return " | ".join(parts)
 
 
+# 已知挥发性 label 模式：时间、日期、电量、通知、热词等动态内容
+_VOLATILE_LABEL_PATTERNS = [
+    re.compile(r"^\d{1,2}:\d{2}$"),                      # 时间
+    re.compile(r"^\d{1,2}月\d{1,2}日"),                    # 日期
+    re.compile(r"^(周一|周二|周三|周四|周五|周六|周日)$"),    # 星期
+    re.compile(r"^\d+%$"),                                 # 电量百分比
+    re.compile(r"^(正在|已).*(充电|USB)"),                   # 充电状态
+    re.compile(r"^\d+ (分钟|小时|天)前$"),                   # 相对时间
+]
+
+
+def _is_volatile_label(label: str) -> bool:
+    """判断 label 是否为挥发性动态内容。"""
+    s = (label or "").strip()
+    if len(s) >= 12:
+        return False  # 长文本通常不是动态的
+    return any(p.search(s) for p in _VOLATILE_LABEL_PATTERNS)
+
+
 def _capture_page_id(ctx: Any) -> str:
-    """捕获当前页面身份标识（activity + 页面标题）。"""
+    """捕获当前页面身份标识（activity + 页面标题 + 稳定可见元素签名）。
+    过滤挥发性 label（时间、电量等），避免假页面变化干扰回退判定。"""
     try:
         app = ctx.device.current_app()
         act = (app.get("activity", "") or "").split(".")[-1]
+        title = ""
+        vis_hash = ""
         if ctx.perceiver:
             understanding = ctx.perceiver.perceive()
             title = getattr(understanding, "page_title", "") or ""
-            return f"{act}「{title}」" if title else act
-        return act
+            labels = sorted(
+                (e.label or "").strip().lower()
+                for e in (understanding.elements or [])
+                if getattr(e, "clickable", False)
+                and (e.label or "").strip()
+                and not _is_volatile_label(e.label)
+            )
+            if labels:
+                vis_hash = hashlib.md5(
+                    "|".join(labels[:80]).encode("utf-8")
+                ).hexdigest()[:12]
+        base = f"{act}「{title}」" if title else act
+        return f"{base}#{vis_hash}" if vis_hash else base
     except Exception:
         return ""
 

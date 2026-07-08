@@ -24,6 +24,9 @@ class ToolContext:
     _ws_emit: Any = field(
         default=None, repr=False
     )  # WebSocket 实时事件回调 (type, payload) -> None
+    _click_preferences: dict[str, Any] = field(
+        default_factory=dict, repr=False
+    )  # RAG 解析出的点击偏好（仅当前 run）
     _last_screenshot_path: str = (
         ""  # perceive() cache miss 时自动存盘的截图路径，assert_verification 失败时回退
     )

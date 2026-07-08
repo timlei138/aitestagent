@@ -25,7 +25,7 @@ from llm.clients import (
     _default_should_retry,
 )
 from agents.state import TestState
-from tools import AGENT_TOOLS, get_tool_context
+from tools import AGENT_TOOLS, get_tool_context, _extract_click_preferences_from_rag
 
 import app_paths
 
@@ -841,6 +841,25 @@ def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
     return "\n\n".join(parts)
 
 
+def _apply_click_preferences(
+    ctx: Any, rag_summary: str, effective_app_package: str = ""
+) -> None:
+    """将 RAG 文本中的点击偏好解析并缓存到 ToolContext。"""
+    if not ctx:
+        return
+    prefs = _extract_click_preferences_from_rag(rag_summary or "")
+    if not prefs:
+        return
+    try:
+        prefs["app_package"] = str(effective_app_package or "")
+        prefs["rag_hash"] = hashlib.md5((rag_summary or "").encode("utf-8")).hexdigest()[
+            :12
+        ]
+        setattr(ctx, "_click_preferences", prefs)
+    except Exception:
+        logger.debug("apply click preferences failed", exc_info=True)
+
+
 def _should_include_rag(state: TestState, effective_app_package: str) -> bool:
     """Phase 1: 从“每轮预注入”收敛为“首轮 + 触发式注入”。
 
@@ -941,6 +960,7 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
             "_rag_injected_once": False,
             "_rag_last_app_package": "",
             "_knowledge_query_hint_injected": False,
+            "_last_page_app_key": "",
         }
     )
 
@@ -983,6 +1003,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     ctx = get_tool_context()
     page_info = "unknown"
     pid = ""
+    current_app_key = ""
     t0 = 0
     if ctx and ctx.perceiver:
         try:
@@ -994,6 +1015,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             act = u.activity.split(".")[-1] if u.activity else "?"
             title = u.page_title or ""
             pid = act + "「" + title + "」" if title else act
+            pkg = (ctx.device.current_app() or {}).get("package", "") if ctx.device else ""
+            current_app_key = f"{pkg}:{act}"
             n_clickable = sum(1 for e in u.elements if e.clickable and e.label)
             lines = [
                 "page=" + pid,
@@ -1004,8 +1027,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 ),
                 "clickable=" + str(n_clickable),
             ]
+            click_idx = 0
             for e in u.elements:
-                if e.clickable and e.label and not _should_skip_hotword_element(e):
+                if e.clickable and e.label:
                     role = e.role or ""
                     rid = (e.resource_id or "").split("/")[-1] if e.resource_id else ""
                     extra = ""
@@ -1013,7 +1037,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                         extra += " [" + role + "]"
                     if rid:
                         extra += " rid=" + rid
-                    lines.append("  - " + e.label + extra)
+                    lines.append(f"  - [{click_idx}] " + e.label + extra)
+                    click_idx += 1
                     if len(lines) > 25:
                         break
             page_info = "\n".join(lines)
@@ -1042,6 +1067,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         rag_summary, rag_truncated = _clip_to_token_budget(rag_summary, 500)
         if rag_truncated:
             budget_violation_count += 1
+    if include_rag and rag_summary and ctx:
+        _apply_click_preferences(ctx, rag_summary, effective_app_package)
     hist_lines = [
         f"  [{s.get('status','')}] {s.get('intent','')}: {str(s.get('observation',''))[:100]}"
         for s in history[-10:]
@@ -1096,6 +1123,20 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         knowledge_query_hint_injected = True
     elif not force_query_hint:
         knowledge_query_hint_injected = False
+
+    last_page_app_key = str(state.get("_last_page_app_key", "") or "")
+    app_switch_hint = ""
+    if current_app_key and current_app_key != last_page_app_key and last_page_app_key:
+        app_switch_hint = (
+            f"已进入新应用上下文（{current_app_key}），如不确定下一步，优先调用 "
+            f'query_app_knowledge(query="当前页面下一步", app_package="{effective_app_package}")。'
+        )
+        msgs.append(SystemMessage(content="APP_SWITCH_HINT: " + app_switch_hint))
+        if ctx and getattr(ctx, "_ws_emit", None):
+            try:
+                ctx._ws_emit("knowledge_hint", {"message": app_switch_hint})
+            except Exception:
+                pass
     msgs.append(
         HumanMessage(
             content="Goal:\n"
@@ -1280,6 +1321,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "budget_violation_count": budget_violation_count,
                 "_finalization_hint_injected": finalization_hint_injected,
                 "_knowledge_query_hint_injected": knowledge_query_hint_injected,
+                "_last_page_app_key": current_app_key or last_page_app_key,
                 "_rag_injected_once": bool(state.get("_rag_injected_once", False))
                 or bool(rag_summary),
                 "_rag_last_app_package": (
@@ -1298,6 +1340,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "budget_violation_count": budget_violation_count,
             "_finalization_hint_injected": finalization_hint_injected,
             "_knowledge_query_hint_injected": knowledge_query_hint_injected,
+            "_last_page_app_key": current_app_key or last_page_app_key,
             "_rag_injected_once": bool(state.get("_rag_injected_once", False))
             or bool(rag_summary),
             "_rag_last_app_package": (
