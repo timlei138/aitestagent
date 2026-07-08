@@ -53,12 +53,15 @@ class ChromaBackend(VectorStoreBackend):
 
     def __init__(
         self,
-        persist_dir: str = "storage/knowledge",
+        persist_dir: str = "",
         embedding_provider: str = "huggingface",   # huggingface | openai
         embedding_model: str = "BAAI/bge-large-zh-v1.5",
         api_key: str | None = None,
         base_url: str | None = None,
     ):
+        import app_paths
+        if not persist_dir:
+            persist_dir = app_paths.KNOWLEDGE_DIR_STR
         from langchain_chroma import Chroma
 
         if embedding_provider == "huggingface":

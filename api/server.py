@@ -31,13 +31,15 @@ from llm.multimodal import multimodal_vision_call, reset_vision_capability_state
 from tools.context import ToolContext
 from tools import set_tool_context
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-FRONTEND_DIR = BASE_DIR / "frontend"
-FRONTEND_DIST_DIR = FRONTEND_DIR / "dist"
+import app_paths
+
+BASE_DIR = app_paths.DATA_DIR
+FRONTEND_DIST_DIR = app_paths.FRONTEND_DIST_DIR
 INDEX_FILE = FRONTEND_DIST_DIR / "index.html"
+PROJECT_ROOT = app_paths.BUNDLE_DIR
 
 app = FastAPI(title="AI 自动化测试 Agent")
-config = TestConfig.from_yaml("config.yaml")
+config = TestConfig.from_yaml(app_paths.get_config_yaml_path())
 ws_manager = WebSocketManager()
 
 # ── 初始化工具上下文 ──
@@ -159,7 +161,7 @@ def _cleanup_old_screenshots(keep_runs: int = 20):
     import os
     import shutil
 
-    base = os.path.join("storage", "screenshots")
+    base = app_paths.SCREENSHOT_DIR_STR
     if not os.path.isdir(base):
         return
     # 只清理符合 run_id 命名规则的目录（必须含连字符，排除纯名称手工目录）
@@ -174,7 +176,8 @@ def _cleanup_old_screenshots(keep_runs: int = 20):
         shutil.rmtree(os.path.join(base, old_dir), ignore_errors=True)
 
 
-# 启动时清理旧截图
+# 启动时确保目录存在 + 清理旧截图
+app_paths.ensure_dirs()
 _cleanup_old_screenshots()
 
 
@@ -253,25 +256,38 @@ set_ws_emit_callback(lambda t, p: ws_manager.broadcast_sync(t, p))
 
 
 # ── USB 热插拔监听 ──
+_usb_monitor_proc: subprocess.Popen | None = None
+
 def _start_usb_monitor() -> None:
     """后台线程：adb track-devices 实时监听 USB 插拔，毫秒级响应。"""
     import subprocess
     import threading
+    import atexit
+
+    def _kill_adb():
+        global _usb_monitor_proc
+        if _usb_monitor_proc is not None:
+            try:
+                _usb_monitor_proc.terminate()
+            except Exception:
+                pass
+
+    atexit.register(_kill_adb)
 
     def _monitor():
-        global _device, _perceiver
+        global _device, _perceiver, _usb_monitor_proc
         logger = logging.getLogger(__name__)
         prev_has_device = _device is not None
         while True:
             try:
-                proc = subprocess.Popen(
+                _usb_monitor_proc = subprocess.Popen(
                     ["adb", "track-devices"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     text=True,
                     bufsize=1,
                 )
-                for line in proc.stdout:
+                for line in _usb_monitor_proc.stdout:
                     line = line.strip()
                     if not line:
                         continue
@@ -528,13 +544,15 @@ async def delete_report(run_id: str):
     for step in report.get("steps", []) or []:
         p = str(step.get("screenshot_path", "") or "").strip()
         if p:
-            image_paths.add(BASE_DIR / p.replace("/", "\\"))
+            _pp = Path(p.replace("/", "\\"))
+            image_paths.add(_pp if _pp.is_absolute() else PROJECT_ROOT / _pp)
     for item in report.get("verification_results", []) or []:
         p = str(item.get("screenshot", "") or "").strip()
         if p:
-            image_paths.add(BASE_DIR / p.replace("/", "\\"))
+            _pp = Path(p.replace("/", "\\"))
+            image_paths.add(_pp if _pp.is_absolute() else PROJECT_ROOT / _pp)
 
-    run_shot_dir = BASE_DIR / "storage" / "screenshots" / run_id
+    run_shot_dir = app_paths.SCREENSHOT_DIR / run_id
     if run_shot_dir.exists() and run_shot_dir.is_dir():
         for f in run_shot_dir.rglob("*"):
             if f.is_file() and _safe_unlink(f):
@@ -547,14 +565,14 @@ async def delete_report(run_id: str):
     for p in image_paths:
         try:
             resolved = p.resolve()
-            if BASE_DIR not in resolved.parents:
+            if PROJECT_ROOT not in resolved.parents and app_paths.DATA_DIR not in resolved.parents:
                 continue
         except Exception:
             continue
         if _safe_unlink(p):
             deleted_images += 1
 
-    logs_dir = BASE_DIR / "logs" / "runs"
+    logs_dir = app_paths.LOG_RUN_DIR
     if logs_dir.exists() and logs_dir.is_dir():
         for lf in logs_dir.glob(f"*{run_id}*langchain.log"):
             if _safe_unlink(lf):
@@ -578,10 +596,15 @@ async def delete_report(run_id: str):
     }
 
 
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
 # ── 静态文件 ──
 
-app.mount("/storage", StaticFiles(directory=str(BASE_DIR / "storage")), name="storage")
-app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+app.mount("/storage", StaticFiles(directory=str(app_paths.DATA_DIR)), name="storage")
+app.mount("/static", StaticFiles(directory=str(app_paths.FRONTEND_DIST_DIR.parent)), name="static")
 
 
 @app.get("/")

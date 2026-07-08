@@ -10,10 +10,9 @@ from typing import Any
 
 import yaml
 
+import app_paths
+
 logger = logging.getLogger(__name__)
-_LOG_DIR = Path("logs")
-_LOG_RUN_DIR = Path("logs") / "runs"
-_LOG_SERVICE_FILE = _LOG_DIR / "service.log"
 
 
 @dataclass
@@ -38,10 +37,10 @@ class TestConfig:
     perception_mode: str = "hybrid"
 
     # ── RAG ──
-    rag_persist_dir: str = "storage/knowledge"
+    rag_persist_dir: str = ""
 
     # ── 存储 ──
-    db_path: str = "storage/test_history.db"
+    db_path: str = ""
 
     # ── 安全 / Debug ──
     safety_level: str = "strict"
@@ -51,7 +50,9 @@ class TestConfig:
     # ──────────────── YAML 加载 ────────────────
 
     @classmethod
-    def from_yaml(cls, path: str = "config.yaml") -> "TestConfig":
+    def from_yaml(cls, path: str = "") -> "TestConfig":
+        if not path:
+            path = app_paths.get_config_yaml_path()
         if not logging.getLogger().handlers:
             logging.basicConfig(
                 level=logging.INFO,
@@ -65,7 +66,7 @@ class TestConfig:
                 data = yaml.safe_load(f) or {}
 
         # ── 加载本地敏感配置（API Key 等，已在 .gitignore 中）──
-        local_path = str(Path(path).parent / "config.local.yaml")
+        local_path = app_paths.get_config_local_yaml_path()
         if os.path.exists(local_path):
             with open(local_path, "r", encoding="utf-8") as f:
                 local_data = yaml.safe_load(f) or {}
@@ -74,6 +75,17 @@ class TestConfig:
 
         # 只取 dataclass 中定义的字段
         config = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+        # 回退到 app_paths 默认路径
+        if not config.rag_persist_dir:
+            config.rag_persist_dir = app_paths.KNOWLEDGE_DIR_STR
+        elif not os.path.isabs(config.rag_persist_dir):
+            # 相对路径 → 转为 AppData 下的绝对路径
+            config.rag_persist_dir = str(app_paths.DATA_DIR / config.rag_persist_dir)
+        if not config.db_path:
+            config.db_path = app_paths.DB_PATH_STR
+        elif not os.path.isabs(config.db_path):
+            config.db_path = str(app_paths.DATA_DIR / config.db_path)
 
         # ── 凭证回退链 ──
         config.api_key = config.api_key or os.getenv("OPENAI_API_KEY")
@@ -140,7 +152,7 @@ class TestConfig:
     @classmethod
     def _ensure_service_log_handler(cls) -> None:
         """确保服务状态日志仅写入 logs/service.log，且避免重复注册 handler。"""
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
+        app_paths.ensure_dirs()
         root = logging.getLogger()
 
         for h in root.handlers:
@@ -154,7 +166,7 @@ class TestConfig:
                     or record.name.startswith("langgraph")
                 )
 
-        fh = logging.FileHandler(_LOG_SERVICE_FILE, encoding="utf-8")
+        fh = logging.FileHandler(app_paths.SERVICE_LOG, encoding="utf-8")
         fh._service_log_handler = True
         fh.setLevel(logging.INFO)
         fh.addFilter(_ExcludeLangchainLogs())
@@ -162,7 +174,7 @@ class TestConfig:
             logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
         )
         root.addHandler(fh)
-        logger.info("Service log file: %s", _LOG_SERVICE_FILE)
+        logger.info("Service log file: %s", app_paths.SERVICE_LOG)
 
 
 def resolve_perception_mode(config: TestConfig) -> tuple[str, bool]:
@@ -184,12 +196,11 @@ def resolve_perception_mode(config: TestConfig) -> tuple[str, bool]:
 
 
 def start_run_log(run_id: str) -> dict:
-    """为单次测试运行创建独立 langchain 日志文件。
-    返回 {"langchain_file": Path, "cleanup": callable}
-    """
+    """为单次测试运行创建独立 langchain 日志文件。"""
     import re
 
-    run_dir = _LOG_RUN_DIR
+    app_paths.ensure_dirs()
+    run_dir = app_paths.LOG_RUN_DIR
     run_dir.mkdir(parents=True, exist_ok=True)
     safe_id = re.sub(r"[<>:\"/\\|?* ]", "_", run_id)[:60]
     ts = datetime.now().strftime("%H%M%S")

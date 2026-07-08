@@ -3,7 +3,8 @@ from pathlib import Path
 import json
 import uuid
 
-from api.server import app, _get_relational_db, BASE_DIR
+from api.server import app, _get_relational_db
+import app_paths
 
 client = TestClient(app)
 
@@ -48,12 +49,12 @@ def test_report_delete_endpoint_cleans_artifacts():
     db = _get_relational_db()
     assert db is not None
     run_id = f"pytest-delete-{uuid.uuid4().hex[:8]}"
-    shot_rel = f"storage/screenshots/{run_id}/1_test.png"
-    shot_abs = BASE_DIR / shot_rel
+    shot_abs = app_paths.SCREENSHOT_DIR / run_id / "1_test.png"
     shot_abs.parent.mkdir(parents=True, exist_ok=True)
     shot_abs.write_bytes(b"fakepng")
+    shot_rel = f"storage/screenshots/{run_id}/1_test.png"
 
-    log_abs = BASE_DIR / "logs" / "runs" / f"000000_{run_id}_langchain.log"
+    log_abs = app_paths.LOG_RUN_DIR / f"000000_{run_id}_langchain.log"
     log_abs.parent.mkdir(parents=True, exist_ok=True)
     log_abs.write_text("fake log", encoding="utf-8")
 

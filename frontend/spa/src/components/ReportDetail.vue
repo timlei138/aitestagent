@@ -111,7 +111,11 @@ function fmtDuration(ms) {
 }
 
 function shotUrl(path, index) {
-  const normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '')
+  let normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '')
+  // 确保路径以 storage/ 开头以匹配服务器的 /storage 挂载点
+  if (!normalized.startsWith('storage/')) {
+    normalized = 'storage/' + normalized
+  }
   return `/${normalized}?v=${props.report?.id || 'report'}_${index}`
 }
 </script>

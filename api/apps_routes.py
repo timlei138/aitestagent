@@ -9,10 +9,12 @@ import yaml
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import app_paths
+
 router = APIRouter(prefix="/api/apps", tags=["apps"])
 
 # ── 存储路径 ──
-_APPS_YAML = Path("storage/apps.yaml")
+_APPS_YAML = Path(app_paths.get_apps_yaml_path())
 _lock = threading.Lock()
 
 

@@ -16,6 +16,8 @@ from llm.multimodal import multimodal_vision_call
 from tools.context import ToolContext
 from llm.safety import check_dangerous
 
+import app_paths
+
 logger = logging.getLogger(__name__)
 
 _CONTEXT: ToolContext | None = None
@@ -921,8 +923,18 @@ def click(label: str, alternatives: str = "") -> str:
             _record_page_transition(ctx, _pre_page, label)
             return _with_snapshot(result)
 
-        # 其他可点击元素 — resource_id > text > bounds（rid 唯一稳定，优先）
-        if best_el.resource_id and ctx.device.click_resource_id(best_el.resource_id):
+        # 其他可点击元素 — 检查 rid 是否唯一，唯一时优先 resource_id，否则用 bounds
+        rid = best_el.resource_id or ""
+        rid_is_unique = False
+        if rid and understanding is not None:
+            rid_count = sum(
+                1
+                for e in (understanding.elements or [])
+                if (e.resource_id or "") == rid
+            )
+            rid_is_unique = rid_count <= 1
+
+        if rid_is_unique and rid and ctx.device.click_resource_id(rid):
             _record_page_transition(ctx, _pre_page, label)
             return _with_snapshot(
                 _format_click_log(matched_label, best_el, strategy="resource_id")
@@ -1852,37 +1864,59 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
         if not hasattr(ctx, "_verifications"):
             ctx._verifications = []
         normalized = result if result in ("passed", "failed") else "unknown"
-        shot_path = ""
+        shot_path = ""        # 相对路径（供前端 /storage 挂载解析）
+        shot_abs_path = ""    # 绝对路径（供本地文件操作）
 
         # 每个验证点都尝试实时截图，失败时再回退到最近缓存截图。
         if ctx.device:
             try:
-                os.makedirs("storage/screenshots", exist_ok=True)
+                app_paths.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
                 safe_cond = re.sub(r"[^\w一-鿿-]", "_", condition[:30])
                 verify_index = len(getattr(ctx, "_verifications", [])) + 1
-                new_path = os.path.join(
-                    "storage/screenshots",
-                    f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{verify_index:02d}_{safe_cond}.png",
+                new_path = str(
+                    app_paths.SCREENSHOT_DIR
+                    / f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{verify_index:02d}_{safe_cond}.png"
                 )
                 ctx.device.screenshot().save(new_path)
-                shot_path = new_path.replace("\\", "/")
+                shot_abs_path = new_path
+                # 转为相对于 DATA_DIR 的路径，使前端 /storage 挂载能解析
+                try:
+                    shot_path = os.path.relpath(new_path, app_paths.DATA_DIR_STR).replace("\\", "/")
+                except Exception:
+                    shot_path = new_path.replace("\\", "/")
             except Exception:
-                shot_path = getattr(ctx, "_last_screenshot_path", "") or ""
+                shot_abs_path = getattr(ctx, "_last_screenshot_path", "") or ""
+                try:
+                    shot_path = (
+                        os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace("\\", "/")
+                        if shot_abs_path else ""
+                    )
+                except Exception:
+                    shot_path = shot_abs_path
         else:
-            shot_path = getattr(ctx, "_last_screenshot_path", "") or ""
+            shot_abs_path = getattr(ctx, "_last_screenshot_path", "") or ""
+            try:
+                shot_path = (
+                    os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace("\\", "/")
+                    if shot_abs_path else ""
+                )
+            except Exception:
+                shot_path = shot_abs_path
 
         if shot_path:
             shot_path = shot_path.replace("\\", "/")
+        if shot_abs_path:
+            shot_abs_path = shot_abs_path.replace("\\", "/")
 
         # failed 时追加视觉分析（短超时，不阻塞主流程）
         if (
             normalized == "failed"
             and ctx.verification_auto_vision
-            and shot_path
-            and os.path.exists(shot_path)
+            and shot_abs_path
+            and os.path.exists(shot_abs_path)
         ):
             try:
-                with open(shot_path, "rb") as fh:
+                with open(shot_abs_path, "rb") as fh:
                     image_b64 = base64.b64encode(fh.read()).decode("utf-8")
                 prompt = (
                     "请分析该失败截图，说明此验证项失败的可能原因。"
@@ -1944,11 +1978,11 @@ def save_screenshot(name: str = "") -> str:
     ctx = get_tool_context()
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
-    os.makedirs("storage/screenshots", exist_ok=True)
+    app_paths.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
     filename = name or f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if not filename.endswith(".png"):
         filename += ".png"
-    path = os.path.join("storage/screenshots", filename)
+    path = str(app_paths.SCREENSHOT_DIR / filename)
     ctx.device.screenshot().save(path)
     return path
 

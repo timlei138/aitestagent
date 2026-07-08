@@ -27,6 +27,8 @@ from llm.clients import (
 from agents.state import TestState
 from tools import AGENT_TOOLS, get_tool_context
 
+import app_paths
+
 logger = logging.getLogger(__name__)
 
 _relational_db = None
@@ -59,8 +61,9 @@ _SCREENSHOT_ACTIONS = {
 
 
 def _take_step_screenshot(ctx, run_id: str, tool_seq: int) -> str:
-    """截取当前屏幕，返回相对路径。
-    路径格式：storage/screenshots/{safe_run_id}/{tool_seq}_{ts}.png
+    """截取当前屏幕，返回相对于 DATA_DIR 的路径。
+    路径格式：screenshots/{safe_run_id}/{tool_seq}_{ts}.png
+    前端通过 /storage 挂载点访问。
     """
     from datetime import datetime as _dt
 
@@ -68,13 +71,18 @@ def _take_step_screenshot(ctx, run_id: str, tool_seq: int) -> str:
     safe_run_id = re.sub(r"[^\w\-]", "_", run_id)
     if not safe_run_id:
         safe_run_id = "unknown"
-    shot_dir = os.path.join("storage", "screenshots", safe_run_id)
+    shot_dir = os.path.join(app_paths.SCREENSHOT_DIR_STR, safe_run_id)
     os.makedirs(shot_dir, exist_ok=True)
     ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
     path = os.path.join(shot_dir, f"{tool_seq}_{ts}.png")
     img = ctx.device.screenshot()  # 返回 PIL Image（无参）
     img.save(path)
-    return path
+    # 返回相对路径（相对于 DATA_DIR），使前端 /storage 挂载能正确解析
+    try:
+        rel = os.path.relpath(path, app_paths.DATA_DIR_STR)
+        return rel.replace(os.sep, "/")
+    except Exception:
+        return path
 
 
 # ═══ Prompt ═══

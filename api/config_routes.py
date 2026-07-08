@@ -7,12 +7,11 @@ import yaml
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+import app_paths
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/config", tags=["config"])
-
-_CONFIG_PATH = "config.yaml"
-_LOCAL_CONFIG_PATH = "config.local.yaml"
 
 # 可通过前端修改的字段白名单
 _EDITABLE_FIELDS = (
@@ -150,13 +149,17 @@ def _save_yaml(updates: dict) -> None:
 
     # ── 非敏感 → config.yaml ──
     if public_updates:
-        path = Path(_CONFIG_PATH)
+        # 读取：优先 AppData，其次 bundle
+        read_path = Path(app_paths.get_config_yaml_path())
+        # 写入：始终写 AppData
+        write_path = app_paths.CONFIG_YAML
+        write_path.parent.mkdir(parents=True, exist_ok=True)
         existing: dict = {}
-        if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
+        if read_path.exists():
+            with open(read_path, "r", encoding="utf-8") as f:
                 existing = yaml.safe_load(f) or {}
         existing.update(public_updates)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(write_path, "w", encoding="utf-8") as f:
             yaml.dump(
                 existing,
                 f,
@@ -164,17 +167,21 @@ def _save_yaml(updates: dict) -> None:
                 default_flow_style=False,
                 sort_keys=False,
             )
-        logger.info("config.yaml saved: %s", list(public_updates.keys()))
+        logger.info("config.yaml saved to %s: %s", write_path, list(public_updates.keys()))
 
     # ── 敏感 → config.local.yaml ──
     if local_updates:
-        local_path = Path(_LOCAL_CONFIG_PATH)
+        # 读取：优先 AppData，其次 bundle
+        read_local = Path(app_paths.get_config_local_yaml_path())
+        # 写入：始终写 AppData
+        write_local = app_paths.CONFIG_LOCAL_YAML
+        write_local.parent.mkdir(parents=True, exist_ok=True)
         local_existing: dict = {}
-        if local_path.exists():
-            with open(local_path, "r", encoding="utf-8") as f:
+        if read_local.exists():
+            with open(read_local, "r", encoding="utf-8") as f:
                 local_existing = yaml.safe_load(f) or {}
         local_existing.update(local_updates)
-        with open(local_path, "w", encoding="utf-8") as f:
+        with open(write_local, "w", encoding="utf-8") as f:
             yaml.dump(
                 local_existing,
                 f,
@@ -182,4 +189,4 @@ def _save_yaml(updates: dict) -> None:
                 default_flow_style=False,
                 sort_keys=False,
             )
-        logger.info("config.local.yaml saved: %s", list(local_updates.keys()))
+        logger.info("config.local.yaml saved to %s: %s", write_local, list(local_updates.keys()))

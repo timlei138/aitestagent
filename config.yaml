@@ -8,6 +8,5 @@ embedding_provider: huggingface
 embedding_model: BAAI/bge-large-zh-v1.5
 embedding_base_url: ''
 perception_mode: ui_tree
-rag_persist_dir: storage/knowledge
 safety_level: strict
 vision_enabled: false

@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from typing import Any, Callable
 
+import app_paths
+
 
 class PerceptionMode:
     UI_TREE = "ui_tree"
@@ -131,16 +133,17 @@ class SmartPerceiver:
         # ── 截图存盘：perceive cache miss 时顺带存磁盘，供 assert_verification 复用（零额外截图调用）
         try:
             if snapshot.image_base64:
-                os.makedirs("storage/screenshots", exist_ok=True)
+                app_paths.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
                 from datetime import datetime as _dt
 
-                _shot_path = os.path.join(
-                    "storage/screenshots",
-                    f"perceive_{_dt.now().strftime('%Y%m%d_%H%M%S_%f')}.png",
+                _shot_path = str(
+                    app_paths.SCREENSHOT_DIR
+                    / f"perceive_{_dt.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
                 )
                 with open(_shot_path, "wb") as _f:
                     _f.write(base64.b64decode(snapshot.image_base64))
                 if self._screenshot_sink is not None:
+                    # 发送绝对路径，消费方按需转换为相对路径
                     self._screenshot_sink(_shot_path)
         except Exception:
             pass

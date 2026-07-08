@@ -84,6 +84,12 @@ class DeviceController:
         except Exception:
             pass
 
+        # 打包模式下 sys.executable 指向 exe，无法运行 python -m
+        import app_paths as _ap
+        if _ap.FROZEN:
+            logger.warning("Frozen mode: ATX agent not detected, skipping auto-init (use `python -m uiautomator2 init` manually)")
+            return
+
         logger.info("ATX agent not detected, auto-installing...")
         try:
             subprocess.run(
