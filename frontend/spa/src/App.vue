@@ -606,7 +606,13 @@ function handleEvent(data) {
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
     case "stream_token": wp?.onToken(); break;
-    case "tool_start": wp?.addTool(content.name || "", (content.input || {}).label || ""); break;
+    case "tool_start":
+      wp?.addTool(
+        content.name || "",
+        (content.input || {}).label || "",
+        content.intent_text || content.intent || ""
+      );
+      break;
     case "tool_end": wp?.finishTool(content.name || "", 0); break;
     case "step_start": refreshSnapshot(); break;
     case "step_end": refreshSnapshot(); break;
@@ -614,6 +620,9 @@ function handleEvent(data) {
     case "device_status_change":
       deviceOnline.value = !!content.connected;
       if (!content.connected) stopSnapshotPolling();
+      break;
+    case "knowledge_hint":
+      wp?.addEntry({ type: "log", icon: "🧠", text: content.message || "建议先查询知识再执行动作" });
       break;
     case "anomaly": wp?.addEntry({ type: "error", icon: "⚠", text: content.message || content.description || "" }); break;
 
@@ -1037,6 +1046,7 @@ async function saveKb() {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          old_entry_id: oldRow.id || '',
           old_content: oldRow.content || '',
           old_app_package: (oldRow.metadata && oldRow.metadata.app_package) || '',
           old_knowledge_type: (oldRow.metadata && oldRow.metadata.knowledge_type) || '',
@@ -1082,8 +1092,10 @@ function openKbDetail(row) {
 
 async function deleteKbItem(row) {
   if (!row) return;
+  const entryId = row.id || '';
   const pkg = (row.metadata && row.metadata.app_package) || '';
   const type = (row.metadata && row.metadata.knowledge_type) || '';
+  const content = row.content || '';
   if (!pkg && !type) { ElMessage.warning('无法定位该条知识'); return; }
   try {
     await ElMessageBox.confirm(
@@ -1092,14 +1104,20 @@ async function deleteKbItem(row) {
     );
   } catch { return; }
   const params = new URLSearchParams();
+  if (entryId) params.set('entry_id', entryId);
   if (pkg) params.set('app_package', pkg);
   if (type) params.set('knowledge_type', type);
+  if (content) params.set('content', content);
   try {
     const res = await fetch(`/api/knowledge?${params}`, { method: 'DELETE' });
     const data = await res.json();
-    ElMessage.success(`已删除 ${data.deleted || 0} 条`);
-    kbDetailVisible.value = false;
-    loadKbList();
+    if (res.ok && data.status === 'success') {
+      ElMessage.success(`已删除 ${data.deleted || 0} 条`);
+      kbDetailVisible.value = false;
+      loadKbList();
+    } else {
+      ElMessage.error(data.detail || data.message || '删除失败');
+    }
   } catch (e) {
     ElMessage.error(`删除失败: ${e}`);
   }
@@ -1123,8 +1141,12 @@ async function deleteKbByFilter() {
   try {
     const res = await fetch(`/api/knowledge?${params}`, { method: 'DELETE' });
     const data = await res.json();
-    ElMessage.success(`已删除 ${data.deleted || 0} 条`);
-    loadKbList();
+    if (res.ok && data.status === 'success') {
+      ElMessage.success(`已删除 ${data.deleted || 0} 条`);
+      loadKbList();
+    } else {
+      ElMessage.error(data.detail || data.message || '删除失败');
+    }
   } catch (e) {
     ElMessage.error(`删除失败: ${e}`);
   }

@@ -247,12 +247,9 @@ def _calc_budget(goal: dict) -> dict[str, int]:
     )
     max_tool_calls_total = 16 + pages * 9 + verifications * 8
     max_agent_iterations = min(max(2 + pages + verifications, 6), 18)
-    max_turns_per_iteration = min(
-        max(
-            (max_tool_calls_total + max_agent_iterations - 1) // max_agent_iterations, 6
-        ),
-        12,
-    )
+    # 每轮子图预算作为断路器，不应过小导致在关键动作前被截断。
+    # 迭代层(route)负责主导结束；这里取较宽上限，避免“即将点击关键元素时 __end__”。
+    max_turns_per_iteration = min(max(max_tool_calls_total, 10), 50)
     return {
         "max_tool_calls_total": max_tool_calls_total,
         "max_agent_iterations": max_agent_iterations,
@@ -302,7 +299,7 @@ def _should_skip_hotword_element(element: Any) -> bool:
     label = (getattr(element, "label", "") or "").strip()
     if rid == "search_keyword":
         return True
-    if rid == "search_bar_bg" and len(label) >= 12:
+    if rid == "search_bar_bg" and len(label) >= 8:
         return True
     return False
 
@@ -422,11 +419,13 @@ def _run_agent(
                 continue
             if name not in _SKIP_EMIT and _ctx and _ctx._ws_emit:
                 try:
+                    _intent_text = (getattr(last_ai, "content", "") or "").strip()
                     _ctx._ws_emit(
                         "tool_start",
                         {
                             "name": name,
                             "input": {"label": _build_tool_target(name, args)},
+                            "intent_text": _intent_text[:200],
                         },
                     )
                 except Exception:
@@ -842,6 +841,54 @@ def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
     return "\n\n".join(parts)
 
 
+def _should_include_rag(state: TestState, effective_app_package: str) -> bool:
+    """Phase 1: 从“每轮预注入”收敛为“首轮 + 触发式注入”。
+
+    触发条件：
+    1) 首轮；
+    2) app_package 变化；
+    3) 最近一步出现循环/无进展信号或失败。
+    """
+    history = state.get("step_history", []) or []
+    if not history:
+        return True
+
+    if not bool(state.get("_rag_injected_once", False)):
+        return True
+
+    last_pkg = str(state.get("_rag_last_app_package", "") or "")
+    if effective_app_package and effective_app_package != last_pkg:
+        return True
+
+    last = history[-1] if history else {}
+    if bool(last.get("loop_detected")):
+        return True
+    if str(last.get("status", "")).lower() == "fail":
+        return True
+    obs = str(last.get("observation", "") or "")
+    if any(k in obs for k in ("NO_PROGRESS", "COOLDOWN", "LOOP_DETECTED")):
+        return True
+    return False
+
+
+def _should_force_query_app_knowledge(
+    state: TestState, include_rag: bool, rag_summary: str
+) -> bool:
+    """在高风险轮次给出明确知识查询指令（仅触发时）。"""
+    history = state.get("step_history", []) or []
+    if not history:
+        return False
+    last = history[-1]
+    obs = str(last.get("observation", "") or "")
+    risky = bool(last.get("loop_detected")) or str(last.get("status", "")).lower() == "fail"
+    if not risky and not any(k in obs for k in ("NO_PROGRESS", "COOLDOWN", "LOOP_DETECTED")):
+        return False
+    # 仍未得到可用 RAG 时，强提示先查知识
+    if include_rag and rag_summary:
+        return False
+    return True
+
+
 # ═══ NODES ═══
 
 
@@ -891,6 +938,9 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
             "started_at": datetime.now().isoformat(),
             "step_times": [],
             "budget_violation_count": budget_violation_count,
+            "_rag_injected_once": False,
+            "_rag_last_app_package": "",
+            "_knowledge_query_hint_injected": False,
         }
     )
 
@@ -980,14 +1030,18 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     goal_str = json.dumps(goal, ensure_ascii=False, indent=2)
     history = state.get("step_history", [])
     budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
-    rag_summary = _rag_ctx(
-        ctx.knowledge_base if ctx else None,
-        state.get("app_package", ""),
-        state.get("user_request", ""),
-    )
-    rag_summary, rag_truncated = _clip_to_token_budget(rag_summary, 500)
-    if rag_truncated:
-        budget_violation_count += 1
+    effective_app_package = goal.get("app_package", "") or state.get("app_package", "")
+    include_rag = _should_include_rag(state, effective_app_package)
+    rag_summary = ""
+    if include_rag:
+        rag_summary = _rag_ctx(
+            ctx.knowledge_base if ctx else None,
+            effective_app_package,
+            state.get("user_request", ""),
+        )
+        rag_summary, rag_truncated = _clip_to_token_budget(rag_summary, 500)
+        if rag_truncated:
+            budget_violation_count += 1
     hist_lines = [
         f"  [{s.get('status','')}] {s.get('intent','')}: {str(s.get('observation',''))[:100]}"
         for s in history[-10:]
@@ -1014,6 +1068,34 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             )
         )
         finalization_hint_injected = True
+    force_query_hint = _should_force_query_app_knowledge(state, include_rag, rag_summary)
+    knowledge_query_hint_injected = bool(
+        state.get("_knowledge_query_hint_injected", False)
+    )
+    if force_query_hint and not knowledge_query_hint_injected:
+        query_text = (state.get("user_request", "") or "").strip()[:40]
+        if not query_text:
+            query_text = "当前页面下一步"
+        hint_text = (
+            "检测到循环或无进展风险，下一步先调用 "
+            f'query_app_knowledge(query="{query_text}", app_package="{effective_app_package}") '
+            "再执行点击/滑动。"
+        )
+        msgs.append(
+            SystemMessage(
+                content=(
+                    "KNOWLEDGE_QUERY_REQUIRED: " + hint_text
+                )
+            )
+        )
+        if ctx and getattr(ctx, "_ws_emit", None):
+            try:
+                ctx._ws_emit("knowledge_hint", {"message": hint_text})
+            except Exception:
+                pass
+        knowledge_query_hint_injected = True
+    elif not force_query_hint:
+        knowledge_query_hint_injected = False
     msgs.append(
         HumanMessage(
             content="Goal:\n"
@@ -1022,6 +1104,12 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             + page_info
             + "\n\nHistory:\n"
             + hist_str
+            + (
+                "\n\nKnowledge Policy:\n默认不预置场景知识。若不确定下一步，"
+                "优先调用 query_app_knowledge(query, app_package) 获取当前场景知识。"
+                if not include_rag
+                else ""
+            )
             + ("\n\nRAG:\n" + rag_summary if rag_summary else "")
         )
     )
@@ -1191,6 +1279,14 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "conclusion": result.strip(),
                 "budget_violation_count": budget_violation_count,
                 "_finalization_hint_injected": finalization_hint_injected,
+                "_knowledge_query_hint_injected": knowledge_query_hint_injected,
+                "_rag_injected_once": bool(state.get("_rag_injected_once", False))
+                or bool(rag_summary),
+                "_rag_last_app_package": (
+                    effective_app_package
+                    if rag_summary
+                    else str(state.get("_rag_last_app_package", "") or "")
+                ),
                 "_tool_calls_log": list(state.get("_tool_calls_log", []))
                 + tool_calls_log,
             }
@@ -1201,6 +1297,14 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "messages": um,
             "budget_violation_count": budget_violation_count,
             "_finalization_hint_injected": finalization_hint_injected,
+            "_knowledge_query_hint_injected": knowledge_query_hint_injected,
+            "_rag_injected_once": bool(state.get("_rag_injected_once", False))
+            or bool(rag_summary),
+            "_rag_last_app_package": (
+                effective_app_package
+                if rag_summary
+                else str(state.get("_rag_last_app_package", "") or "")
+            ),
             "_tool_calls_log": list(state.get("_tool_calls_log", [])) + tool_calls_log,
         }
     )

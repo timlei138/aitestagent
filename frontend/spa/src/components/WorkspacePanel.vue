@@ -12,6 +12,7 @@
         <!-- tool -->
         <template v-else-if="entry.type === 'tool'">
           <span class="wp-icon-wrap wp-icon-tool">⚙</span>
+          <span v-if="entry.intent" class="wp-intent">AI意图: {{ entry.intent }}</span>
           <span class="wp-text">{{ entry.text }}</span>
           <span v-if="entry.detail" class="wp-detail">{{ entry.detail }}</span>
           <span class="wp-time">{{ entry.time }}</span>
@@ -87,12 +88,29 @@ function stopThinking() {
   }
 }
 
-function addTool(name, target) {
+function _stripPrefix(s) {
+  return String(s || '').replace(/^(?:#{1,3}\s*)?(?:DONE|ABORT)\s*[:：]\s*/im, '').trim()
+}
+
+function _shortIntentText(text) {
+  const cleaned = _stripPrefix(text).replace(/\s+/g, ' ').trim()
+  if (!cleaned) return ''
+  return cleaned.length > 80 ? cleaned.slice(0, 80) + '…' : cleaned
+}
+
+function addTool(name, target, intentText = '') {
   console.log('[WP] addTool:', name, target)
   startThinking()
   stopThinking()
   const text = target ? `${name} → ${target}` : name
-  timeline.value.push({ type: 'tool', icon: '⚙', text, time: now(), id: Date.now() })
+  timeline.value.push({
+    type: 'tool',
+    icon: '⚙',
+    text,
+    intent: _shortIntentText(intentText),
+    time: now(),
+    id: Date.now(),
+  })
 }
 
 function finishTool(name, elapsedMs) {
@@ -216,6 +234,7 @@ watch(() => timeline.value.length, () => {
 }
 .wp-text { color: var(--text-secondary, #5f6368); }
 .wp-entry.wp-user .wp-text { color: var(--text-primary, #1a1d23); }
+.wp-intent { color: var(--text-primary, #1a1d23); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42%; }
 .wp-detail { color: var(--text-muted, #9aa0a6); font-size: 11px; }
 .wp-result-text { font-weight: 600; }
 

@@ -13,7 +13,7 @@ def test_calc_budget_values():
     )
     assert budget["max_tool_calls_total"] == 59
     assert budget["max_agent_iterations"] == 7
-    assert budget["max_turns_per_iteration"] == 9
+    assert budget["max_turns_per_iteration"] == 50
 
 
 def test_determine_execution_status_uses_dynamic_iteration_budget():
@@ -86,3 +86,48 @@ def test_assert_verification_detail_retry_fallback(monkeypatch):
     assert "detail is required" in r2
     assert "记录完成" in r3
     assert fake_ctx._verifications[0]["detail"] == "detail unavailable after retries"
+
+
+def test_should_include_rag_on_first_iteration():
+    state = {"step_history": [], "_rag_injected_once": False}
+    assert graph._should_include_rag(state, "com.test.app") is True  # type: ignore[attr-defined]
+
+
+def test_should_include_rag_skips_stable_repeated_iterations():
+    state = {
+        "step_history": [{"status": "continue", "observation": "ok", "loop_detected": False}],
+        "_rag_injected_once": True,
+        "_rag_last_app_package": "com.test.app",
+    }
+    assert graph._should_include_rag(state, "com.test.app") is False  # type: ignore[attr-defined]
+
+
+def test_should_include_rag_when_recent_loop_detected():
+    state = {
+        "step_history": [{"status": "continue", "observation": "x", "loop_detected": True}],
+        "_rag_injected_once": True,
+        "_rag_last_app_package": "com.test.app",
+    }
+    assert graph._should_include_rag(state, "com.test.app") is True  # type: ignore[attr-defined]
+
+
+def test_should_force_query_app_knowledge_on_risky_no_rag():
+    state = {
+        "step_history": [
+            {"status": "continue", "observation": "NO_PROGRESS warning", "loop_detected": False}
+        ]
+    }
+    assert (
+        graph._should_force_query_app_knowledge(state, include_rag=False, rag_summary="")  # type: ignore[attr-defined]
+        is True
+    )
+
+
+def test_should_not_force_query_when_rag_already_available():
+    state = {
+        "step_history": [{"status": "fail", "observation": "x", "loop_detected": False}]
+    }
+    assert (
+        graph._should_force_query_app_knowledge(state, include_rag=True, rag_summary="## 人工知识")  # type: ignore[attr-defined]
+        is False
+    )

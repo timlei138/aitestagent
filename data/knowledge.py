@@ -39,13 +39,36 @@ class KnowledgeBase:
 
     # ── 通用存取 ──
 
+    @staticmethod
+    def _sanitize_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        """规范化 metadata，避免向量库因空列表值写入失败。"""
+        cleaned: dict[str, Any] = {}
+        for k, v in (metadata or {}).items():
+            if v is None:
+                continue
+            if isinstance(v, list):
+                normalized = [x for x in v if x not in (None, "")]
+                if normalized:
+                    cleaned[k] = normalized
+                continue
+            cleaned[k] = v
+        return cleaned
+
     def save_knowledge(self, knowledge: UIKnowledge) -> None:
+        metadata = dict(knowledge.metadata or {})
+        # 防御性规范化：人工知识写入时自动补齐 scope，避免“有数据但不可检索”
+        if knowledge.knowledge_type in self._TYPE_ALIASES.get(
+            "curated_rule", ["curated_rule"]
+        ):
+            if "scope" not in metadata or not metadata.get("scope"):
+                metadata["scope"] = "universal" if not knowledge.app_package else "app"
+        metadata = self._sanitize_metadata(metadata)
         self.backend.add(
             knowledge.content,
             {
                 "app_package": knowledge.app_package,
                 "knowledge_type": knowledge.knowledge_type,
-                **knowledge.metadata,
+                **metadata,
             },
         )
 
@@ -66,6 +89,25 @@ class KnowledgeBase:
             else:
                 filter_dict["$or"] = [{"knowledge_type": a} for a in aliases]
         return self.backend.search(query, filter_dict if filter_dict else None, top_k)
+
+    def list_entries(
+        self, app_package: str = "", knowledge_type: str = "", top_k: int = 50
+    ) -> list[dict[str, Any]]:
+        """列出知识（metadata 精确读取，不走向量相似度检索）。"""
+        where: dict[str, Any] = {}
+        if app_package:
+            where["app_package"] = app_package
+        if knowledge_type:
+            aliases = self._TYPE_ALIASES.get(knowledge_type, [knowledge_type])
+            if len(aliases) == 1:
+                where["knowledge_type"] = aliases[0]
+            else:
+                where["$or"] = [{"knowledge_type": a} for a in aliases]
+        items = self.backend.get_by_metadata(where, limit=top_k)
+        items.sort(
+            key=lambda r: str(r.get("metadata", {}).get("timestamp", "")), reverse=True
+        )
+        return items
 
     # ── 操作经验 (experience) ──
 
@@ -246,7 +288,7 @@ class KnowledgeBase:
                     "quality_score": quality_score,
                     "app_version": app_version,
                     "last_verified_at": last_verified_at or datetime.now().isoformat(),
-                    "applicable_domains": applicable_domains or [],
+                    "applicable_domains": applicable_domains,
                 },
             )
         )
@@ -275,6 +317,18 @@ class KnowledgeBase:
             {**type_filter, "app_package": "", "scope": "universal"},
             limit=top_k,
         )
+        # 兜底：兼容历史数据未写入 scope 的全局规则
+        if not universal_rules:
+            fallback_rules = self.backend.get_by_metadata(
+                {**type_filter, "app_package": ""},
+                limit=top_k * 2,
+            )
+            universal_rules = [
+                r
+                for r in fallback_rules
+                if str((r.get("metadata", {}) or {}).get("scope", "") or "").strip()
+                in ("", "universal")
+            ][:top_k]
         universal_lines = [
             f"- {str(r.get('content', '') or '')}" for r in universal_rules
         ]

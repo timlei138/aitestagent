@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from data.knowledge import KnowledgeBase
+from data.knowledge import KnowledgeBase, UIKnowledge
 
 
 class _FakeBackend:
@@ -52,6 +52,10 @@ class _FakeBackend:
             if len(out) >= limit:
                 break
         return out
+
+    def delete_by_ids(self, ids: list[str]) -> int:
+        del ids
+        return 0
 
 
 def _seed_rules(kb: KnowledgeBase):
@@ -117,3 +121,46 @@ def test_contamination_sentinel():
         rules = kb.query_curated_rules(app_package)
         for word in forbidden_words:
             assert word not in rules, f"CONTAMINATION: {app_package} contains {word}"
+
+
+def test_save_knowledge_auto_sets_universal_scope_for_global_curated_rule():
+    backend = _FakeBackend()
+    kb = KnowledgeBase(backend)
+    kb.save_knowledge(
+        UIKnowledge(
+            app_package="",
+            knowledge_type="curated_rule",
+            content="全局入口规则",
+            metadata={},
+        )
+    )
+    assert backend.records[0]["metadata"].get("scope") == "universal"
+
+
+def test_query_curated_rules_fallback_reads_global_rules_without_scope():
+    backend = _FakeBackend()
+    kb = KnowledgeBase(backend)
+    backend.add(
+        "缺少scope的全局规则",
+        {
+            "app_package": "",
+            "knowledge_type": "curated_rule",
+            # scope 故意缺失
+            "timestamp": "2026-01-01T00:00:00",
+        },
+    )
+    out = kb.query_curated_rules("com.zui.launcher")
+    assert "缺少scope的全局规则" in out
+
+
+def test_save_curated_rule_drops_empty_applicable_domains():
+    backend = _FakeBackend()
+    kb = KnowledgeBase(backend)
+    kb.save_curated_rule(
+        "",
+        "全局规则-empty-domains",
+        scope="universal",
+        reviewed_by="qa",
+        applicable_domains=[],
+    )
+    assert "applicable_domains" not in backend.records[0]["metadata"]

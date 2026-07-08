@@ -25,6 +25,7 @@ def _get_kb():
 
 # ── 数据模型 ──
 
+
 class KnowledgeEntry(BaseModel):
     app_package: str
     knowledge_type: str
@@ -33,7 +34,9 @@ class KnowledgeEntry(BaseModel):
 
 
 class KnowledgeUpdate(BaseModel):
-    """编辑知识：通过旧内容定位 + 新内容覆盖。"""
+    """编辑知识：优先通过旧条目 ID 精确替换；无 ID 时退化为严格唯一匹配。"""
+
+    old_entry_id: str = ""
     old_content: str
     old_app_package: str = ""
     old_knowledge_type: str = ""
@@ -47,7 +50,52 @@ class SearchRequest(BaseModel):
     top_k: int = 10
 
 
+def _normalized_curated_args(entry: KnowledgeEntry) -> dict[str, Any]:
+    if entry.knowledge_type == "curated_rule":
+        scope = (entry.metadata or {}).get("scope", "")
+        if not scope:
+            scope = "universal" if not entry.app_package else "app"
+        try:
+            quality_score = float((entry.metadata or {}).get("quality_score", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="quality_score 必须是数字") from exc
+        return {
+            "app_package": entry.app_package,
+            "content": entry.content,
+            "scope": scope,
+            "reviewed_by": (entry.metadata or {}).get("reviewed_by", "api"),
+            "domain": (entry.metadata or {}).get("domain", ""),
+            "scenario": (entry.metadata or {}).get("scenario", ""),
+            "quality_score": quality_score,
+            "app_version": (entry.metadata or {}).get("app_version", ""),
+            "last_verified_at": (entry.metadata or {}).get("last_verified_at", ""),
+            "applicable_domains": (entry.metadata or {}).get("applicable_domains"),
+        }
+    return {}
+
+
+def _save_entry(kb, entry: KnowledgeEntry) -> None:
+    from data.knowledge import UIKnowledge
+
+    if entry.knowledge_type == "curated_rule":
+        args = _normalized_curated_args(entry)
+        try:
+            kb.save_curated_rule(**args)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return
+
+    knowledge = UIKnowledge(
+        app_package=entry.app_package,
+        knowledge_type=entry.knowledge_type,
+        content=entry.content,
+        metadata=entry.metadata,
+    )
+    kb.save_knowledge(knowledge)
+
+
 # ── API ──
+
 
 @router.get("/count")
 def get_count():
@@ -78,70 +126,66 @@ def list_knowledge(
 ):
     """列出知识（默认返回最多 50 条，支持过滤）。"""
     kb = _get_kb()
-    # 用一个宽泛 query 拉取数据
-    q = query if query and query != "*" else (app_package or knowledge_type or "知识")
-    results = kb.query(
-        q,
+    results = kb.list_entries(
         app_package=app_package,
         knowledge_type=knowledge_type,
         top_k=top_k,
     )
+    if query and query != "*":
+        q = query.strip().lower()
+        results = [r for r in results if q in str(r.get("content", "")).lower()]
     return {"status": "success", "items": results, "total": len(results)}
 
 
 @router.post("")
 def add_knowledge(entry: KnowledgeEntry):
-    """手动新增一条知识。"""
+    """手动新增一条知识。curated_rule 类型走 save_curated_rule 以保证 scope 校验。"""
     kb = _get_kb()
-    from data.knowledge import UIKnowledge
-    knowledge = UIKnowledge(
-        app_package=entry.app_package,
-        knowledge_type=entry.knowledge_type,
-        content=entry.content,
-        metadata=entry.metadata,
-    )
-    kb.save_knowledge(knowledge)
+    _save_entry(kb, entry)
     return {"status": "success", "message": "知识已添加"}
 
 
 @router.put("")
 def update_knowledge(req: KnowledgeUpdate):
-    """编辑知识：按旧内容定位删除，再新增新条目。"""
+    """编辑知识：删除旧条目后新增新条目。"""
     kb = _get_kb()
-    from data.knowledge import UIKnowledge
 
-    # 1. 用 content + metadata 精确删除旧条目
-    results = kb.query(req.old_content[:80], app_package=req.old_app_package,
-                       knowledge_type=req.old_knowledge_type, top_k=20)
-    deleted = 0
-    for r in results:
-        if r.get("content", "") == req.old_content:
-            meta = r.get("metadata", {})
-            pkg = meta.get("app_package", "")
-            ktype = meta.get("knowledge_type", "")
-            if pkg or ktype:
-                filter_dict: dict[str, str] = {}
-                if pkg:
-                    filter_dict["app_package"] = pkg
-                if ktype:
-                    filter_dict["knowledge_type"] = ktype
-                del_count = kb.backend.delete(filter_dict)
-                if del_count > 0:
-                    deleted += del_count
-                    break  # 只删一条匹配的
+    delete_id = req.old_entry_id.strip()
+    if not delete_id:
+        where: dict[str, Any] = {}
+        if req.old_app_package:
+            where["app_package"] = req.old_app_package
+        if req.old_knowledge_type:
+            where["knowledge_type"] = req.old_knowledge_type
+        candidates = kb.backend.get_by_metadata(where, limit=200)
+        matched = [
+            r for r in candidates if str(r.get("content", "") or "") == req.old_content
+        ]
+        if not matched:
+            raise HTTPException(status_code=404, detail="未找到匹配的知识条目")
+        if len(matched) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "检测到多条同内容记录，已拒绝更新以避免误改。"
+                    "请刷新列表并使用 entry_id 精确更新。"
+                ),
+            )
+        delete_id = str(matched[0].get("id", "") or "").strip()
+        if not delete_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "当前记录缺少可用 entry_id，已拒绝更新以避免误改。"
+                    "请刷新列表后重试。"
+                ),
+            )
 
+    deleted = kb.backend.delete_by_ids([delete_id])
     if deleted == 0:
-        raise HTTPException(status_code=404, detail="未找到匹配的知识条目")
+        raise HTTPException(status_code=404, detail="旧知识条目不存在或已被删除")
 
-    # 2. 新增新条目
-    new = req.new_entry
-    knowledge = UIKnowledge(
-        app_package=new.app_package,
-        knowledge_type=new.knowledge_type,
-        content=new.content,
-        metadata=new.metadata,
-    )
-    kb.save_knowledge(knowledge)
+    _save_entry(kb, req.new_entry)
     return {"status": "success", "message": "知识已更新"}
 
 
@@ -149,11 +193,52 @@ def update_knowledge(req: KnowledgeUpdate):
 def delete_knowledge(
     app_package: str = Query(default=""),
     knowledge_type: str = Query(default=""),
+    content: str = Query(default=""),
+    entry_id: str = Query(default=""),
 ):
-    """按条件删除知识（app_package 和/或 knowledge_type 过滤）。"""
-    if not app_package and not knowledge_type:
-        raise HTTPException(status_code=400, detail="至少提供 app_package 或 knowledge_type 之一")
+    """删除知识。
+    - 单条删除：优先使用 entry_id；否则使用 app_package+knowledge_type+content 精确匹配。
+    - 批量删除：仅提供 app_package 和/或 knowledge_type。
+    """
     kb = _get_kb()
+    if entry_id:
+        deleted = kb.backend.delete_by_ids([entry_id])
+        return {"status": "success", "deleted": deleted}
+    if content:
+        where: dict[str, Any] = {}
+        if app_package:
+            where["app_package"] = app_package
+        if knowledge_type:
+            where["knowledge_type"] = knowledge_type
+        candidates = kb.backend.get_by_metadata(where, limit=200)
+        matched = [
+            r for r in candidates if str(r.get("content", "") or "") == str(content)
+        ]
+        if not matched:
+            raise HTTPException(status_code=404, detail="未找到匹配的知识条目")
+        if len(matched) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "检测到多条同内容记录，已拒绝删除以避免误删。"
+                    "请先刷新列表并使用 entry_id 精确删除。"
+                ),
+            )
+        first_id = str(matched[0].get("id", "") or "")
+        if first_id:
+            deleted = kb.backend.delete_by_ids([first_id])
+            return {"status": "success", "deleted": deleted}
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "当前记录缺少可用 entry_id，已拒绝条件删除以避免误删。"
+                "请刷新列表后重试。"
+            ),
+        )
+    if not app_package and not knowledge_type:
+        raise HTTPException(
+            status_code=400, detail="至少提供 app_package 或 knowledge_type 之一"
+        )
     filter_dict: dict[str, str] = {}
     if app_package:
         filter_dict["app_package"] = app_package
