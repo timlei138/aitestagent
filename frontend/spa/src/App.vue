@@ -15,6 +15,10 @@
           <el-icon><i class="nav-icon">📊</i></el-icon>
           <span>报告中心</span>
         </el-menu-item>
+        <el-menu-item index="plans">
+          <el-icon><i class="nav-icon">▣</i></el-icon>
+          <span>测试用例</span>
+        </el-menu-item>
         <el-menu-item index="apps">
           <el-icon><i class="nav-icon">📱</i></el-icon>
           <span>APP 管理</span>
@@ -70,7 +74,7 @@
       <el-header class="topbar">
         <el-breadcrumb separator="/">
           <el-breadcrumb-item>AI 测试平台</el-breadcrumb-item>
-          <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'apps' ? 'APP 管理' : activeMenu === 'settings' ? '设置' : '知识库' }}</el-breadcrumb-item>
+          <el-breadcrumb-item>{{ activeMenuTitle }}</el-breadcrumb-item>
         </el-breadcrumb>
         <div class="header-tags">
           <el-tag :type="wsConnected ? 'success' : 'info'" size="small" effect="light" round>
@@ -82,6 +86,39 @@
       <!-- ═══════════ 工作台 ═══════════ -->
       <el-main class="main-content workspace-main" v-show="activeMenu === 'workspace'">
         <WorkspacePanel ref="workspaceRef" :executing="executing" @run="startRun" />
+      </el-main>
+
+      <!-- ═══════════ 测试用例（已保存计划） ═══════════ -->
+      <el-main class="main-content" v-show="activeMenu === 'plans'">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h3 class="panel-title">测试用例（已保存计划）</h3>
+              <div class="panel-subtitle">复跑会跳过 planner 和计划确认，直接按保存的目标执行。</div>
+            </div>
+            <div style="display:flex;gap:8px">
+              <el-button size="small" @click="loadPlans">刷新</el-button>
+              <el-button size="small" type="primary" :disabled="selectedPlans.length === 0 || plansRunning" :loading="plansRunning" @click="runSelectedPlans">
+                批量复跑
+              </el-button>
+            </div>
+          </div>
+          <el-table :data="plansList" row-key="name" empty-text="暂无保存的测试用例" @selection-change="selectedPlans = $event">
+            <el-table-column type="selection" width="44" />
+            <el-table-column prop="name" label="名称" min-width="160" show-overflow-tooltip />
+            <el-table-column prop="app_package" label="包名" min-width="180" show-overflow-tooltip />
+            <el-table-column prop="steps_count" label="规模" width="80" />
+            <el-table-column prop="updated_at" label="更新时间" min-width="160">
+              <template #default="{ row }">{{ (row.updated_at || '').replace('T', ' ').substring(0, 19) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="150" fixed="right">
+              <template #default="{ row }">
+                <el-button size="small" text type="primary" :disabled="plansRunning" @click.stop="runSavedPlan(row)">复跑</el-button>
+                <el-button size="small" text type="danger" :disabled="plansRunning" @click.stop="deleteSavedPlan(row)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </section>
       </el-main>
 
       <!-- ═══════════ 报告中心 ═══════════ -->
@@ -290,6 +327,7 @@
     <template #footer>
       <div class="pr-footer">
         <el-button size="large" @click="confirmPlan('cancel')">取消</el-button>
+        <el-button size="large" :loading="planSaving" @click="saveCurrentPlan">存为测试用例</el-button>
         <el-button size="large" type="primary" @click="confirmPlan('confirm')">
           确认并开始执行
         </el-button>
@@ -440,7 +478,7 @@
 </template>
 
 <script setup>
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import ReportDetail from "./components/ReportDetail.vue";
 import KnowledgePanel from "./components/KnowledgePanel.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
@@ -448,6 +486,14 @@ import DeviceFloat from "./components/DeviceFloat.vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 const activeMenu = ref("workspace");
+const activeMenuTitle = computed(() => ({
+  workspace: '工作台',
+  reports: '报告中心',
+  plans: '测试用例',
+  apps: 'APP 管理',
+  settings: '设置',
+  knowledge: '知识库',
+}[activeMenu.value] || '工作台'));
 const executing = ref(false);
 const wsConnected = ref(false);
 const deviceOnline = ref(false);
@@ -469,7 +515,14 @@ const planReviewPages = ref([]);
 const planReviewVerifications = ref([]);
 const planReviewHints = ref([]);
 const planReviewSubmitting = ref(false);
+const planReviewPlan = ref({});
+const planSaving = ref(false);
 const newPageName = ref("");
+
+// 保存的测试用例计划
+const plansList = ref([]);
+const selectedPlans = ref([]);
+const plansRunning = ref(false);
 
 function addReviewPage() {
   const name = newPageName.value.trim();
@@ -602,7 +655,7 @@ function handleEvent(data) {
 
   switch (type) {
     case "status": wp?.addEntry({ type: "log", text: String(content) }); refreshSnapshot(); break;
-    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewVisible.value = true; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
+    case "plan_review": { const pd = content.plan || content; planReviewPlan.value = pd || {}; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewVisible.value = true; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
     case "stream_token": wp?.onToken(); break;
@@ -628,7 +681,7 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopSnapshotPolling(); break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopSnapshotPolling();
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewPlan.value = planData || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopSnapshotPolling(); break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopSnapshotPolling();
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
       wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports(); break;
     case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; stopSnapshotPolling(); break;
@@ -777,6 +830,139 @@ async function confirmPlan(action) {
     handleEvent({ type: "error", content: String(e) });
   } finally {
     planReviewSubmitting.value = false;
+  }
+}
+
+function currentEditablePlan() {
+  return {
+    goal: planReviewGoal.value,
+    app_package: planReviewPlan.value.app_package || '',
+    app_name: planReviewPlan.value.app_name || '',
+    target_pages: planReviewPages.value.filter(p => String(p || '').trim()),
+    verification: planReviewVerifications.value.filter(v => String(v || '').trim()),
+    hints: planReviewHints.value.filter(h => String(h || '').trim()),
+  };
+}
+
+async function saveCurrentPlan() {
+  const plan = currentEditablePlan();
+  if (!plan.goal.trim()) {
+    ElMessage.warning('测试目标为空，无法保存');
+    return;
+  }
+  let name = '';
+  try {
+    const result = await ElMessageBox.prompt('请输入测试用例名称', '保存测试用例', {
+      inputValue: plan.goal.substring(0, 40),
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+    });
+    name = String(result.value || '').trim();
+  } catch (e) {
+    return;
+  }
+  if (!name) {
+    ElMessage.warning('名称不能为空');
+    return;
+  }
+  planSaving.value = true;
+  try {
+    const res = await fetch('/api/plans', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, plan }),
+    });
+    const data = await res.json();
+    if (res.ok && data.status === 'success') {
+      ElMessage.success(`已保存为测试用例「${name}」`);
+      await loadPlans();
+    } else {
+      ElMessage.error(data.detail || data.message || '保存失败');
+    }
+  } catch (e) {
+    ElMessage.error(`保存失败: ${e}`);
+  } finally {
+    planSaving.value = false;
+  }
+}
+
+async function loadPlans() {
+  try {
+    const res = await fetch('/api/plans', { cache: 'no-store' });
+    const data = await res.json();
+    if (data.status === 'success') plansList.value = data.items || [];
+  } catch (e) { /* ignore */ }
+}
+
+async function runSavedPlan(row) {
+  if (!deviceOnline.value) {
+    ElMessage.warning('Android 设备未连接，请先连接设备');
+    return;
+  }
+  plansRunning.value = true;
+  executing.value = true;
+  workspaceRef.value?.addEntry({ type: 'log', text: `复跑测试用例: ${row.name}` });
+  startSnapshotPolling();
+  try {
+    const res = await fetch(`/api/plans/${encodeURIComponent(row.name)}/run`, { method: 'POST' });
+    const data = await res.json();
+    handleEvent({ type: 'result', content: data.data || data });
+  } catch (e) {
+    handleEvent({ type: 'error', content: String(e) });
+  } finally {
+    plansRunning.value = false;
+  }
+}
+
+async function runSelectedPlans() {
+  const names = selectedPlans.value.map(p => p.name).filter(Boolean);
+  if (names.length === 0) return;
+  if (!deviceOnline.value) {
+    ElMessage.warning('Android 设备未连接，请先连接设备');
+    return;
+  }
+  plansRunning.value = true;
+  executing.value = true;
+  workspaceRef.value?.addEntry({ type: 'log', text: `批量复跑 ${names.length} 个测试用例` });
+  startSnapshotPolling();
+  try {
+    const res = await fetch('/api/plans/run/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }),
+    });
+    const data = await res.json();
+    const items = data.items || [];
+    const passed = items.filter(x => x.status === 'success').length;
+    ElMessage.success(`批量复跑完成: ${passed}/${items.length} 成功`);
+    workspaceRef.value?.addEntry({ type: 'log', text: `批量复跑完成: ${passed}/${items.length} 成功` });
+    await loadReports();
+  } catch (e) {
+    handleEvent({ type: 'error', content: String(e) });
+  } finally {
+    executing.value = false;
+    plansRunning.value = false;
+    stopSnapshotPolling();
+  }
+}
+
+async function deleteSavedPlan(row) {
+  try {
+    await ElMessageBox.confirm(`确定删除测试用例「${row.name}」？`, '删除确认', {
+      type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消'
+    });
+  } catch (e) { return; }
+  try {
+    const res = await fetch(`/api/plans/${encodeURIComponent(row.name)}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (res.ok && data.status === 'success') {
+      ElMessage.success('删除成功');
+      await loadPlans();
+    } else {
+      ElMessage.error(data.detail || data.message || '删除失败');
+    }
+  } catch (e) {
+    ElMessage.error(`删除失败: ${e}`);
   }
 }
 
@@ -1249,6 +1435,7 @@ onMounted(() => {
   connectWS();
   checkDeviceStatus();
   loadReports();
+  loadPlans();
   loadApps();
   loadKbList();
   fetchConfig();

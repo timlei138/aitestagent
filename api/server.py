@@ -18,6 +18,9 @@ from api.apps_routes import router as apps_router
 from api.apps_routes import resolve_app as _resolve_app_from_yaml
 from api.knowledge_routes import router as knowledge_router
 from api.config_routes import router as config_router
+from api.plans_routes import router as plans_router
+from api.plans_routes import set_device_getter as set_plans_device_getter
+from api.plans_routes import set_orchestrator as set_plans_orchestrator
 from api.knowledge_routes import set_knowledge_base as _set_kb_for_routes
 from api.websocket_manager import WebSocketManager
 from config import TestConfig, resolve_perception_mode
@@ -232,6 +235,8 @@ def reconnect_device() -> dict:
 # ── 编排器 ──
 orchestrator = TestOrchestrator(config)
 set_device_runner(orchestrator)
+set_plans_orchestrator(orchestrator)
+set_plans_device_getter(lambda: _device)
 
 # ── 关系型数据库 ──
 _db = create_relational_db(config)
@@ -314,6 +319,7 @@ app.include_router(device_router)
 app.include_router(apps_router)
 app.include_router(knowledge_router)
 app.include_router(config_router)
+app.include_router(plans_router)
 _set_kb_for_routes(_kb)
 
 

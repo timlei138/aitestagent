@@ -912,6 +912,35 @@ def _should_force_query_app_knowledge(
 
 
 def planner_node(state: TestState, config: RunnableConfig) -> Command:
+    override = state.get("_goal_override") or {}
+    if isinstance(override, dict) and override.get("goal"):
+        goal = {
+            "goal": override.get("goal", state.get("user_request", "")),
+            "app_package": override.get("app_package", state.get("app_package", "")),
+            "app_name": override.get("app_name", state.get("app_name", "")),
+            "target_pages": override.get("target_pages", []) or [],
+            "verification": override.get("verification", []) or [],
+            "hints": override.get("hints", []) or [],
+        }
+        logger.info("Planner skipped: replay saved plan %s", goal.get("goal", "")[:80])
+        return Command(
+            update={
+                "goal_description": goal,
+                "app_package": goal.get("app_package", "") or state.get("app_package", ""),
+                "app_name": goal.get("app_name", "") or state.get("app_name", ""),
+                "step_history": [],
+                "messages": [],
+                "started_at": datetime.now().isoformat(),
+                "step_times": [],
+                "budget_violation_count": 0,
+                "_replay_mode": True,
+                "_rag_injected_once": False,
+                "_rag_last_app_package": "",
+                "_knowledge_query_hint_injected": False,
+                "_last_page_app_key": "",
+                "_last_clickable_count": 0,
+            }
+        )
     cfg: TestConfig = config["configurable"]["test_config"]
     llm = _llm_cfg(cfg)
     ctx = get_tool_context()
@@ -948,6 +977,10 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     else:
         text = raw.content if hasattr(raw, "content") else str(raw)
         goal = _parse_goal(text)
+    if not goal.get("app_package"):
+        goal["app_package"] = state.get("app_package", "")
+    if not goal.get("app_name"):
+        goal["app_name"] = state.get("app_name", "")
     logger.info("Planner: %s", goal.get("goal", "")[:80])
     return Command(
         update={
@@ -1592,6 +1625,12 @@ def route_after_plan_review(state: TestState) -> str:
     return "agent"
 
 
+def route_after_planner(state: TestState) -> str:
+    if state.get("_replay_mode"):
+        return "agent"
+    return "plan_review"
+
+
 def build_graph(config: TestConfig) -> StateGraph:
     g = StateGraph(TestState)
     g.add_node("planner", planner_node)
@@ -1599,7 +1638,11 @@ def build_graph(config: TestConfig) -> StateGraph:
     g.add_node("agent", agent_node)
     g.add_node("reporter", reporter_node)
     g.add_edge(START, "planner")
-    g.add_edge("planner", "plan_review")
+    g.add_conditional_edges(
+        "planner",
+        route_after_planner,
+        {"agent": "agent", "plan_review": "plan_review"},
+    )
     g.add_conditional_edges(
         "plan_review",
         route_after_plan_review,

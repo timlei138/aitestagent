@@ -319,6 +319,49 @@ class SqliteBackend(RelationalBackend):
         self._conn.commit()
         return True
 
+    # ── 保存的测试用例计划 ──
+
+    def save_test_plan(
+        self,
+        name: str,
+        app_package: str,
+        yaml_path: str,
+        steps_count: int = 0,
+    ) -> None:
+        now = datetime.now().isoformat()
+        row = self._conn.execute(
+            "SELECT created_at FROM test_plans WHERE name = ?",
+            (name,),
+        ).fetchone()
+        created_at = dict(row).get("created_at") if row else now
+        self.upsert(
+            "test_plans",
+            {
+                "name": name,
+                "app_package": app_package,
+                "yaml_path": yaml_path,
+                "steps_count": int(steps_count or 0),
+                "created_at": created_at,
+                "updated_at": now,
+            },
+            key="name",
+        )
+
+    def list_test_plans(self, limit: int = 200) -> list[dict[str, Any]]:
+        return self.select("test_plans", order_by="updated_at DESC", limit=limit)
+
+    def get_test_plan(self, name: str) -> dict[str, Any] | None:
+        rows = self.select("test_plans", {"name": name}, limit=1)
+        return rows[0] if rows else None
+
+    def delete_test_plan(self, name: str) -> bool:
+        row = self.get_test_plan(name)
+        if not row:
+            return False
+        self._conn.execute("DELETE FROM test_plans WHERE name = ?", (name,))
+        self._conn.commit()
+        return True
+
     # ── 元素身份 ──
 
     def save_element_identity(

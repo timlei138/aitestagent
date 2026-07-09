@@ -48,3 +48,5 @@ class TestState(TypedDict, total=False):
     _knowledge_query_hint_injected: bool
     _last_page_app_key: str
     _last_clickable_count: int
+    _goal_override: dict[str, Any]
+    _replay_mode: bool

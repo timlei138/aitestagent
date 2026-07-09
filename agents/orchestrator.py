@@ -49,6 +49,7 @@ class TestOrchestrator:
         app_package: str = "",
         app_name: str = "",
         thread_id: str = "",
+        goal_override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
         # 设备连接前置检查
@@ -83,6 +84,8 @@ class TestOrchestrator:
             "messages": [],
             "conclusion": "",
             "status": "",
+            "_goal_override": goal_override or {},
+            "_replay_mode": bool(goal_override),
         }
 
         config_ctx = {
@@ -137,6 +140,7 @@ class TestOrchestrator:
         app_package: str = "",
         app_name: str = "",
         thread_id: str = "",
+        goal_override: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """流式执行测试 — 通过 astream_events 实时推送每个事件。"""
         if not thread_id:
@@ -151,6 +155,8 @@ class TestOrchestrator:
             "messages": [],
             "conclusion": "",
             "status": "",
+            "_goal_override": goal_override or {},
+            "_replay_mode": bool(goal_override),
         }
 
         config_ctx = {

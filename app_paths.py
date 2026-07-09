@@ -35,6 +35,7 @@ CONFIG_DIR = APP_DATA / "config" if FROZEN else APP_DATA
 # ── 数据子目录 ──
 SCREENSHOT_DIR = DATA_DIR / "screenshots"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+CASE_DIR = DATA_DIR / "cases"
 DB_PATH = DATA_DIR / "test_history.db"
 APPS_YAML = DATA_DIR / "apps.yaml"
 
@@ -53,7 +54,7 @@ PROMPTS_DIR = BUNDLE_DIR / "agents" / "prompts"
 
 def ensure_dirs() -> None:
     """确保所有运行时目录存在。启动时调用一次。"""
-    for d in (DATA_DIR, LOG_DIR, LOG_RUN_DIR, SCREENSHOT_DIR, KNOWLEDGE_DIR):
+    for d in (DATA_DIR, LOG_DIR, LOG_RUN_DIR, SCREENSHOT_DIR, KNOWLEDGE_DIR, CASE_DIR):
         d.mkdir(parents=True, exist_ok=True)
     if FROZEN:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
