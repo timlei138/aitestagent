@@ -1327,6 +1327,13 @@ def click(
     def _perform_click_on_element(el: Any, desc: str) -> tuple[bool, str]:
         role = getattr(el, "role", "")
         rid = getattr(el, "resource_id", "") or ""
+        label_text = (getattr(el, "label", "") or "").lower()
+        assoc_text = (getattr(el, "associated_label", "") or "").lower()
+        desc_lower = (desc or "").lower().strip()
+        raw_words = [w for w in re.split(r"\s+", desc_lower) if w]
+        score_words = [w for w in raw_words if (len(w) > 1 or _has_cjk(w))]
+        if not score_words and desc_lower:
+            score_words = [desc_lower]
         rid_is_unique = False
         if rid and understanding is not None:
             rid_count = sum(
@@ -1347,13 +1354,21 @@ def click(
                     + f" | 开关状态: {state_cn}",
                 )
             return True, _format_click_log(desc, el, strategy="bounds")
-        if (
-            rid_is_unique
-            and rid
-            and (exact_mode or (not _should_skip_rid_fastpath(el, desc)))
-            and ctx.device.click_resource_id(rid)
-        ):
-            return True, _format_click_log(desc, el, strategy="resource_id")
+        if rid_is_unique and rid and (exact_mode or (not _should_skip_rid_fastpath(el, desc))):
+            label_assoc_hit = any(
+                w and (w in label_text or w in assoc_text) for w in score_words
+            )
+            if (
+                _score_element(el, score_words, prefs=None, description="") >= 3
+                and label_assoc_hit
+            ):
+                if ctx.device.click_resource_id(rid):
+                    return True, _format_click_log(desc, el, strategy="resource_id")
+            return (
+                False,
+                f"AMBIGUOUS: rid={rid} label={getattr(el, 'label', '')} "
+                f"与目标 '{desc}' 不匹配，请用 index/class 精确定位",
+            )
         if getattr(el, "text", "") and ctx.device.click_text(el.text):
             return True, _format_click_log(desc, el, strategy="text")
         if getattr(el, "bounds", (0, 0, 0, 0)) != (0, 0, 0, 0):
@@ -1405,45 +1420,9 @@ def click(
                     matched_el=best_el,
                 )
                 return _with_snapshot(result, best_el)
-            post_page = _capture_page_id(ctx)
-            if (
-                post_page
-                and _pre_page
-                and post_page == _pre_page
-                and _is_container_like(best_el)
-                and len(ranked_candidates) >= 2
-            ):
-                for _, _, candidate in ranked_candidates[1:4]:
-                    if candidate is best_el:
-                        continue
-                    # 硬门槛：回退候选必须与原始目标语义一致
-                    if not _is_target_consistent(candidate, matched_label, click_prefs):
-                        continue
-                    ok2, result2 = _perform_click_on_element(candidate, matched_label)
-                    if not ok2:
-                        continue
-                    strategy2 = re.search(r"strategy=([A-Za-z0-9_-]+)", result2 or "")
-                    _record_page_transition(
-                        ctx,
-                        _pre_page,
-                        label,
-                        click_context=_build_click_context(
-                            strategy2.group(1) if strategy2 else "", candidate
-                        ),
-                    )
-                    post_page2 = _capture_page_id(ctx)
-                    # 成功条件：RAG prefs 命中时走严格后置特征检查，否则页面变化即成功
-                    if click_prefs:
-                        if not _is_expected_destination(
-                            ctx, post_page2, _pre_page, label
-                        ):
-                            continue
-                    elif not post_page2 or post_page2 == _pre_page:
-                        continue
-                    return _with_snapshot(
-                        result2 + " | fallback=next_candidate", candidate
-                    )
             return _with_snapshot(result, best_el)
+        # 不在工具内自动猜测次优候选；直接透传给 LLM 做下一步精确决策
+        return result or f"未能点击目标元素: {label}，请用 index/class/rid 精确定位"
 
     # 兆底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):

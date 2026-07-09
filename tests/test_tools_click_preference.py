@@ -103,7 +103,7 @@ def test_rag_weight_prefers_textview_over_container():
     assert pref_child > pref_container
 
 
-def test_click_fallback_runs_inside_single_tool_call(monkeypatch):
+def test_click_no_longer_auto_fallbacks_to_next_candidate(monkeypatch):
     class _Device:
         def __init__(self):
             self.page = "CustomModeLauncher"
@@ -179,15 +179,77 @@ def test_click_fallback_runs_inside_single_tool_call(monkeypatch):
     )
 
     out = tools_module.click.invoke({"label": "应用列表", "alternatives": ""})
-    assert "fallback=next_candidate" in out
+    assert "fallback=next_candidate" not in out
+    assert "已点击" in out
     assert device.rid_click_count == 1
-    assert device.bounds_click_count >= 1
+    assert device.bounds_click_count == 0
+
+
+def test_click_returns_ambiguous_when_unique_rid_semantics_mismatch(monkeypatch):
+    class _Device:
+        def __init__(self):
+            self.rid_click_count = 0
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calculator",
+                "activity": "com.zui.calculator.Calculator",
+            }
+
+        def click_resource_id(self, rid: str):
+            if rid == "com.zui.calculator:id/op_fact":
+                self.rid_click_count += 1
+                return True
+            return False
+
+        def click_text(self, _text: str):
+            return False
+
+        def click_bounds(self, _bounds):
+            return True
+
+        def snapshot(self):
+            return SimpleNamespace(width=1200, height=2000)
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calculator.Calculator",
+                page_title="16:53",
+                primary_paths=[],
+                elements=[
+                    _el(
+                        label="x!",
+                        rid="com.zui.calculator:id/op_fact",
+                        cls="android.widget.Button",
+                        role="list_entry",
+                        path="content > root_layout > content_layout > pad_layout",
+                    )
+                ],
+            )
+
+    device = _Device()
+    tools_module.set_tool_context(ToolContext(device=device, perceiver=_Perceiver()))
+    monkeypatch.setattr(
+        tools_module,
+        "check_dangerous",
+        lambda _label: SimpleNamespace(allowed=True, reason=""),
+    )
+    out = tools_module.click.invoke(
+        {"label": "AC", "rid": "com.zui.calculator:id/op_fact"}
+    )
+    assert "AMBIGUOUS:" in out
+    assert "请用 index/class 精确定位" in out
+    assert device.rid_click_count == 0
 
 
 def test_get_screen_info_contains_click_indexes():
     class _Device:
         def current_app(self):
-            return {"package": "com.zui.launcher", "activity": "com.zui.launcher.MainActivity"}
+            return {
+                "package": "com.zui.launcher",
+                "activity": "com.zui.launcher.MainActivity",
+            }
 
         def snapshot(self):
             return SimpleNamespace(width=3840, height=2560)
@@ -215,7 +277,10 @@ def test_get_screen_info_contains_click_indexes():
 def test_click_exact_mode_reports_ambiguous_matches(monkeypatch):
     class _Device:
         def current_app(self):
-            return {"package": "com.zui.launcher", "activity": "com.zui.launcher.MainActivity"}
+            return {
+                "package": "com.zui.launcher",
+                "activity": "com.zui.launcher.MainActivity",
+            }
 
         def snapshot(self):
             return SimpleNamespace(width=3840, height=2560)
@@ -249,7 +314,10 @@ def test_click_exact_mode_with_index_clicks_direct_target(monkeypatch):
             self.clicked_bounds = 0
 
         def current_app(self):
-            return {"package": "com.zui.launcher", "activity": "com.zui.launcher.MainActivity"}
+            return {
+                "package": "com.zui.launcher",
+                "activity": "com.zui.launcher.MainActivity",
+            }
 
         def click_resource_id(self, rid: str):
             if rid == "com.zui.launcher:id/app_list":
@@ -297,11 +365,17 @@ def test_click_exact_mode_with_index_clicks_direct_target(monkeypatch):
 
 def test_extract_curated_rule_label_for_conflict_match():
     assert (
-        tools_module._extract_curated_rule_label("在MainActivity点击“应用列表”时，优先匹配 class=textview")
+        tools_module._extract_curated_rule_label(
+            "在MainActivity点击“应用列表”时，优先匹配 class=textview"
+        )
         == "应用列表"
     )
     assert (
-        tools_module._extract_curated_rule_label('在MainActivity点击"应用"时，优先匹配 class=textview')
+        tools_module._extract_curated_rule_label(
+            '在MainActivity点击"应用"时，优先匹配 class=textview'
+        )
         == "应用"
     )
-    assert tools_module._extract_curated_rule_label("普通人工规则：先等待页面稳定") == ""
+    assert (
+        tools_module._extract_curated_rule_label("普通人工规则：先等待页面稳定") == ""
+    )

@@ -459,6 +459,9 @@ def _run_agent(
             except Exception as e:
                 output = f"ERROR: {e}"
             page_sig_after = _build_page_signature(_ctx)
+            progress_milestone = name == "assert_verification" or _output_has_page_change(
+                output, page_sig_once, page_sig_after
+            )
             # 设备断开快速终止：工具执行后立即检测，避免继续执行无意义操作
             try:
                 _live_ctx = get_tool_context()
@@ -497,8 +500,8 @@ def _run_agent(
                     _screenshot_path = ""
             outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
 
-            # 最小断路器：连续 N 次未进行 assert_verification 判定为空转。
-            if name == "assert_verification":
+            # 最小断路器：连续无进展动作判定为空转（assert 或页面变化均算进展）。
+            if progress_milestone:
                 no_progress_count = 0
                 no_progress_warned = False
             else:
@@ -547,10 +550,7 @@ def _run_agent(
                     break
 
             # 语义冷却：处理近似抖动（与签名断路器互补）
-            milestone = name == "assert_verification" or _output_has_page_change(
-                output, page_sig_once, page_sig_after
-            )
-            if milestone:
+            if progress_milestone:
                 recent_action_groups = []
             elif cooldown_group:
                 recent_action_groups.append(cooldown_group)

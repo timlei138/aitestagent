@@ -87,6 +87,7 @@ async def update_config(req: ConfigUpdateRequest):
     updates = req.model_dump(exclude_none=True)
 
     changed = {}
+    changed_values: dict[str, object] = {}
     need_rebuild_perceiver = False
 
     for field, new_val in updates.items():
@@ -105,6 +106,7 @@ async def update_config(req: ConfigUpdateRequest):
             continue
         setattr(cfg, field, normalized_val)
         changed[field] = True
+        changed_values[field] = normalized_val
         # perception_mode 或主 LLM 凭证变更需要重建 perceiver/context
         if field in (
             "perception_mode",
@@ -117,7 +119,7 @@ async def update_config(req: ConfigUpdateRequest):
             need_rebuild_perceiver = True
 
     # 写回 YAML（敏感字段写 config.local.yaml，非敏感写 config.yaml）
-    _save_yaml(updates)
+    _save_yaml(changed_values)
 
     # 热更新 perceiver
     if need_rebuild_perceiver:
