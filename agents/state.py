@@ -41,6 +41,9 @@ class TestState(TypedDict, total=False):
         list  # [{"item": "...", "result": "passed|failed|unknown", "screenshot": ""}]
     )
     budget_violation_count: int  # P0.4: token budget violations in current run
+    llm_call_count: int
+    tool_call_400_count: int
+    tool_call_400_rate: float
     _tool_calls_log: list  # 工具调用实时日志（存入 state，不依赖 ctx）
     _finalization_hint_injected: bool
     _rag_injected_once: bool

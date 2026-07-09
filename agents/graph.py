@@ -320,6 +320,17 @@ def _run_agent(
         _ctx = None
     if _ctx and _ws_emit_callback:
         _ctx._ws_emit = _ws_emit_callback
+    llm_call_count = 0
+    tool_call_400_count = 0
+
+    def _is_tool_call_400_error(exc: Exception) -> bool:
+        text = str(exc or "")
+        if "tool_call_id" in text:
+            return True
+        return (
+            "assistant message with 'tool_calls' must be followed by tool messages"
+            in text.lower()
+        )
     if provider == "zhipu":
         from zhipuai import ZhipuAI
 
@@ -329,6 +340,8 @@ def _run_agent(
         schemas = _zhipu_schemas(tools)
 
         def _llm(s: _SubState) -> dict:
+            nonlocal llm_call_count
+            llm_call_count += 1
             if _ctx and _ctx._ws_emit:
                 try:
                     _ctx._ws_emit("stream_token", "thinking")
@@ -374,12 +387,22 @@ def _run_agent(
         ).bind_tools(tools)
 
         def _llm(s: _SubState) -> dict:
+            nonlocal llm_call_count, tool_call_400_count
+            llm_call_count += 1
             if _ctx and _ctx._ws_emit:
                 try:
                     _ctx._ws_emit("stream_token", "thinking")
                 except Exception:
                     pass
-            r = _call_retry("openai", lc.invoke, s["messages"])
+            current_call_has_tool_400 = False
+
+            def _on_llm_error(exc: Exception) -> None:
+                nonlocal current_call_has_tool_400, tool_call_400_count
+                if _is_tool_call_400_error(exc) and not current_call_has_tool_400:
+                    tool_call_400_count += 1
+                    current_call_has_tool_400 = True
+
+            r = _call_retry("openai", lc.invoke, s["messages"], on_error=_on_llm_error)
             return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
 
         llm_node = _llm
@@ -633,6 +656,8 @@ def _run_agent(
                     "loop_detected": False,
                     "loop_pattern": "",
                     "loop_break_action": "report_done",
+                    "llm_call_count": llm_call_count,
+                    "tool_call_400_count": tool_call_400_count,
                 },
             )
         if loop_break_reason.startswith("REPORT_ABORT:"):
@@ -644,6 +669,8 @@ def _run_agent(
                     "loop_detected": False,
                     "loop_pattern": "",
                     "loop_break_action": "report_abort",
+                    "llm_call_count": llm_call_count,
+                    "tool_call_400_count": tool_call_400_count,
                 },
             )
         return (
@@ -653,6 +680,8 @@ def _run_agent(
                 "loop_detected": True,
                 "loop_pattern": loop_break_reason,
                 "loop_break_action": "end_subgraph",
+                "llm_call_count": llm_call_count,
+                "tool_call_400_count": tool_call_400_count,
             },
         )
 
@@ -668,6 +697,8 @@ def _run_agent(
                         "loop_detected": False,
                         "loop_pattern": "",
                         "loop_break_action": "",
+                        "llm_call_count": llm_call_count,
+                        "tool_call_400_count": tool_call_400_count,
                     },
                 )
         return (
@@ -677,6 +708,8 @@ def _run_agent(
                 "loop_detected": False,
                 "loop_pattern": "",
                 "loop_break_action": "",
+                "llm_call_count": llm_call_count,
+                "tool_call_400_count": tool_call_400_count,
             },
         )
 
@@ -690,6 +723,8 @@ def _run_agent(
                     "loop_detected": False,
                     "loop_pattern": "",
                     "loop_break_action": "",
+                    "llm_call_count": llm_call_count,
+                    "tool_call_400_count": tool_call_400_count,
                 },
             )
     return (
@@ -699,6 +734,8 @@ def _run_agent(
             "loop_detected": False,
             "loop_pattern": "",
             "loop_break_action": "",
+            "llm_call_count": llm_call_count,
+            "tool_call_400_count": tool_call_400_count,
         },
     )
 
@@ -750,15 +787,22 @@ def _ensure_device_alive(max_retries: int = 2, wait_sec: float = 5.0) -> bool:
     return False
 
 
-def _call_retry(provider, fn, *a, **kw):
+def _call_retry(provider, fn, *a, on_error=None, **kw):
     return _call_with_retry(
-        lambda e: (
-            _is_rate_limit_error(e) if provider == "zhipu" else _default_should_retry(e)
-        ),
+        lambda e: _call_retry_should_retry(provider, e, on_error),
         fn,
         *a,
         **kw,
     )
+
+
+def _call_retry_should_retry(provider: str, exc: Exception, on_error=None) -> bool:
+    if on_error:
+        try:
+            on_error(exc)
+        except Exception:
+            logger.debug("on_error callback failed", exc_info=True)
+    return _is_rate_limit_error(exc) if provider == "zhipu" else _default_should_retry(exc)
 
 
 def _zhipu_schemas(tools):
@@ -852,9 +896,9 @@ def _apply_click_preferences(
         return
     try:
         prefs["app_package"] = str(effective_app_package or "")
-        prefs["rag_hash"] = hashlib.md5((rag_summary or "").encode("utf-8")).hexdigest()[
-            :12
-        ]
+        prefs["rag_hash"] = hashlib.md5(
+            (rag_summary or "").encode("utf-8")
+        ).hexdigest()[:12]
         setattr(ctx, "_click_preferences", prefs)
     except Exception:
         logger.debug("apply click preferences failed", exc_info=True)
@@ -899,13 +943,103 @@ def _should_force_query_app_knowledge(
         return False
     last = history[-1]
     obs = str(last.get("observation", "") or "")
-    risky = bool(last.get("loop_detected")) or str(last.get("status", "")).lower() == "fail"
-    if not risky and not any(k in obs for k in ("NO_PROGRESS", "COOLDOWN", "LOOP_DETECTED")):
+    risky = (
+        bool(last.get("loop_detected")) or str(last.get("status", "")).lower() == "fail"
+    )
+    if not risky and not any(
+        k in obs for k in ("NO_PROGRESS", "COOLDOWN", "LOOP_DETECTED")
+    ):
         return False
     # 仍未得到可用 RAG 时，强提示先查知识
     if include_rag and rag_summary:
         return False
     return True
+
+
+def _normalize_verification_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return re.sub(r"\s+", "", text)
+
+
+def _goal_verification_items(goal: dict) -> list[str]:
+    raw_items = goal.get("verification", []) if isinstance(goal, dict) else []
+    return [str(item or "").strip() for item in raw_items if str(item or "").strip()]
+
+
+def _build_verification_key_maps(goal: dict) -> tuple[dict[str, str], dict[str, str]]:
+    key_lookup: dict[str, str] = {}
+    key_to_item: dict[str, str] = {}
+    for i, item in enumerate(_goal_verification_items(goal)):
+        key = f"v{i}"
+        key_to_item[key] = item
+        key_lookup[item] = key
+        normalized = _normalize_verification_text(item)
+        if normalized:
+            key_lookup[normalized] = key
+    return key_lookup, key_to_item
+
+
+def _resolve_verification_key(
+    assertion: dict[str, Any], key_lookup: dict[str, str]
+) -> str:
+    explicit = str(assertion.get("key", "") or "").strip()
+    if explicit:
+        return explicit
+    item = str(assertion.get("item", "") or "").strip()
+    if item and item in key_lookup:
+        return key_lookup[item]
+    normalized = _normalize_verification_text(item)
+    if normalized and normalized in key_lookup:
+        return key_lookup[normalized]
+    if item.startswith("v") and item[1:].isdigit():
+        return item
+    if normalized:
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+        return f"dyn_{digest}"
+    return "dyn_unknown"
+
+
+def _merge_goal_verification_results(
+    goal: dict, assertions: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    verification_items = _goal_verification_items(goal)
+    if not verification_items:
+        return []
+    key_lookup, key_to_item = _build_verification_key_maps(goal)
+    merged: dict[str, dict[str, Any]] = {
+        key: {
+            "key": key,
+            "item": item,
+            "result": "unknown",
+            "detail": "",
+            "screenshot": "",
+        }
+        for key, item in key_to_item.items()
+    }
+    for assertion in assertions or []:
+        if not isinstance(assertion, dict):
+            continue
+        key = _resolve_verification_key(assertion, key_lookup)
+        if key not in merged:
+            continue
+        incoming_result = str(assertion.get("result", "unknown") or "unknown")
+        incoming = {
+            "key": key,
+            "item": key_to_item[key],
+            "result": incoming_result,
+            "detail": str(assertion.get("detail", "") or ""),
+            "screenshot": str(assertion.get("screenshot", "") or ""),
+        }
+        current = merged[key]
+        current_result = str(current.get("result", "unknown") or "unknown")
+        if incoming_result == "passed":
+            merged[key] = incoming
+        elif incoming_result == "failed":
+            if current_result != "passed":
+                merged[key] = incoming
+        elif current_result == "unknown":
+            merged[key] = incoming
+    return [merged[f"v{i}"] for i in range(len(verification_items))]
 
 
 # ═══ NODES ═══
@@ -957,6 +1091,9 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
             "started_at": datetime.now().isoformat(),
             "step_times": [],
             "budget_violation_count": budget_violation_count,
+            "llm_call_count": 0,
+            "tool_call_400_count": 0,
+            "tool_call_400_rate": 0.0,
             "_rag_injected_once": False,
             "_rag_last_app_package": "",
             "_knowledge_query_hint_injected": False,
@@ -1017,7 +1154,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             act = u.activity.split(".")[-1] if u.activity else "?"
             title = u.page_title or ""
             pid = act + "「" + title + "」" if title else act
-            pkg = (ctx.device.current_app() or {}).get("package", "") if ctx.device else ""
+            pkg = (
+                (ctx.device.current_app() or {}).get("package", "")
+                if ctx.device
+                else ""
+            )
             current_app_key = f"{pkg}:{act}"
             n_clickable = sum(1 for e in u.elements if e.clickable and e.label)
             lines = [
@@ -1076,6 +1217,20 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         for s in history[-10:]
     ]
     hist_str = "\n".join(hist_lines) if hist_lines else "(none)"
+    key_lookup, key_to_item = _build_verification_key_maps(goal)
+    if ctx:
+        ctx._verification_key_map = key_lookup
+        ctx._verification_items_by_key = key_to_item
+        merged_verifications = _merge_goal_verification_results(
+            goal, getattr(ctx, "_verifications", []) or []
+        )
+        passed_items = [
+            f"[{entry.get('key', '')}] {entry.get('item', '')}"
+            for entry in merged_verifications
+            if str(entry.get("result", "") or "") == "passed"
+        ]
+        if passed_items:
+            hist_str += "\n\n已通过验证: " + "; ".join(passed_items)
 
     # Messages — always include goal + page for context
     msgs = list(state.get("messages", []))
@@ -1092,12 +1247,14 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             SystemMessage(
                 content=(
                     "FINALIZATION_HINT: 剩余工具预算较低。请优先对可判定项调用 "
-                    "assert_verification；若无法继续，请立即 report_done(status=\"abort\")。"
+                    'assert_verification；若无法继续，请立即 report_done(status="abort")。'
                 )
             )
         )
         finalization_hint_injected = True
-    force_query_hint = _should_force_query_app_knowledge(state, include_rag, rag_summary)
+    force_query_hint = _should_force_query_app_knowledge(
+        state, include_rag, rag_summary
+    )
     knowledge_query_hint_injected = bool(
         state.get("_knowledge_query_hint_injected", False)
     )
@@ -1110,13 +1267,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             f'query_app_knowledge(query="{query_text}", app_package="{effective_app_package}") '
             "再执行点击/滑动。"
         )
-        msgs.append(
-            SystemMessage(
-                content=(
-                    "KNOWLEDGE_QUERY_REQUIRED: " + hint_text
-                )
-            )
-        )
+        msgs.append(SystemMessage(content=("KNOWLEDGE_QUERY_REQUIRED: " + hint_text)))
         if ctx and getattr(ctx, "_ws_emit", None):
             try:
                 ctx._ws_emit("knowledge_hint", {"message": hint_text})
@@ -1134,7 +1285,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             for s in recent_hist
         ):
             self_doubt_reasons.append("连续 3 步在同一页面无进展")
-    target_pages = [str(x or "").strip() for x in (goal.get("target_pages", []) or []) if str(x or "").strip()]
+    target_pages = [
+        str(x or "").strip()
+        for x in (goal.get("target_pages", []) or [])
+        if str(x or "").strip()
+    ]
     if pid and target_pages and len(history) >= 3:
         if all(tp not in pid for tp in target_pages):
             self_doubt_reasons.append("当前页面与 Goal 目标页面长期偏离")
@@ -1193,6 +1348,15 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         llm["base_url"],
         max_turns=budget["max_turns_per_iteration"],
         run_id=config.get("configurable", {}).get("thread_id", "unknown"),
+    )
+    prev_llm_call_count = int(state.get("llm_call_count", 0) or 0)
+    prev_tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
+    iter_llm_call_count = int(loop_meta.get("llm_call_count", 0) or 0)
+    iter_tool_call_400_count = int(loop_meta.get("tool_call_400_count", 0) or 0)
+    llm_call_count = prev_llm_call_count + iter_llm_call_count
+    tool_call_400_count = prev_tool_call_400_count + iter_tool_call_400_count
+    tool_call_400_rate = (
+        round(tool_call_400_count / llm_call_count, 4) if llm_call_count > 0 else 0.0
     )
     # 不再写入 ctx._tool_calls_log（避免 rebuild 丢失），改为存入 state
     logger.info("Agent #%d: %s", len(history) + 1, result[:200])
@@ -1359,6 +1523,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                     if rag_summary
                     else str(state.get("_rag_last_app_package", "") or "")
                 ),
+                "llm_call_count": llm_call_count,
+                "tool_call_400_count": tool_call_400_count,
+                "tool_call_400_rate": tool_call_400_rate,
                 "_tool_calls_log": list(state.get("_tool_calls_log", []))
                 + tool_calls_log,
             }
@@ -1379,6 +1546,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 if rag_summary
                 else str(state.get("_rag_last_app_package", "") or "")
             ),
+            "llm_call_count": llm_call_count,
+            "tool_call_400_count": tool_call_400_count,
+            "tool_call_400_rate": tool_call_400_rate,
             "_tool_calls_log": list(state.get("_tool_calls_log", [])) + tool_calls_log,
         }
     )
@@ -1411,25 +1581,42 @@ def _collect_verification_results(goal: dict) -> tuple[str, list]:
     """从 ToolContext._verifications 收集 assert_verification 的结构化结果。"""
     ctx = get_tool_context()
     assertions = getattr(ctx, "_verifications", []) if ctx else []
-
-    if not assertions:
-        verification_items = goal.get("verification", [])
-        if verification_items:
-            assertions = [{"item": v, "result": "unknown"} for v in verification_items]
+    verification_items = _goal_verification_items(goal)
+    if verification_items:
+        merged = _merge_goal_verification_results(goal, assertions)
+        failed = sum(1 for a in merged if a.get("result") == "failed")
+        passed = sum(1 for a in merged if a.get("result") == "passed")
+        if failed > 0:
+            verdict = "failed"
+        elif passed == len(merged):
+            verdict = "passed"
         else:
-            return "passed", []
-
-    passed = sum(1 for a in assertions if a["result"] == "passed")
-    failed = sum(1 for a in assertions if a["result"] == "failed")
-
+            verdict = "inconclusive"
+        return verdict, merged
+    if not assertions:
+        return "passed", []
+    normalized_assertions = []
+    for assertion in assertions:
+        if not isinstance(assertion, dict):
+            continue
+        normalized_assertions.append(
+            {
+                "key": str(assertion.get("key", "") or ""),
+                "item": str(assertion.get("item", "") or ""),
+                "result": str(assertion.get("result", "unknown") or "unknown"),
+                "detail": str(assertion.get("detail", "") or ""),
+                "screenshot": str(assertion.get("screenshot", "") or ""),
+            }
+        )
+    failed = sum(1 for a in normalized_assertions if a.get("result") == "failed")
+    passed = sum(1 for a in normalized_assertions if a.get("result") == "passed")
     if failed > 0:
         verdict = "failed"
-    elif passed == len(assertions):
+    elif normalized_assertions and passed == len(normalized_assertions):
         verdict = "passed"
     else:
         verdict = "inconclusive"
-
-    return verdict, assertions
+    return verdict, normalized_assertions
 
 
 def reporter_node(state: TestState, config: RunnableConfig) -> Command:
@@ -1474,6 +1661,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     execution_status = _determine_execution_status(state)
     test_verdict, verification_results = _collect_verification_results(goal)
     budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
+    llm_call_count = int(state.get("llm_call_count", 0) or 0)
+    tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
+    tool_call_400_rate = float(state.get("tool_call_400_rate", 0.0) or 0.0)
     if execution_status not in ("completed",):
         test_verdict = "inconclusive"
     # 向后兼容 status
@@ -1501,6 +1691,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 execution_status=execution_status,
                 test_verdict=test_verdict,
                 verification_json=json.dumps(verification_results, ensure_ascii=False),
+                llm_call_count=llm_call_count,
+                tool_call_400_count=tool_call_400_count,
+                tool_call_400_rate=tool_call_400_rate,
             )
         except:
             pass
@@ -1510,7 +1703,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     fc = sum(1 for s in dd if s.get("status") == "fail")
     cc = sum(1 for s in dd if s.get("status") == "continue")
     logger.info(
-        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d conclusion=%s",
+        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f conclusion=%s",
         execution_status,
         test_verdict,
         len(dd),
@@ -1519,6 +1712,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         cc,
         duration,
         budget_violation_count,
+        llm_call_count,
+        tool_call_400_count,
+        tool_call_400_rate,
         str(conclusion)[:120],
     )
     return Command(
@@ -1530,6 +1726,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             "test_verdict": test_verdict,
             "verification_results": verification_results,
             "budget_violation_count": budget_violation_count,
+            "llm_call_count": llm_call_count,
+            "tool_call_400_count": tool_call_400_count,
+            "tool_call_400_rate": tool_call_400_rate,
         }
     )
 
@@ -1571,6 +1770,18 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
 
 
 def route_after_agent(state: TestState) -> str:
+    try:
+        ctx = get_tool_context()
+    except Exception:
+        ctx = None
+    goal = state.get("goal_description", {}) if isinstance(state, dict) else {}
+    merged = _merge_goal_verification_results(
+        goal if isinstance(goal, dict) else {},
+        getattr(ctx, "_verifications", []) if ctx else [],
+    )
+    if merged and all(str(item.get("result", "") or "") == "passed" for item in merged):
+        logger.info("Route: reporter (all verifications passed)")
+        return "reporter"
     n = len(state.get("step_history", []))
     budget = _calc_budget_from_state(state)
     if state.get("status") in ("success", "fail"):

@@ -49,6 +49,7 @@ class SqliteBackend(RelationalBackend):
 
     def __init__(self, db_path: str = ""):
         import app_paths
+
         db_path = db_path or app_paths.DB_PATH_STR
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -113,6 +114,8 @@ class SqliteBackend(RelationalBackend):
         self._migrate_v2_columns()
         # ── V3: 双维度结果列 ──
         self._migrate_v3_columns()
+        # ── V4: LLM 400 观测列 ──
+        self._migrate_v4_columns()
 
     def _migrate_v2_columns(self) -> None:
         """V2 迁移：为 element_identities 新增 screen_width/screen_height/bounds_json 列。"""
@@ -135,6 +138,19 @@ class SqliteBackend(RelationalBackend):
             ("execution_status", "TEXT DEFAULT ''"),
             ("test_verdict", "TEXT DEFAULT ''"),
             ("verification_json", "TEXT DEFAULT '[]'"),
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
+        self._conn.commit()
+
+    def _migrate_v4_columns(self) -> None:
+        """V4 迁移：为 test_runs 新增 tool_call_400 观测列。"""
+        for col, typedef in [
+            ("llm_call_count", "INTEGER DEFAULT 0"),
+            ("tool_call_400_count", "INTEGER DEFAULT 0"),
+            ("tool_call_400_rate", "REAL DEFAULT 0"),
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
@@ -207,6 +223,9 @@ class SqliteBackend(RelationalBackend):
         execution_status: str = "",
         test_verdict: str = "",
         verification_json: str = "[]",
+        llm_call_count: int = 0,
+        tool_call_400_count: int = 0,
+        tool_call_400_rate: float = 0.0,
     ) -> None:
         """快捷方法：记录一次测试执行。"""
         self.upsert(
@@ -223,6 +242,9 @@ class SqliteBackend(RelationalBackend):
                 "execution_status": execution_status,
                 "test_verdict": test_verdict,
                 "verification_json": verification_json,
+                "llm_call_count": llm_call_count,
+                "tool_call_400_count": tool_call_400_count,
+                "tool_call_400_rate": tool_call_400_rate,
                 "created_at": datetime.now().isoformat(),
             },
             key="id",
@@ -248,7 +270,9 @@ class SqliteBackend(RelationalBackend):
         rows = self._conn.execute(
             "SELECT id, user_request, app_package, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
-            "execution_status, test_verdict FROM test_runs "
+            "execution_status, test_verdict, "
+            "llm_call_count, tool_call_400_count, tool_call_400_rate "
+            "FROM test_runs "
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
@@ -272,6 +296,9 @@ class SqliteBackend(RelationalBackend):
                 d["test_verdict"] = (
                     "passed" if d["status"] == "success" else "inconclusive"
                 )
+            d["llm_call_count"] = int(d.get("llm_call_count", 0) or 0)
+            d["tool_call_400_count"] = int(d.get("tool_call_400_count", 0) or 0)
+            d["tool_call_400_rate"] = float(d.get("tool_call_400_rate", 0.0) or 0.0)
             result.append(d)
         return result
 
@@ -280,7 +307,9 @@ class SqliteBackend(RelationalBackend):
         row = self._conn.execute(
             "SELECT id, user_request, app_package, app_name, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
-            "execution_status, test_verdict, verification_json FROM test_runs WHERE id = ?",
+            "execution_status, test_verdict, verification_json, "
+            "llm_call_count, tool_call_400_count, tool_call_400_rate "
+            "FROM test_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
         if not row:
@@ -298,6 +327,9 @@ class SqliteBackend(RelationalBackend):
             d["execution_status"] = "completed" if d["status"] == "success" else "error"
         if not d.get("test_verdict"):
             d["test_verdict"] = "passed" if d["status"] == "success" else "inconclusive"
+        d["llm_call_count"] = int(d.get("llm_call_count", 0) or 0)
+        d["tool_call_400_count"] = int(d.get("tool_call_400_count", 0) or 0)
+        d["tool_call_400_rate"] = float(d.get("tool_call_400_rate", 0.0) or 0.0)
         verification_results = json.loads(d.pop("verification_json", "[]") or "[]")
         if isinstance(verification_results, list):
             for item in verification_results:

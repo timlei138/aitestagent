@@ -13,6 +13,21 @@
       </div>
     </div>
 
+    <div class="rd-metrics">
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">LLM调用</span>
+        <b class="rd-metric-value">{{ Number(report.llm_call_count || 0) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">tool_call 400</span>
+        <b class="rd-metric-value">{{ Number(report.tool_call_400_count || 0) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">400占比</span>
+        <b class="rd-metric-value">{{ fmtRate(report.tool_call_400_rate) }}</b>
+      </div>
+    </div>
+
     <!-- 请求文本 -->
     <div class="rd-request" v-if="report.user_request">{{ report.user_request }}</div>
 
@@ -110,6 +125,11 @@ const execStatusMap = {
 }
 function execStatusLabel(s) { return (execStatusMap[s] || execStatusMap.error).label }
 
+function fmtRate(v) {
+  const n = Number(v || 0)
+  return (n * 100).toFixed(2) + '%'
+}
+
 function fmtDuration(ms) {
   if (!ms || ms <= 0) return ''
   if (ms < 1000) return ms + 'ms'
@@ -138,6 +158,10 @@ function shotUrl(path, index) {
 .rd-banner-icon { font-size: 40px; }
 .rd-banner-title { font-size: 22px; font-weight: 700; color: var(--text-primary); }
 .rd-banner-meta { display: flex; gap: 16px; font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+.rd-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+.rd-metric-item { background: #fafbfc; border: 1px solid var(--line-light); border-radius: var(--radius-sm); padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; }
+.rd-metric-label { font-size: 12px; color: var(--text-muted); }
+.rd-metric-value { font-size: 13px; color: var(--text-primary); }
 
 /* ── 请求 ── */
 .rd-request { padding: 12px 16px; background: var(--accent-light); border-radius: var(--radius-sm); font-size: 14px; color: var(--accent); margin-bottom: 12px; border-left: 3px solid var(--accent); }

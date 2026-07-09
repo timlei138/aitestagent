@@ -98,6 +98,13 @@
             <el-table-column prop="user_request" label="测试用例" min-width="200" show-overflow-tooltip />
             <el-table-column prop="total_steps" label="步骤数" width="80" />
             <el-table-column prop="duration_seconds" label="耗时(s)" width="90" />
+            <el-table-column prop="llm_call_count" label="LLM调用" width="90" />
+            <el-table-column prop="tool_call_400_count" label="400次数" width="90" />
+            <el-table-column label="400占比" width="100">
+              <template #default="{ row }">
+                {{ (((Number(row.tool_call_400_rate) || 0) * 100)).toFixed(2) }}%
+              </template>
+            </el-table-column>
             <el-table-column label="执行状态" width="100">
               <template #default="{ row }">
                 <el-tag :type="execStatusType(row.execution_status)" size="small">

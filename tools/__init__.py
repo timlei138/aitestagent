@@ -87,7 +87,9 @@ def get_screen_info(mode: str = "full") -> str:
         return "Perceiver not available - no Android device connected"
     understanding = ctx.perceiver.perceive()
     indexed_clickables = [
-        e for e in understanding.elements if getattr(e, "clickable", False) and (e.label or "")
+        e
+        for e in understanding.elements
+        if getattr(e, "clickable", False) and (e.label or "")
     ]
     clickable_index_map = {id(e): i for i, e in enumerate(indexed_clickables)}
     # 页面身份: activity + 标题
@@ -277,7 +279,9 @@ def _extract_click_preferences_from_rag(rag_summary: str) -> dict[str, Any]:
     return prefs
 
 
-def _prefs_active_for_description(prefs: dict[str, Any] | None, description: str) -> bool:
+def _prefs_active_for_description(
+    prefs: dict[str, Any] | None, description: str
+) -> bool:
     if not prefs:
         return False
     labels = [str(x).strip().lower() for x in (prefs.get("label_contains") or []) if x]
@@ -305,7 +309,9 @@ def _pref_bonus_for_element(
     if cls and cls in [str(v).lower() for v in (prefs or {}).get("class_prefer", [])]:
         bonus += int(weights["textview"])
     if any(
-        str(v).strip().lower() in path for v in (prefs or {}).get("path_contains", []) if v
+        str(v).strip().lower() in path
+        for v in (prefs or {}).get("path_contains", [])
+        if v
     ):
         bonus += int(weights["path"])
     if any(
@@ -512,9 +518,7 @@ def _disambiguate_container(
 
     allow_list_entry = _prefs_active_for_description(
         prefs, description
-    ) and "list_entry" in [
-        str(v).lower() for v in (prefs or {}).get("role_prefer", [])
-    ]
+    ) and "list_entry" in [str(v).lower() for v in (prefs or {}).get("role_prefer", [])]
     allowed_roles = {"navigation_item", "button", "tab"}
     if allow_list_entry:
         allowed_roles.add("list_entry")
@@ -1028,7 +1032,9 @@ def _exact_clickable_candidates(
     if understanding is None:
         return [], "ERROR: 页面信息不可用，无法执行精确点击"
     clickables = [
-        e for e in (understanding.elements or []) if e.clickable and (e.label or "").strip()
+        e
+        for e in (understanding.elements or [])
+        if e.clickable and (e.label or "").strip()
     ]
     if index >= 0:
         if index >= len(clickables):
@@ -1054,7 +1060,8 @@ def _exact_clickable_candidates(
         candidates = [
             e
             for e in candidates
-            if _normalize_text(getattr(e, "class_name", "")).split(".")[-1] == cls_filter
+            if _normalize_text(getattr(e, "class_name", "")).split(".")[-1]
+            == cls_filter
         ]
     if path_filter:
         candidates = [
@@ -1218,7 +1225,12 @@ def click(
     # 收集所有待搜索的目标（label + alternatives 逗号分隔）
     alt_list = [a.strip() for a in (alternatives or "").split(",") if a.strip()]
     search_targets = [label] + alt_list
-    exact_mode = bool((rid or "").strip() or (class_name or "").strip() or (path_contains or "").strip() or index >= 0)
+    exact_mode = bool(
+        (rid or "").strip()
+        or (class_name or "").strip()
+        or (path_contains or "").strip()
+        or index >= 0
+    )
     click_prefs = {}
     try:
         click_prefs = dict(getattr(ctx, "_click_preferences", {}) or {})
@@ -1318,7 +1330,9 @@ def click(
         rid_is_unique = False
         if rid and understanding is not None:
             rid_count = sum(
-                1 for e in (understanding.elements or []) if (e.resource_id or "") == rid
+                1
+                for e in (understanding.elements or [])
+                if (e.resource_id or "") == rid
             )
             rid_is_unique = rid_count <= 1
         if role in ("switch", "switch_row"):
@@ -1347,7 +1361,9 @@ def click(
             return True, _format_click_log(desc, el, strategy="bounds")
         return False, ""
 
-    def _build_click_context(strategy: str, element: Any | None = None) -> dict[str, Any]:
+    def _build_click_context(
+        strategy: str, element: Any | None = None
+    ) -> dict[str, Any]:
         return {
             "exact_mode": exact_mode,
             "index": index,
@@ -1433,7 +1449,10 @@ def click(
     if ctx.device.click_text(label):
         _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(
-            ctx, _pre_page, label, click_context=_build_click_context("text-fallback", None)
+            ctx,
+            _pre_page,
+            label,
+            click_context=_build_click_context("text-fallback", None),
         )
         return _with_snapshot(f"已点击: {label} (strategy=text-fallback)", None)
     # 历史身份兜底
@@ -1493,7 +1512,10 @@ def click(
     if ctx.device.click_resource_id(label):
         _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(
-            ctx, _pre_page, label, click_context=_build_click_context("rid-fallback", None)
+            ctx,
+            _pre_page,
+            label,
+            click_context=_build_click_context("rid-fallback", None),
         )
         return _with_snapshot(f"已点击资源: {label} (strategy=rid-fallback)", None)
     return f"未找到可点击元素: {label}"
@@ -1556,12 +1578,12 @@ def _format_click_log(query: str, el: Any, strategy: str) -> str:
 
 # 已知挥发性 label 模式：时间、日期、电量、通知、热词等动态内容
 _VOLATILE_LABEL_PATTERNS = [
-    re.compile(r"^\d{1,2}:\d{2}$"),                      # 时间
-    re.compile(r"^\d{1,2}月\d{1,2}日"),                    # 日期
-    re.compile(r"^(周一|周二|周三|周四|周五|周六|周日)$"),    # 星期
-    re.compile(r"^\d+%$"),                                 # 电量百分比
-    re.compile(r"^(正在|已).*(充电|USB)"),                   # 充电状态
-    re.compile(r"^\d+ (分钟|小时|天)前$"),                   # 相对时间
+    re.compile(r"^\d{1,2}:\d{2}$"),  # 时间
+    re.compile(r"^\d{1,2}月\d{1,2}日"),  # 日期
+    re.compile(r"^(周一|周二|周三|周四|周五|周六|周日)$"),  # 星期
+    re.compile(r"^\d+%$"),  # 电量百分比
+    re.compile(r"^(正在|已).*(充电|USB)"),  # 充电状态
+    re.compile(r"^\d+ (分钟|小时|天)前$"),  # 相对时间
 ]
 
 
@@ -1669,11 +1691,7 @@ def _record_page_transition(
             if index >= 0:
                 action_parts.append(f"index={index}")
             action_semantic = ",".join(action_parts)
-            action = (
-                f'click_exact("{label}")'
-                if exact_mode
-                else f"click({label})"
-            )
+            action = f'click_exact("{label}")' if exact_mode else f"click({label})"
             if rid:
                 action += f" rid={rid}"
             if class_name:
@@ -1700,7 +1718,9 @@ def _record_page_transition(
                 else ("fallback_click" if "fallback" in strategy else "semantic_click")
             )
             page_stability = "stable"
-            if re.search(r"\d+\.\d+\s*[KMG]?[Bb]/s|\d{1,2}:\d{2}(:\d{2})?|\d+%", pre_page):
+            if re.search(
+                r"\d+\.\d+\s*[KMG]?[Bb]/s|\d{1,2}:\d{2}(:\d{2})?|\d+%", pre_page
+            ):
                 page_stability = "volatile"
                 quality -= 0.30
             quality = max(0.0, min(1.0, quality))
@@ -2447,6 +2467,27 @@ def assert_element_exists(label: str) -> str:
 # ═══════════════════════════════════════════
 
 
+def _normalize_verification_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return re.sub(r"\s+", "", text)
+
+
+def _resolve_verification_key(ctx: ToolContext, condition: str) -> str:
+    raw = str(condition or "").strip()
+    normalized = _normalize_verification_text(raw)
+    key_map = getattr(ctx, "_verification_key_map", {}) or {}
+    if raw and raw in key_map:
+        return str(key_map[raw])
+    if normalized and normalized in key_map:
+        return str(key_map[normalized])
+    if raw.startswith("v") and raw[1:].isdigit():
+        return raw
+    if normalized:
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+        return f"dyn_{digest}"
+    return f"dyn_{len(getattr(ctx, '_verifications', [])) + 1}"
+
+
 @tool
 def assert_verification(condition: str, result: str, detail: str = "") -> str:
     """逐条报告验证条件的结果。condition 对应 goal.verification 中的验证项，
@@ -2458,18 +2499,34 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
             ctx._verifications = []
         if not hasattr(ctx, "_verification_detail_retries"):
             ctx._verification_detail_retries = {}
+        if not hasattr(ctx, "_duplicate_assert_count"):
+            ctx._duplicate_assert_count = 0
+        verification_key = _resolve_verification_key(ctx, condition)
         normalized = result if result in ("passed", "failed") else "unknown"
+        if normalized == "passed":
+            for index, existing in enumerate(ctx._verifications):
+                if (
+                    str(existing.get("key", "") or "") == verification_key
+                    and str(existing.get("result", "") or "") == "passed"
+                ):
+                    ctx._duplicate_assert_count = (
+                        int(ctx._duplicate_assert_count or 0) + 1
+                    )
+                    return (
+                        "DUPLICATE_IGNORED: "
+                        + verification_key
+                        + f" already passed at step={index + 1}"
+                    )
         if normalized in ("passed", "failed") and not (detail or "").strip():
-            key = (condition or "").strip() or f"#{len(ctx._verifications) + 1}"
-            retries = int(ctx._verification_detail_retries.get(key, 0) or 0)
+            retries = int(
+                ctx._verification_detail_retries.get(verification_key, 0) or 0
+            )
             if retries < 2:
-                ctx._verification_detail_retries[key] = retries + 1
+                ctx._verification_detail_retries[verification_key] = retries + 1
                 return f"ERROR: detail is required for assert_verification (attempt {retries + 1}/2)"
             detail = "detail unavailable after retries"
         else:
-            key = (condition or "").strip()
-            if key:
-                ctx._verification_detail_retries.pop(key, None)
+            ctx._verification_detail_retries.pop(verification_key, None)
         shot_path = ""  # 相对路径（供前端 /storage 挂载解析）
         shot_abs_path = ""  # 绝对路径（供本地文件操作）
 
@@ -2552,6 +2609,7 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
 
         ctx._verifications.append(
             {
+                "key": verification_key,
                 "item": condition,
                 "result": normalized,
                 "detail": detail,

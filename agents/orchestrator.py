@@ -233,6 +233,13 @@ class TestOrchestrator:
                         "budget_violation_count": final_state.values.get(
                             "budget_violation_count", 0
                         ),
+                        "llm_call_count": final_state.values.get("llm_call_count", 0),
+                        "tool_call_400_count": final_state.values.get(
+                            "tool_call_400_count", 0
+                        ),
+                        "tool_call_400_rate": final_state.values.get(
+                            "tool_call_400_rate", 0.0
+                        ),
                         "conclusion": final_state.values.get("conclusion", ""),
                         "steps": final_state.values.get("step_history", []),
                     },
@@ -378,6 +385,15 @@ class TestOrchestrator:
                             "budget_violation_count": final_state.values.get(
                                 "budget_violation_count", 0
                             ),
+                            "llm_call_count": final_state.values.get(
+                                "llm_call_count", 0
+                            ),
+                            "tool_call_400_count": final_state.values.get(
+                                "tool_call_400_count", 0
+                            ),
+                            "tool_call_400_rate": final_state.values.get(
+                                "tool_call_400_rate", 0.0
+                            ),
                             "conclusion": final_state.values.get("conclusion", ""),
                             "steps": final_state.values.get("step_history", []),
                         },
@@ -425,6 +441,9 @@ class TestOrchestrator:
             "test_verdict": verdict,
             "verification_results": state.get("verification_results", []),
             "budget_violation_count": state.get("budget_violation_count", 0),
+            "llm_call_count": state.get("llm_call_count", 0),
+            "tool_call_400_count": state.get("tool_call_400_count", 0),
+            "tool_call_400_rate": state.get("tool_call_400_rate", 0.0),
             "mode": "run",
             "conclusion": conclusion,
             "steps": display_steps,
