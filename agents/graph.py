@@ -283,6 +283,24 @@ def _cooldown_group(name: str, args: dict, target: str = "") -> str:
     return ""
 
 
+def _resolve_click_match_mode(name: str, args: dict, output: str) -> str:
+    """从 click 参数和输出推断 match_mode：exact / semantic / ambiguous。"""
+    out_lower = (output or "").lower()
+    if "ambiguous" in out_lower:
+        return "ambiguous"
+    index_val = args.get("index", -1)
+    if (isinstance(index_val, int) and index_val >= 0) or (args.get("rid") or "").strip() or (
+        args.get("class_name") or "").strip() or (args.get("path_contains") or "").strip():
+        return "exact"
+    return "semantic"
+
+
+def _resolve_click_fallback(output: str) -> bool:
+    """从 click 输出判断是否走了兜底路径。仅 fallback 标记为兜底，WARNING 模糊匹配不算。"""
+    out_lower = (output or "").lower()
+    return "fallback" in out_lower
+
+
 def _output_has_page_change(
     output: str, page_sig_before: str = "", page_sig_after: str = ""
 ) -> bool:
@@ -292,16 +310,6 @@ def _output_has_page_change(
     if not m:
         return False
     return m.group(1).strip() != m.group(2).strip()
-
-
-def _should_skip_hotword_element(element: Any) -> bool:
-    rid = ((getattr(element, "resource_id", "") or "").split("/")[-1]).lower()
-    label = (getattr(element, "label", "") or "").strip()
-    if rid == "search_keyword":
-        return True
-    if rid == "search_bar_bg" and len(label) >= 8:
-        return True
-    return False
 
 
 def _run_agent(
@@ -574,18 +582,22 @@ def _run_agent(
 
             # 实时记录工具调用日志（过滤感知类，不去重）
             if name not in _SKIP_EMIT:
-                _current_log.append(
-                    {
-                        "name": name,
-                        "target": target_hint,
-                        "intent_text": (getattr(last_ai, "content", "") or "").strip()[
-                            :200
-                        ],
-                        "observation": output[:200],
-                        "screenshot_path": _screenshot_path,
-                        "tool_seq": len(_current_log),
-                    }
-                )
+                entry: dict[str, Any] = {
+                    "name": name,
+                    "target": target_hint,
+                    "intent_text": (getattr(last_ai, "content", "") or "").strip()[
+                        :200
+                    ],
+                    "observation": output[:200],
+                    "screenshot_path": _screenshot_path,
+                    "tool_seq": len(_current_log),
+                }
+                # 结构化输出字段：click 工具携带 match_mode / fallback_used
+                if name == "click":
+                    entry["match_mode"] = _resolve_click_match_mode(name, args, output)
+                    entry["fallback_used"] = _resolve_click_fallback(output)
+                    entry["tool_input"] = dict(args or {})
+                _current_log.append(entry)
 
             # report_done: 结构化终止信号，立即终止子图
             if name == "report_done":
@@ -1083,6 +1095,18 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
         text = raw.content if hasattr(raw, "content") else str(raw)
         goal = _parse_goal(text)
     logger.info("Planner: %s", goal.get("goal", "")[:80])
+    # 每次新 run 开始时清空 RAG 查询缓存和计数器
+    try:
+        ctx_cleanup = get_tool_context()
+        if ctx_cleanup:
+            ctx_cleanup._rag_query_cache = {}
+            ctx_cleanup._run_tag = config.get("configurable", {}).get("thread_id", "") or ""
+            ctx_cleanup._rag_query_count = 0
+            ctx_cleanup._rag_same_app_count = 0
+            ctx_cleanup._rag_cross_app_count = 0
+            ctx_cleanup._rag_empty_hit_count = 0
+    except Exception:
+        pass
     return Command(
         update={
             "goal_description": goal,
@@ -1673,12 +1697,27 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         else status
     )
 
+    # ── 点击质量指标 ──
+    _tool_log = state.get("_tool_calls_log", [])
+    click_count = sum(1 for s in _tool_log if s.get("name") == "click")
+    exact_count = sum(1 for s in _tool_log if s.get("name") == "click" and s.get("match_mode") == "exact")
+    fuzzy_count = sum(1 for s in _tool_log if s.get("name") == "click" and s.get("fallback_used"))
+    ambiguous_count = sum(1 for s in _tool_log if s.get("name") == "click" and s.get("match_mode") == "ambiguous")
+    rag_query_count = int(getattr(ctx, "_rag_query_count", 0) or 0)
+
+    # RAG same_app ratio: 统计 query_app_knowledge 调用中 same_app 回应的占比
+    _rag_same_app = int(getattr(ctx, "_rag_same_app_count", 0) or 0)
+    _rag_cross_app = int(getattr(ctx, "_rag_cross_app_count", 0) or 0)
+    _rag_empty = int(getattr(ctx, "_rag_empty_hit_count", 0) or 0)
+    rag_total_resolved = _rag_same_app + _rag_cross_app + _rag_empty
+    rag_same_app_ratio = round(_rag_same_app / max(rag_total_resolved, 1), 4)
+    rag_empty_hit_rate = round(_rag_empty / max(rag_total_resolved, 1), 4)
+
     if _relational_db:
         try:
             from agents.orchestrator import _build_display_steps
 
-            tool_log = state.get("_tool_calls_log", [])
-            dd = _build_display_steps(history, tool_log)
+            dd = _build_display_steps(history, _tool_log)
             _relational_db.record_test_run(
                 run_id=config.get("configurable", {}).get("thread_id", ""),
                 user_request=state.get("user_request", ""),
@@ -1694,6 +1733,14 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 llm_call_count=llm_call_count,
                 tool_call_400_count=tool_call_400_count,
                 tool_call_400_rate=tool_call_400_rate,
+                click_count=click_count,
+                fuzzy_click_count=fuzzy_count,
+                ambiguous_count=ambiguous_count,
+                exact_click_count=exact_count,
+                rag_query_count=rag_query_count,
+                rag_same_app_ratio=rag_same_app_ratio,
+                rag_empty_hit_rate=rag_empty_hit_rate,
+                rag_cross_app_used_count=_rag_cross_app,
             )
         except:
             pass
@@ -1703,7 +1750,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     fc = sum(1 for s in dd if s.get("status") == "fail")
     cc = sum(1 for s in dd if s.get("status") == "continue")
     logger.info(
-        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f conclusion=%s",
+        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f click=%d exact=%d fuzzy=%d ambiguous=%d rag_q=%d rag_same=%.2f conclusion=%s",
         execution_status,
         test_verdict,
         len(dd),
@@ -1715,6 +1762,12 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         llm_call_count,
         tool_call_400_count,
         tool_call_400_rate,
+        click_count,
+        exact_count,
+        fuzzy_count,
+        ambiguous_count,
+        rag_query_count,
+        rag_same_app_ratio,
         str(conclusion)[:120],
     )
     return Command(

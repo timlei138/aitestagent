@@ -22,7 +22,7 @@
 │  │   ├── _pref_bonus_for_element  RAG 加分                  │
 │  │   ├── _find_best_element_with_known  历史身份匹配         │
 │  │   ├── _disambiguate_container  容器 vs 子项               │
-│  │   └── _is_container_like       class 判断                │
+│  │   └── _is_container_like       class_name 判断                │
 │  └── 兜底/回退 (150 行)                                     │
 │      ├── fallback 回退循环        点错→试探→再点错           │
 │      ├── text-fallback            文本点击兜底               │
@@ -53,21 +53,21 @@
 
 ## 3) 分阶段下线计划
 
-### Phase 1：无害清理（本周，~100 行）
+### Phase 1：无害清理（已完成，净删 14 行）
 
-这些代码已经不再被主路径使用，直接删：
+删除已不被调用的死代码，内联单调用函数，缩简 prompt 硬规则。`_expand_zh_keywords` / `_ZH_CONTROL_TOKENS` 经检查仍被 legacy 管线调用，延至 Phase 2。
 
-| 删除项 | 位置 | 原因 |
-|--------|------|------|
-| `_should_skip_hotword_element` | graph L299-306 | 精确模式下 LLM 不点热词；page_info 构建已不调用 |
-| `_expand_zh_keywords` | tools L230-238 | LLM 不需要中文→英文翻译 |
-| `_ZH_CONTROL_TOKENS` | tools L197-207 | 同上 |
-| `_is_volatile_label` | tools L1311-1316 | page_info hash 过滤逻辑并入 `_capture_page_id`，独立函数删除 |
-| `agent.txt` 元素选择优先级 6 行 | prompt L29-38 | 缩为 2 行："用精确参数（index/rid/class/path），不要猜" |
+| 删除项 | 位置 | 状态 |
+|--------|------|:---:|
+| `_should_skip_hotword_element` | graph L299-306 | ✅ 已删（0 调用方） |
+| `_is_volatile_label` | tools L1569-1574 | ✅ 已内联到 `_capture_page_id` |
+| `agent.txt` 元素选择优先级 6 行 | prompt L29-38 | ✅ 已缩为 2 行 |
+| `_expand_zh_keywords` | tools L230-238 | ⏸️ 延后 Phase 2（仍被 legacy 调用） |
+| `_ZH_CONTROL_TOKENS` | tools L197-207 | ⏸️ 延后 Phase 2（`_expand_zh_keywords` 依赖） |
 
 ### Phase 2：精确模式接管后（观察 1-2 周，~300 行）
 
-确认精确模式（`index`/`rid`/`class`/`path`）覆盖主要场景后：
+确认精确模式（`index`/`rid`/`class_name`/`path_contains`）覆盖主要场景后：
 
 | 删除项 | 位置 | 前提 |
 |--------|------|------|
@@ -134,41 +134,41 @@ click(label, rid, class_name, path_contains, index)
 每阶段代码删除前满足：
 
 - Phase 1：全量 pytest 通过
-- Phase 2：精确模式连续 50 次 run 零 WARNING（模糊匹配触发 legacy），零 fallback 触发
+- Phase 2：精确模式连续 50 次 run 零 `fallback_used=true`（即无 legacy 兜底触发），`match_mode != semantic` 率 ≥ 95%
 - Phase 3：进展事件驱动的 NO_PROGRESS 稳定运行 1 周
 
 ## 7) 验收标准
 
 - `tools/__init__.py` 从 2770 行降到 ≤ 2200 行
 - `agents/graph.py` 从 1872 行降到 ≤ 1700 行
-- 精确模式占比 ≥ 95%（总 click 次数中精确参数的占比）
-- 模糊匹配 WARNING 率 ≤ 2%
+- 精确模式占比 ≥ 95%（`match_mode=exact` 占 total click 的比例）
+- legacy 兜底触发率 ≤ 2%（`fallback_used=true` 或 `match_mode=semantic` 占比）
 - 全量 pytest + 回放集通过
 
 ---
 
 ## 8) 当前实现偏差（2026-07-09 实测补充）
 
-以下两项与“LLM-Native 决策优先”仍有偏差，需纳入下一轮收敛：
+以下两项与"LLM-Native 决策优先"仍有偏差，需纳入下一轮收敛：
 
 1. **legacy 猜测兜底未完全下线**
-   - 现状：“次优候选回退循环”已在迁移计划中列为删除项（落地状态以当前代码分支为准），`click` 仍保留
+   - 现状："次优候选回退循环"已在迁移计划中列为删除项（落地状态以当前代码分支为准），`click` 仍保留
      `text-fallback` / `known-rid-fallback` / `pct-bounds-fallback` / `rid-fallback`。
-   - 问题：这些路径仍在工具层替 LLM 决策，可能产生“非精确参数下的隐式误点”。
+   - 问题：这些路径仍在工具层替 LLM 决策，可能产生"非精确参数下的隐式误点"。
    - 调整：当非精确模式无法稳定命中时，统一返回结构化错误
      （`AMBIGUOUS` / `NOT_FOUND`），由 LLM 基于 page_info 重新下发
-     `index/rid/class/path` 精确参数。
+     `index/rid/class_name/path_contains` 精确参数。
 
 2. **Fix 4 埋点未形成 click 侧闭环**
    - 现状：`fuzzy_click_count` / `fuzzy_click_rate` / `no_progress_abort_rate`
      在报告与数据库侧尚未全部打通。
-   - 问题：无法量化“legacy 依赖度”和“模糊匹配回归风险”。
+   - 问题：无法量化"legacy 依赖度"和"模糊匹配回归风险"。
    - 调整：将上述指标纳入 run 结果、报告列表与详情，并持久化到 test_runs。
 
 ### 8.1 补充验收门槛
 
-- 非精确参数场景下，点击工具不再执行任何“自动猜次优”行为；
-- `AMBIGUOUS` 返回后，后续一次 LLM 重试应出现精确参数（index/rid/class/path）；
+- 非精确参数场景下，点击工具不再执行任何"自动猜次优"行为；
+- `AMBIGUOUS` 返回后，后续一次 LLM 重试应出现精确参数（index/rid/class_name/path_contains）；
 - 报告可见并可查询：
   - `fuzzy_click_count`
   - `fuzzy_click_rate`
@@ -178,13 +178,13 @@ click(label, rid, class_name, path_contains, index)
 
 ## 9) 高级工程师视角补充（系统级）
 
-在“LLM 擅长的事交给 LLM”原则下，当前还建议补齐以下系统能力：
+在"LLM 擅长的事交给 LLM"原则下，当前还建议补齐以下系统能力：
 
 ### 9.0 优先级分层（P0/P1/P2）
 
 | 优先级 | 条目 | 理由 |
 |---|---|---|
-| P0 | 9.5 可证伪假设、9.7 DoD | 决定“能不能删代码”的标尺，Phase 1 即需要 |
+| P0 | 9.5 可证伪假设、9.7 DoD | 决定"能不能删代码"的标尺，Phase 1 即需要 |
 | P1 | 9.1 Tool Contract、9.4 Kill Switch | Phase 2 精确模式接管前必须具备的工程护栏 |
 | P2 | 9.2 单一规则源、9.3 Trace、9.6 回放集 | 长期工程能力，建议并行推进但不阻塞迁移 |
 
@@ -197,10 +197,10 @@ click(label, rid, class_name, path_contains, index)
 建议统一 click/verify 等核心工具返回结构（至少包含）：
 - `code`: `OK | AMBIGUOUS | NOT_FOUND | SAFETY_BLOCKED | DEVICE_OFFLINE`
 - `message`: 人类可读描述
-- `hints`: 下一步建议参数（如 `index/rid/class/path`）
+- `hints`: 下一步建议参数（如 `index/rid/class_name/path_contains`）
 - `evidence`: 候选摘要（最多 N 条，避免超长）
 
-> 先“结构化输出稳定”，再“下线启发式”。
+> 先"结构化输出稳定"，再"下线启发式"。
 
 ### 9.2 Prompt 规则与运行时规则单一来源
 
@@ -220,9 +220,9 @@ click(label, rid, class_name, path_contains, index)
 - `page_signature_before/after`
 - `llm_turn_index`
 
-目标：能回答“这次错点是模型决策错、工具契约错，还是页面感知错”。
+目标：能回答"这次错点是模型决策错、工具契约错，还是页面感知错"。
 
-### 9.4 迁移防护：双跑对比 + Kill Switch
+### 9.4 迁移防护：双跑对比 + Kill Switch（迁移期备选，最终以 §10.1 单开关为准）
 
 建议引入运行期开关：
 - `CLICK_NATIVE_STRICT=true/false`（严格透传）
@@ -232,13 +232,13 @@ click(label, rid, class_name, path_contains, index)
 - 同输入在新旧路径并行决策，不实际执行旧路径，仅对比输出差异；
 - 达到阈值后再彻底关闭 legacy。
 
-### 9.5 数据闭环：把“可删代码”变成“可证伪假设”
+### 9.5 数据闭环：把"可删代码"变成"可证伪假设"
 
 每个待删除模块都绑定一个可量化假设，例如：
 - 删除 `_score_element` 后，`AMBIGUOUS` 率上升不超过 X%，最终通过率不下降；
 - 删除 fallback 后，平均重试轮数不超过 Y，误点率下降 Z%。
 
-无指标不删除，避免“删完才发现隐含依赖”。
+无指标不删除，避免"删完才发现隐含依赖"。
 
 ### 9.6 回归体系补齐（不仅 pytest）
 
@@ -253,7 +253,7 @@ click(label, rid, class_name, path_contains, index)
 
 建议补一条架构级 DoD：
 - Legacy 路径只保留设备执行与安全相关代码；
-- 所有”语义判断/候选排序/回退策略”不再在工具层实现；
+- 所有"语义判断/候选排序/回退策略"不再在工具层实现；
 - 线上 2 周满足：
   - 通过率不降
   - 误点率下降
@@ -263,6 +263,8 @@ click(label, rid, class_name, path_contains, index)
 ---
 
 ## 10) 实施细节
+
+> **状态：待实现。** 以下为详细规格，代码库中尚未落地。行号以当前 main 分支为参考，函数名 + rg 搜索为准。
 
 ### 10.1 Kill Switch（运行期开关）
 
@@ -284,15 +286,15 @@ click_mode: native_strict  # native_strict | legacy
 
 ```python
 class ToolContext:
-    click_mode: str = “legacy”  # 由 server.py 从 config 注入
+    click_mode: str = "legacy"  # 由 server.py 从 config 注入
 ```
 
 **分流**：`tools/__init__.py` → `click()`
 
 ```python
-def click(label, ..., rid=””, class_name=””, path_contains=””, index=-1):
+def click(label, ..., rid="", class_name="", path_contains="", index=-1):
     ctx = get_tool_context()
-    if getattr(ctx, “click_mode”, “legacy”) == “native_strict”:
+    if getattr(ctx, "click_mode", "legacy") == "native_strict":
         return _native_strict(label, rid, class_name, path_contains, index,
                              alternatives, ctx)
     return _legacy_click(label, rid, class_name, path_contains, index,
@@ -314,7 +316,7 @@ def _native_strict(label, rid, class_name, path_contains, index, alternatives, c
         return _execute(candidates[0])
 
     # 无精确参数 -> 直接返回 AMBIGUOUS，不猜
-    return “AMBIGUOUS: 未提供精确参数（index/rid/class_name/path_contains），请在 page_info 中选择后重试”
+    return "AMBIGUOUS: 未提供精确参数（index/rid/class_name/path_contains），请在 page_info 中选择后重试"
 ```
 
 **回滚**（Windows PowerShell / Linux 通用）：
@@ -333,13 +335,15 @@ sed -i 's/native_strict/legacy/' config.yaml
 
 ### 10.2 指标门禁
 
+> **前提**：以下门禁依赖 click 工具侧先落地结构化字段（`match_mode`、`fallback_used`、`tool_input`）。当前 `_format_click_log` 仍为字符串拼接，直接按文档统计会有偏差。**先落地结构化输出，再启用门禁阈值。**
+
 **click 工具侧**：新增结构化输出字段，避免依赖日志文案字符串匹配。
 
 `_format_click_log` 返回结果中追加：
 
 ```python
 # 输出格式追加 match_mode 和 fallback_used
-# 例: “已点击: 应用列表 | strategy=bounds | match_mode=exact | fallback_used=false | ...”
+# 例: "已点击: 应用列表 | strategy=bounds | match_mode=exact | fallback_used=false | ..."
 ```
 
 **数据采集**：`agents/graph.py` → `reporter_node`
@@ -348,17 +352,17 @@ sed -i 's/native_strict/legacy/' config.yaml
 import re
 
 # 从 tool_calls_log 的结构化字段 + observation 提取
-click_count = sum(1 for s in dd if s.get(“action_type”) == “click”)
+click_count = sum(1 for s in dd if s.get("action_type") == "click")
 
 # 优先读结构化字段，缺失时回退 observation 匹配（向后兼容）
 def _is_fuzzy(s):
-    return bool(s.get(“fallback_used”)) or (
-        not s.get(“match_mode”) and “WARNING” in str(s.get(“observation”, “”))
+    return bool(s.get("fallback_used")) or (
+        not s.get("match_mode") and "WARNING" in str(s.get("observation", ""))
     )
 
 def _is_ambiguous(s):
-    return bool(s.get(“match_mode”) == “ambiguous”) or (
-        not s.get(“match_mode”) and “AMBIGUOUS” in str(s.get(“observation”, “”))
+    return bool(s.get("match_mode") == "ambiguous") or (
+        not s.get("match_mode") and "AMBIGUOUS" in str(s.get("observation", ""))
     )
 
 fuzzy_count = sum(1 for s in dd if _is_fuzzy(s))
@@ -369,16 +373,19 @@ ambiguous_count = sum(1 for s in dd if _is_ambiguous(s))
 ambiguous_retry_ok = 0
 pending_ambiguous = False
 for s in dd:
-    act = s.get(“action_type”, “”)
-    if act == “click”:
+    act = s.get("action_type", "")
+    if act == "click":
         if pending_ambiguous:
-            obs = str(s.get(“observation”, “”) or “”)
-            if any(k in obs for k in (“rid=”, “class=”, “path_contains=”, “index=”)):
+            # 读 tool_input 结构化字段，不依赖 observation 文案
+            ti = s.get("tool_input", {}) if isinstance(s.get("tool_input"), dict) else {}
+            if any(ti.get(k) for k in ("rid", "class_name", "path_contains")) or (
+                isinstance(ti.get("index"), int) and ti.get("index", -1) >= 0
+            ):
                 ambiguous_retry_ok += 1
             pending_ambiguous = False
         if _is_ambiguous(s):
             pending_ambiguous = True
-    elif act in (“get_screen_info”, “query_app_knowledge”, “check_page_health”):
+    elif act in ("get_screen_info", "query_app_knowledge", "check_page_health"):
         continue  # 中间插入感知/查询动作，不打断跟踪
     else:
         pending_ambiguous = False  # 其他动作打断跟踪
@@ -389,7 +396,7 @@ _relational_db.record_test_run(
     click_count=click_count,
     ambiguous_count=ambiguous_count,
     ambiguous_retry_ok=ambiguous_retry_ok,
-    no_progress_abort=(“NO_PROGRESS” in str(conclusion)),
+    no_progress_abort=("NO_PROGRESS" in str(conclusion)),
 )
 ```
 
@@ -412,17 +419,17 @@ _relational_db.record_test_run(
 ```python
 # 改前：rid 唯一 -> 直接点
 if rid_is_unique and ctx.device.click_resource_id(rid):
-    return True, _format_click_log(desc, el, strategy=”resource_id”)
+    return True, _format_click_log(desc, el, strategy="resource_id")
 
 # 改后：rid 唯一 -> 语义验证 -> 放行或透传（Phase 1 过渡态，依赖 _score_element）
 if rid_is_unique:
-    if _score_element(el, [desc], prefs=None, description=””) >= 3:
+    if _score_element(el, [desc], prefs=None, description="") >= 3:
         if ctx.device.click_resource_id(rid):
-            return True, _format_click_log(desc, el, strategy=”resource_id”)
+            return True, _format_click_log(desc, el, strategy="resource_id")
     # 语义不匹配 -> 不执行，透传歧义
     return (False,
-        f”AMBIGUOUS: rid={rid} label={getattr(el, 'label', '')} “
-        f”与目标 '{desc}' 不匹配，请用 index/class_name 精确定位”)
+        f"AMBIGUOUS: rid={rid} label={getattr(el, 'label', '')} "
+        f"与目标 '{desc}' 不匹配，请用 index/class_name 精确定位")
 ```
 
 > **过渡态说明**：Phase 1 依赖 `_score_element >= 3` 做歧义判断。Phase 2 `_score_element` 下线后，改为 contract-only 判断：精确参数存在则执行，不存在则直接 AMBIGUOUS。
@@ -435,34 +442,34 @@ if rid_is_unique:
 
 ```python
 # 成功
-{“code”: “OK”, “message”: “已点击: 应用列表”,
- “hints”: {“index”: 2, “class_name”: “TextView”}}
+{"code": "OK", "message": "已点击: 应用列表",
+ "hints": {"index": 2, "class_name": "TextView"}}
 
 # 歧义
-{“code”: “AMBIGUOUS”, “message”: “3 个候选匹配”,
- “evidence”: [
-    {“index”: 0, “label”: “应用列表”, “class_name”: “FrameLayout”, “rid”: “taskbar_view”},
-    {“index”: 2, “label”: “应用列表”, “class_name”: “TextView”,
-     “path”: “taskbar_container > taskbar_view”}
+{"code": "AMBIGUOUS", "message": "3 个候选匹配",
+ "evidence": [
+    {"index": 0, "label": "应用列表", "class_name": "FrameLayout", "rid": "taskbar_view"},
+    {"index": 2, "label": "应用列表", "class_name": "TextView",
+     "path_contains": "taskbar_container > taskbar_view"}
 ]}
 
 # 未找到
-{“code”: “NOT_FOUND”, “message”: “未找到匹配元素”}
+{"code": "NOT_FOUND", "message": "未找到匹配元素"}
 
 # 安全拦截
-{“code”: “SAFETY_BLOCKED”, “message”: “操作被安全策略拦截”}
+{"code": "SAFETY_BLOCKED", "message": "操作被安全策略拦截"}
 ```
 
 **实现阶段**：Phase 1 不做格式变更，Phase 2 精确模式接管前完成切换。
 
-### 10.5 Phase 1 清理检查清单
+### 10.5 Phase 1 清理检查清单（计划项，脚本尚未落地，不作为当前分支验收门禁）
 
 ```bash
 # 删除前确认（Windows PowerShell 替代 grep）
-rg “_should_skip_hotword_element” agents/ tools/   # 确认无调用
-rg “_expand_zh_keywords” agents/ tools/             # 确认无调用
-rg “_ZH_CONTROL_TOKENS” agents/ tools/              # 确认无调用
-rg “_is_volatile_label” agents/ tools/              # 确认只有 _capture_page_id 调用
+rg "_should_skip_hotword_element" agents/ tools/   # 确认无调用
+rg "_expand_zh_keywords" agents/ tools/             # 确认无调用
+rg "_ZH_CONTROL_TOKENS" agents/ tools/              # 确认无调用
+rg "_is_volatile_label" agents/ tools/              # 确认只有 _capture_page_id 调用
 
 # 删除后验证
 pytest -q                                           # 全量通过
@@ -472,7 +479,7 @@ git diff --stat                                     # 确认净删行数
 
 > 注：Windows 下 `rg` = [ripgrep](https://github.com/BurntSushi/ripgrep)，`grep` 也可用 Git Bash 自带的版本。
 
-### 10.6 测试补充
+### 10.6 测试补充（计划项，用例尚未落地，不作为当前分支验收门禁）
 
 | 测试文件 | 新增用例 | 覆盖 |
 |---------|---------|------|

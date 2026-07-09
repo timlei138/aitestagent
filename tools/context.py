@@ -30,6 +30,13 @@ class ToolContext:
     _last_screenshot_path: str = (
         ""  # perceive() cache miss 时自动存盘的截图路径，assert_verification 失败时回退
     )
+    # RAG 查询缓存与观测计数器
+    _rag_query_cache: dict[str, str] = field(default_factory=dict, repr=False)
+    _rag_query_count: int = 0
+    _rag_same_app_count: int = 0
+    _rag_cross_app_count: int = 0
+    _rag_empty_hit_count: int = 0
+    _run_tag: str = ""  # 当前 run 标识，用于缓存键隔离
 
     @property
     def screen_size(self) -> tuple[int, int]:

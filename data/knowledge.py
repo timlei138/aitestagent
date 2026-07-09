@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import logging
 import re
 from typing import Any
@@ -129,15 +130,14 @@ class KnowledgeBase:
     ) -> None:
         """保存操作经验 —— 精简格式: A → action → B"""
 
-        # 精简内容格式
-        content = page
-        if action:
-            content += f" → {action}"
-        if to_page:
-            content += f" → {to_page}"
-
+        # 精简内容格式：page/to_page 归一化后拼接，不含 hash/动态 token
         page_norm = self._normalize_page_id(page)
         to_page_norm = self._normalize_page_id(to_page)
+        content = page_norm or page
+        if action:
+            content += f" → {action}"
+        if to_page_norm:
+            content += f" → {to_page_norm}"
         action_type, action_label_norm, rid_tail = self._parse_action_signature(action)
 
         # Phase 1：严格去重（app_package, page_norm, action_label_norm, rid_tail）
@@ -160,6 +160,20 @@ class KnowledgeBase:
                 break
 
         now_iso = last_verified_at or datetime.now().isoformat()
+        dedupe_raw = f"{app_package}|{page_norm}|{action_label_norm}|{rid_tail}"
+        dedupe_key = hashlib.sha1(dedupe_raw.encode("utf-8")).hexdigest()[:16]
+
+        # 优先按 dedupe_key 精确查找
+        try:
+            existing_by_key = self.backend.get_by_metadata(
+                {"knowledge_type": "experience", "dedupe_key": dedupe_key},
+                limit=1,
+            )
+            if existing_by_key and existing_by_key[0].get("id"):
+                duplicate = existing_by_key[0]
+        except Exception:
+            logger.debug("dedupe_key lookup failed, fallback to scan", exc_info=True)
+
         if duplicate:
             meta = dict(duplicate.get("metadata", {}) or {})
             merged = {
@@ -211,6 +225,7 @@ class KnowledgeBase:
                     "action_type": action_type,
                     "action_label_norm": action_label_norm,
                     "rid_tail": rid_tail,
+                    "dedupe_key": dedupe_key,
                 },
             )
         )
@@ -361,34 +376,39 @@ class KnowledgeBase:
 
     def query_curated_rules(self, app_package: str, top_k: int = 5) -> str:
         """查询人工知识：双路精确 metadata 查询，无评分过滤。"""
-        type_filter = {
-            "$or": [
-                {"knowledge_type": t}
-                for t in self._TYPE_ALIASES.get("curated_rule", ["curated_rule"])
-            ]
-        }
+        curated_aliases = self._TYPE_ALIASES.get("curated_rule", ["curated_rule"])
+        if len(curated_aliases) == 1:
+            type_filter = {"knowledge_type": curated_aliases[0]}
+        else:
+            type_filter = {
+                "$or": [{"knowledge_type": t} for t in curated_aliases]
+            }
+
+        universal_slots = max(1, top_k // 5)  # 20% 名额给 universal，至少 1 条
+        app_slots = top_k - universal_slots       # 剩余名额给 app 规则，避免总条数超 top_k
 
         app_lines: list[str] = []
         if app_package:
             app_rules = self.backend.get_by_metadata(
                 {**type_filter, "app_package": app_package},
-                limit=top_k,
+                limit=app_slots,
             )
             app_lines = [f"- {str(r.get('content', '') or '')}" for r in app_rules]
 
         universal_rules = self.backend.get_by_metadata(
             {**type_filter, "app_package": "", "scope": "universal"},
-            limit=top_k,
+            limit=universal_slots,
         )
         universal_lines = [
             f"- {str(r.get('content', '') or '')}" for r in universal_rules
         ]
 
         parts = []
-        if universal_lines:
-            parts.append("### 通用知识\n" + "\n".join(universal_lines))
+        # 先 App 规则，再通用知识（避免通用规则在前部抢占注意力）
         if app_lines:
             parts.append("### App 操作前提\n" + "\n".join(app_lines))
+        if universal_lines:
+            parts.append("### 通用知识\n" + "\n".join(universal_lines))
         return "\n\n".join(parts)
 
     @property
@@ -403,8 +423,10 @@ class KnowledgeBase:
         # 去掉标题栏中动态片段（网速/时间/百分比）
         for p in cls._DYN_PAGE_PATTERNS:
             s = p.sub("", s)
+        # 去掉 hash 后缀和残留括号
+        s = re.sub(r"#[a-f0-9]{6,}", "", s)
         s = re.sub(r"\s+", " ", s).strip()
-        s = s.replace("「」", "")
+        s = s.replace("「」", "").replace("「」", "")
         if "「" in s:
             s = s.split("「", 1)[0].strip()
         return s

@@ -116,6 +116,9 @@ class SqliteBackend(RelationalBackend):
         self._migrate_v3_columns()
         # ── V4: LLM 400 观测列 ──
         self._migrate_v4_columns()
+        # ── V5: 点击质量指标列 ──
+        self._migrate_v5_columns()
+        self._migrate_v6_columns()
 
     def _migrate_v2_columns(self) -> None:
         """V2 迁移：为 element_identities 新增 screen_width/screen_height/bounds_json 列。"""
@@ -151,6 +154,34 @@ class SqliteBackend(RelationalBackend):
             ("llm_call_count", "INTEGER DEFAULT 0"),
             ("tool_call_400_count", "INTEGER DEFAULT 0"),
             ("tool_call_400_rate", "REAL DEFAULT 0"),
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
+        self._conn.commit()
+
+    def _migrate_v5_columns(self) -> None:
+        """V5 迁移：为 test_runs 新增点击质量指标列。"""
+        for col, typedef in [
+            ("click_count", "INTEGER DEFAULT 0"),
+            ("fuzzy_click_count", "INTEGER DEFAULT 0"),
+            ("ambiguous_count", "INTEGER DEFAULT 0"),
+            ("exact_click_count", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
+        self._conn.commit()
+
+    def _migrate_v6_columns(self) -> None:
+        """V6 迁移：为 test_runs 新增 RAG 观测列。"""
+        for col, typedef in [
+            ("rag_query_count", "INTEGER DEFAULT 0"),
+            ("rag_same_app_ratio", "REAL DEFAULT 0"),
+            ("rag_empty_hit_rate", "REAL DEFAULT 0"),
+            ("rag_cross_app_used_count", "INTEGER DEFAULT 0"),
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
@@ -226,6 +257,14 @@ class SqliteBackend(RelationalBackend):
         llm_call_count: int = 0,
         tool_call_400_count: int = 0,
         tool_call_400_rate: float = 0.0,
+        click_count: int = 0,
+        fuzzy_click_count: int = 0,
+        ambiguous_count: int = 0,
+        exact_click_count: int = 0,
+        rag_query_count: int = 0,
+        rag_same_app_ratio: float = 0.0,
+        rag_empty_hit_rate: float = 0.0,
+        rag_cross_app_used_count: int = 0,
     ) -> None:
         """快捷方法：记录一次测试执行。"""
         self.upsert(
@@ -245,6 +284,14 @@ class SqliteBackend(RelationalBackend):
                 "llm_call_count": llm_call_count,
                 "tool_call_400_count": tool_call_400_count,
                 "tool_call_400_rate": tool_call_400_rate,
+                "click_count": click_count,
+                "fuzzy_click_count": fuzzy_click_count,
+                "ambiguous_count": ambiguous_count,
+                "exact_click_count": exact_click_count,
+                "rag_query_count": rag_query_count,
+                "rag_same_app_ratio": rag_same_app_ratio,
+                "rag_empty_hit_rate": rag_empty_hit_rate,
+                "rag_cross_app_used_count": rag_cross_app_used_count,
                 "created_at": datetime.now().isoformat(),
             },
             key="id",
@@ -271,7 +318,10 @@ class SqliteBackend(RelationalBackend):
             "SELECT id, user_request, app_package, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
             "execution_status, test_verdict, "
-            "llm_call_count, tool_call_400_count, tool_call_400_rate "
+            "llm_call_count, tool_call_400_count, tool_call_400_rate, "
+            "click_count, fuzzy_click_count, ambiguous_count, exact_click_count, "
+            "rag_query_count, rag_same_app_ratio, rag_empty_hit_rate, "
+            "rag_cross_app_used_count "
             "FROM test_runs "
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
@@ -299,6 +349,17 @@ class SqliteBackend(RelationalBackend):
             d["llm_call_count"] = int(d.get("llm_call_count", 0) or 0)
             d["tool_call_400_count"] = int(d.get("tool_call_400_count", 0) or 0)
             d["tool_call_400_rate"] = float(d.get("tool_call_400_rate", 0.0) or 0.0)
+            d["click_count"] = int(d.get("click_count", 0) or 0)
+            d["fuzzy_click_count"] = int(d.get("fuzzy_click_count", 0) or 0)
+            d["ambiguous_count"] = int(d.get("ambiguous_count", 0) or 0)
+            d["exact_click_count"] = int(d.get("exact_click_count", 0) or 0)
+            # 派生比率
+            d["fuzzy_click_rate"] = round(
+                d["fuzzy_click_count"] / max(d["click_count"], 1), 4
+            )
+            d["exact_click_rate"] = round(
+                d["exact_click_count"] / max(d["click_count"], 1), 4
+            )
             result.append(d)
         return result
 
@@ -308,7 +369,10 @@ class SqliteBackend(RelationalBackend):
             "SELECT id, user_request, app_package, app_name, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
             "execution_status, test_verdict, verification_json, "
-            "llm_call_count, tool_call_400_count, tool_call_400_rate "
+            "llm_call_count, tool_call_400_count, tool_call_400_rate, "
+            "click_count, fuzzy_click_count, ambiguous_count, exact_click_count, "
+            "rag_query_count, rag_same_app_ratio, rag_empty_hit_rate, "
+            "rag_cross_app_used_count "
             "FROM test_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
@@ -330,6 +394,16 @@ class SqliteBackend(RelationalBackend):
         d["llm_call_count"] = int(d.get("llm_call_count", 0) or 0)
         d["tool_call_400_count"] = int(d.get("tool_call_400_count", 0) or 0)
         d["tool_call_400_rate"] = float(d.get("tool_call_400_rate", 0.0) or 0.0)
+        d["click_count"] = int(d.get("click_count", 0) or 0)
+        d["fuzzy_click_count"] = int(d.get("fuzzy_click_count", 0) or 0)
+        d["ambiguous_count"] = int(d.get("ambiguous_count", 0) or 0)
+        d["exact_click_count"] = int(d.get("exact_click_count", 0) or 0)
+        d["fuzzy_click_rate"] = round(
+            d["fuzzy_click_count"] / max(d["click_count"], 1), 4
+        )
+        d["exact_click_rate"] = round(
+            d["exact_click_count"] / max(d["click_count"], 1), 4
+        )
         verification_results = json.loads(d.pop("verification_json", "[]") or "[]")
         if isinstance(verification_results, list):
             for item in verification_results:

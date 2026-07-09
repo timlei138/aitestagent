@@ -31,11 +31,9 @@ click("A") → click("B") → click("A") → ...
 - 如果当前页面名称与 Goal 描述的起始页面不一致，优先完成页面/模式切换，不要直接在错误页面开始操作。
 - 不确定当前环境是否符合要求时，先调用 `check_desktop_mode()` 或 `get_screen_info` 验证，不要假设已处于正确状态。
 
-## 元素选择优先级（强约束）
-- 导航动作必须优先依据 rid/role/path 证据，不得仅凭热词/新闻标题文本点击。
-- `search_keyword`、`search_bar_bg` 属于搜索区元素，不得作为“进入页面”导航目标。
-- 候选冲突时，按 rid > role+label > path 的优先级决策。
-- App/页面特定导航规则优先从 RAG（人工知识/操作经验）读取并执行，不在此处硬编码场景特例。
+## 元素选择优先级
+- 点击时优先使用精确参数（index/rid/class_name/path_contains），不要仅凭 label 文本猜测。
+- 页面特定导航规则从 RAG 读取，不在此处硬编码场景特例。
 
 ## 精确点击
 - click 支持精确参数：`index`、`rid`、`class_name`、`path_contains`。

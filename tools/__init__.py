@@ -914,20 +914,79 @@ def query_app_knowledge(query: str, app_package: str = "") -> str:
         return "未启用知识库"
     package = app_package or ctx.device.current_app().get("package", "")
 
-    exp_results = ctx.knowledge_base.query(
-        query, app_package=package, knowledge_type="experience", top_k=5
-    )
-    rule_text = ctx.knowledge_base.query_curated_rules(package, top_k=3)
+    # 埋点：统计 RAG 查询次数
+    ctx._rag_query_count = int(getattr(ctx, "_rag_query_count", 0) or 0) + 1
+
+    # 缓存键含 page_signature_hash，页面变化自动失效
+    try:
+        page_sig = _capture_page_id(ctx) or "unknown"
+    except Exception:
+        page_sig = "unknown"
+    _cache = getattr(ctx, "_rag_query_cache", None)
+    if _cache is None:
+        _cache = {}
+        ctx._rag_query_cache = _cache
+    query_norm = (query or "").strip().lower()
+    run_tag = getattr(ctx, "_run_tag", "") or ""
+    cache_key = f"{run_tag}|{package}|{query_norm}|{page_sig}"
+    if cache_key in _cache:
+        return _cache[cache_key]
 
     parts = []
-    if exp_results:
+    # 并行召回：质量 + 语义双路，合并 rerank
+    strong = ctx.knowledge_base.query_experience(package, query, top_k=10) if package else []
+    semantic = ctx.knowledge_base.query(
+        query, app_package=package, knowledge_type="experience", top_k=5
+    )
+
+    seen = set()
+    merged = []
+    for r in strong + semantic:
+        rid_val = str(r.get("id", "") or "")
+        if rid_val:
+            key = rid_val
+        else:
+            key = hashlib.sha1(
+                str(r.get("content", "") or "").strip().lower().encode("utf-8")
+            ).hexdigest()[:12]
+        if key not in seen:
+            seen.add(key)
+            merged.append(r)
+
+    if merged and query.strip():
+        merged.sort(
+            key=lambda r: _experience_relevance(r, query.strip().lower()), reverse=True
+        )
+        merged = merged[:5]
+
+    # RAG 来源标记（用于观测）
+    n_same = sum(1 for r in merged if (r.get("metadata", {}) or {}).get("app_package", "") == package)
+    ctx._rag_same_app_count = int(getattr(ctx, "_rag_same_app_count", 0) or 0) + n_same
+    ctx._rag_cross_app_count = int(getattr(ctx, "_rag_cross_app_count", 0) or 0) + (len(merged) - n_same)
+    if not merged:
+        ctx._rag_empty_hit_count = int(getattr(ctx, "_rag_empty_hit_count", 0) or 0) + 1
+
+    if merged:
         parts.append("## 操作经验")
-        parts.extend(f"- {r['content']}" for r in exp_results)
+        parts.extend(f"- {r['content']}" for r in merged)
+
+    rule_text = ctx.knowledge_base.query_curated_rules(package, top_k=3)
     if rule_text:
         parts.append("## 人工知识")
         parts.append(rule_text)
 
-    return "\n".join(parts) if parts else f"未找到 '{query}' 的相关知识"
+    result = "\n".join(parts) if parts else f"未找到 '{query}' 的相关知识"
+    _cache[cache_key] = result
+    return result
+
+
+def _experience_relevance(entry: dict, query_lower: str) -> int:
+    """轻量语义相关性：content 中 query 词命中数。"""
+    content = str(entry.get("content", "") or "").lower()
+    words = [w for w in query_lower.split() if len(w) >= 2]
+    if not words:
+        return 0
+    return sum(1 for w in words if w in content)
 
 
 @tool
@@ -1147,18 +1206,28 @@ def _maybe_promote_exact_rule(
         return
 
     page_name = (pre_page or "").split("「")[0] or "当前页面"
-    rule = f"在{page_name}点击“{label}”时，优先匹配"
-    rule_parts = []
-    if cls:
-        rule_parts.append(f"class={cls}")
-    if path:
-        rule_parts.append(f"path={path}")
-    if rid:
-        rule_parts.append(f"rid={rid.split('/')[-1]}")
-    if not rule_parts:
-        return
-    rule += " 且 ".join(rule_parts)
-    # 冲突检测：若同 label 存在人工 curated（非 auto_exact_click）且内容不同，不自动覆盖
+
+    # 聚合去重：同 (app, class, path) 已有通用规则时不再逐按钮新增
+    if cls and path:
+        dedup_sig = f"{app_pkg}|{cls}|{path}"
+        existing = kb.query_curated_rules(app_pkg, top_k=20)
+        if dedup_sig in existing:
+            return
+        # 检查是否已有同 class+path 的 auto 规则（仅更新 last_verified_at）
+        try:
+            curated = kb.backend.get_by_metadata(
+                {"app_package": app_pkg, "knowledge_type": "curated_rule"},
+                limit=50,
+            )
+            for row in curated:
+                meta = row.get("metadata", {}) or {}
+                content = str(row.get("content", "") or "")
+                if dedup_sig in content:
+                    return
+        except Exception:
+            logger.debug("curated dedup check failed", exc_info=True)
+
+    # 冲突检测：若存在人工 curated（非 auto_exact_click），不自动覆盖
     try:
         curated = kb.backend.get_by_metadata(
             {"app_package": app_pkg, "knowledge_type": "curated_rule"},
@@ -1171,19 +1240,25 @@ def _maybe_promote_exact_rule(
             if scenario == "auto_exact_click":
                 continue
             manual_label = _extract_curated_rule_label(content)
-            if manual_label and manual_label == label and content != rule:
+            if manual_label and manual_label == label and dedup_sig not in content:
                 logger.warning(
-                    "Skip auto curated due to manual conflict: label=%r manual=%r auto=%r",
-                    label,
-                    content[:80],
-                    rule[:80],
+                    "Skip auto curated due to manual conflict: label=%r", label
                 )
                 return
     except Exception:
         logger.debug("curated conflict check failed", exc_info=True)
-    existing = kb.query_curated_rules(app_pkg, top_k=20)
-    if rule in existing:
+
+    # 生成通用规则（按 class+path 聚合，不逐按钮命名）
+    rule_parts = []
+    if cls:
+        rule_parts.append(f"class={cls}")
+    if path:
+        rule_parts.append(f"path={path}")
+    if not rule_parts:
         return
+    rule = f"在{page_name}点击按钮时，优先匹配 " + " 且 ".join(rule_parts)
+    if rid:
+        rule += f"，并用 rid 区分具体按钮（如 {rid.split('/')[-1]}）"
     kb.save_curated_rule(
         app_package=app_pkg,
         content=rule,
@@ -1358,10 +1433,8 @@ def click(
             label_assoc_hit = any(
                 w and (w in label_text or w in assoc_text) for w in score_words
             )
-            if (
-                _score_element(el, score_words, prefs=None, description="") >= 3
-                and label_assoc_hit
-            ):
+            # 语义匹配：label 或 associated_label 命中即放行（不做业务惩罚，不做 rid 子串）
+            if label_assoc_hit:
                 if ctx.device.click_resource_id(rid):
                     return True, _format_click_log(desc, el, strategy="resource_id")
             return (
@@ -1402,6 +1475,8 @@ def click(
             best_el = promoted
 
         ok, result = _perform_click_on_element(best_el, matched_label)
+        if not ok and "AMBIGUOUS:" in (result or ""):
+            return result  # 歧义直接透传给 LLM，不走 fallback
         if ok:
             strategy = re.search(r"strategy=([A-Za-z0-9_-]+)", result or "")
             _record_page_transition(
@@ -1566,14 +1641,6 @@ _VOLATILE_LABEL_PATTERNS = [
 ]
 
 
-def _is_volatile_label(label: str) -> bool:
-    """判断 label 是否为挥发性动态内容。"""
-    s = (label or "").strip()
-    if len(s) >= 12:
-        return False  # 长文本通常不是动态的
-    return any(p.search(s) for p in _VOLATILE_LABEL_PATTERNS)
-
-
 def _capture_page_id(ctx: Any) -> str:
     """捕获当前页面身份标识（activity + 页面标题 + 稳定可见元素签名）。
     过滤挥发性 label（时间、电量等），避免假页面变化干扰回退判定。"""
@@ -1590,7 +1657,13 @@ def _capture_page_id(ctx: Any) -> str:
                 for e in (understanding.elements or [])
                 if getattr(e, "clickable", False)
                 and (e.label or "").strip()
-                and not _is_volatile_label(e.label)
+                and not (
+                    # 内联 _is_volatile_label 逻辑
+                    len(str(e.label or "").strip()) < 12
+                    and any(
+                        p.search(str(e.label or "").strip()) for p in _VOLATILE_LABEL_PATTERNS
+                    )
+                )
             )
             if labels:
                 vis_hash = hashlib.md5(
@@ -1711,6 +1784,12 @@ def _record_page_transition(
                     strategy,
                 )
                 return
+            # §5.2: 同页同按钮不重复写 experience。跨页导航才写入。
+            pre_activity = (pre_page or "").split("「")[0].split("#")[0].strip()
+            post_activity = (post_page or "").split("「")[0].split("#")[0].strip()
+            if exact_mode and pre_activity == post_activity:
+                return  # 同 activity 内的精确点击（如计算器按键）不写 experience
+
             combo_key = f"{pre_page}|{action}|{post_page}"
             if combo_key in _page_transition_seen:
                 return
@@ -1719,11 +1798,15 @@ def _record_page_transition(
             kb = ctx.knowledge_base
             if kb:
                 app_pkg = ctx.device.current_app().get("package", "")
+                # §5.3: content 精简 — page 归一化去 hash，action 传语义化摘要
+                rid_tail = (rid or "").split("/")[-1] if rid else ""
+                norm_pre = re.sub(r"#\w{6,}", "", (pre_page or "").split("「")[0])
+                norm_post = re.sub(r"#\w{6,}", "", (post_page or "").split("「")[0])
                 kb.save_experience(
                     app_package=app_pkg,
-                    page=pre_page,
+                    page=norm_pre,
                     action=action,
-                    to_page=post_page,
+                    to_page=norm_post,
                     outcome="成功",
                     signal_type=signal_type,
                     quality_score=quality,

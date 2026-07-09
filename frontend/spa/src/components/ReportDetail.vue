@@ -19,12 +19,32 @@
         <b class="rd-metric-value">{{ Number(report.llm_call_count || 0) }}</b>
       </div>
       <div class="rd-metric-item">
-        <span class="rd-metric-label">tool_call 400</span>
-        <b class="rd-metric-value">{{ Number(report.tool_call_400_count || 0) }}</b>
+        <span class="rd-metric-label">点击 (精确/模糊/歧义)</span>
+        <b class="rd-metric-value">{{ Number(report.click_count || 0) }} / {{ Number(report.fuzzy_click_count || 0) }} / {{ Number(report.ambiguous_count || 0) }}</b>
       </div>
       <div class="rd-metric-item">
-        <span class="rd-metric-label">400占比</span>
-        <b class="rd-metric-value">{{ fmtRate(report.tool_call_400_rate) }}</b>
+        <span class="rd-metric-label">精确点击率</span>
+        <b class="rd-metric-value">{{ fmtRate(report.exact_click_rate) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">模糊点击率</span>
+        <b class="rd-metric-value">{{ fmtRate(report.fuzzy_click_rate) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">RAG查询</span>
+        <b class="rd-metric-value">{{ Number(report.rag_query_count || 0) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">RAG同App率</span>
+        <b class="rd-metric-value">{{ fmtRate(report.rag_same_app_ratio) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">RAG跨App</span>
+        <b class="rd-metric-value">{{ Number(report.rag_cross_app_used_count || 0) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">tool_call 400</span>
+        <b class="rd-metric-value">{{ Number(report.tool_call_400_count || 0) }}</b>
       </div>
     </div>
 
