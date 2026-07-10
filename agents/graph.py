@@ -886,7 +886,7 @@ def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
         return ""
     parts = []
     # 1. 人工知识（一次查询，Python 侧自动分组为全局知识 + App 操作前提）
-    rules = kb.query_curated_rules(app_package)
+    rules = kb.query_curated_rules(app_package, top_k=20)
     if rules:
         parts.append("## 人工知识\n" + rules)
     # 2. 操作经验

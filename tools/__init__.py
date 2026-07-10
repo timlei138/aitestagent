@@ -1189,83 +1189,9 @@ def _maybe_promote_exact_rule(
         action_semantic=action,
         page_stability="stable",
     )
-    evidence = 0
-    try:
-        exp_rows = kb.backend.get_by_metadata(
-            {"app_package": app_pkg, "knowledge_type": "experience"},
-            limit=100,
-        )
-        for row in exp_rows:
-            meta = row.get("metadata", {}) or {}
-            if str(meta.get("action", "") or "") != action:
-                continue
-            evidence = max(evidence, int(meta.get("success_count", 1) or 1))
-    except Exception:
-        logger.debug("read exact experience counters failed", exc_info=True)
-    if evidence < 3:
-        return
-
-    page_name = (pre_page or "").split("「")[0] or "当前页面"
-
-    # 聚合去重：同 (app, class, path) 已有通用规则时不再逐按钮新增
-    if cls and path:
-        dedup_sig = f"{app_pkg}|{cls}|{path}"
-        existing = kb.query_curated_rules(app_pkg, top_k=20)
-        if dedup_sig in existing:
-            return
-        # 检查是否已有同 class+path 的 auto 规则（仅更新 last_verified_at）
-        try:
-            curated = kb.backend.get_by_metadata(
-                {"app_package": app_pkg, "knowledge_type": "curated_rule"},
-                limit=50,
-            )
-            for row in curated:
-                meta = row.get("metadata", {}) or {}
-                content = str(row.get("content", "") or "")
-                if dedup_sig in content:
-                    return
-        except Exception:
-            logger.debug("curated dedup check failed", exc_info=True)
-
-    # 冲突检测：若存在人工 curated（非 auto_exact_click），不自动覆盖
-    try:
-        curated = kb.backend.get_by_metadata(
-            {"app_package": app_pkg, "knowledge_type": "curated_rule"},
-            limit=50,
-        )
-        for row in curated:
-            meta = row.get("metadata", {}) or {}
-            content = str(row.get("content", "") or "")
-            scenario = str(meta.get("scenario", "") or "")
-            if scenario == "auto_exact_click":
-                continue
-            manual_label = _extract_curated_rule_label(content)
-            if manual_label and manual_label == label and dedup_sig not in content:
-                logger.warning(
-                    "Skip auto curated due to manual conflict: label=%r", label
-                )
-                return
-    except Exception:
-        logger.debug("curated conflict check failed", exc_info=True)
-
-    # 生成通用规则（按 class+path 聚合，不逐按钮命名）
-    rule_parts = []
-    if cls:
-        rule_parts.append(f"class={cls}")
-    if path:
-        rule_parts.append(f"path={path}")
-    if not rule_parts:
-        return
-    rule = f"在{page_name}点击按钮时，优先匹配 " + " 且 ".join(rule_parts)
-    if rid:
-        rule += f"，并用 rid 区分具体按钮（如 {rid.split('/')[-1]}）"
-    kb.save_curated_rule(
-        app_package=app_pkg,
-        content=rule,
-        scope="app",
-        scenario="auto_exact_click",
-        quality_score=0.8,
-    )
+    # NOTE(2026-07-10): 点击偏好已通过 save_experience 保存为操作经验，
+    # _extract_click_preferences_from_rag 在 RAG 查询时自动提取。
+    # 不再自动提升为 curated_rule —— 人工知识应仅由测试人员手动维护。
 
 
 @tool

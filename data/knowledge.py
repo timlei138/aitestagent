@@ -348,13 +348,16 @@ class KnowledgeBase:
                 f"app_package={app_package}"
             )
 
-        existing = self.query("", knowledge_type="curated_rule", top_k=10)
-        if any(
-            e.get("content", "") == content
-            and e.get("metadata", {}).get("app_package", "") == app_package
-            for e in existing
-        ):
-            return
+        # 确定性去重：扫描全量 curated_rule，按 (app_package, content) 精确匹配
+        existing = self.backend.get_by_metadata(
+            {"knowledge_type": "curated_rule"}, limit=500
+        )
+        for e in existing:
+            if (
+                str(e.get("content", "") or "") == content
+                and str((e.get("metadata", {}) or {}).get("app_package", "")) == app_package
+            ):
+                return
         self.save_knowledge(
             UIKnowledge(
                 app_package=app_package,
@@ -375,7 +378,12 @@ class KnowledgeBase:
         )
 
     def query_curated_rules(self, app_package: str, top_k: int = 5) -> str:
-        """查询人工知识：双路精确 metadata 查询，无评分过滤。"""
+        """查询人工知识：双路精确 metadata 查询，无评分过滤。
+
+        只返回测试人员手写的规则（无 scenario 或 scenario 不以 auto_ 开头）。
+        Agent 自动生成的规则（scenario=auto_exact_click 等）走操作经验通道，
+        不混入人工知识。
+        """
         curated_aliases = self._TYPE_ALIASES.get("curated_rule", ["curated_rule"])
         if len(curated_aliases) == 1:
             type_filter = {"knowledge_type": curated_aliases[0]}
@@ -384,31 +392,37 @@ class KnowledgeBase:
                 "$or": [{"knowledge_type": t} for t in curated_aliases]
             }
 
-        universal_slots = max(1, top_k // 5)  # 20% 名额给 universal，至少 1 条
-        app_slots = top_k - universal_slots       # 剩余名额给 app 规则，避免总条数超 top_k
+        # 取超额（ChromaDB 不支持 NOT 过滤），Python 侧筛掉自动规则
+        universal_slots = max(1, top_k // 5)
+        _fetch_n = max(top_k * 3, 50)
 
         app_lines: list[str] = []
         if app_package:
-            app_rules = self.backend.get_by_metadata(
+            raw = self.backend.get_by_metadata(
                 {**type_filter, "app_package": app_package},
-                limit=app_slots,
+                limit=_fetch_n,
             )
-            app_lines = [f"- {str(r.get('content', '') or '')}" for r in app_rules]
+            app_lines = [
+                f"- {str(r.get('content', '') or '')}"
+                for r in raw
+                if not str(r.get("metadata", {}).get("scenario", "")).startswith("auto_")
+            ][:top_k]
 
-        universal_rules = self.backend.get_by_metadata(
+        raw_univ = self.backend.get_by_metadata(
             {**type_filter, "app_package": "", "scope": "universal"},
             limit=universal_slots,
         )
         universal_lines = [
-            f"- {str(r.get('content', '') or '')}" for r in universal_rules
-        ]
+            f"- {str(r.get('content', '') or '')}" for r in raw_univ
+            if not str(r.get("metadata", {}).get("scenario", "")).startswith("auto_")
+        ][:universal_slots]
 
         parts = []
-        # 先 App 规则，再通用知识（避免通用规则在前部抢占注意力）
-        if app_lines:
-            parts.append("### App 操作前提\n" + "\n".join(app_lines))
+        # 优先级：人工全局 > App 规则
         if universal_lines:
             parts.append("### 通用知识\n" + "\n".join(universal_lines))
+        if app_lines:
+            parts.append("### App 操作前提\n" + "\n".join(app_lines))
         return "\n\n".join(parts)
 
     @property
