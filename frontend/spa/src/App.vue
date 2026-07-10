@@ -17,7 +17,7 @@
         </el-menu-item>
         <el-menu-item index="plans">
           <el-icon><i class="nav-icon">▣</i></el-icon>
-          <span>测试用例</span>
+          <span>测试意图</span>
         </el-menu-item>
         <el-menu-item index="apps">
           <el-icon><i class="nav-icon">📱</i></el-icon>
@@ -93,8 +93,8 @@
         <section class="panel">
           <div class="panel-header">
             <div>
-              <h3 class="panel-title">测试用例（已保存计划）</h3>
-              <div class="panel-subtitle">复跑会跳过 planner 和计划确认，直接按保存的目标执行。</div>
+              <h3 class="panel-title">测试意图（已保存）</h3>
+              <div class="panel-subtitle">复跑会跳过 planner 和意图确认，直接按保存的大纲目标执行。</div>
             </div>
             <div style="display:flex;gap:8px">
               <el-button size="small" @click="loadPlans">刷新</el-button>
@@ -103,7 +103,7 @@
               </el-button>
             </div>
           </div>
-          <el-table :data="plansList" row-key="name" empty-text="暂无保存的测试用例" @selection-change="selectedPlans = $event">
+          <el-table :data="plansList" row-key="name" empty-text="暂无保存的测试意图" @selection-change="selectedPlans = $event">
             <el-table-column type="selection" width="44" />
             <el-table-column prop="name" label="名称" min-width="160" show-overflow-tooltip />
             <el-table-column prop="app_package" label="包名" min-width="180" show-overflow-tooltip />
@@ -327,7 +327,7 @@
     <template #footer>
       <div class="pr-footer">
         <el-button size="large" @click="confirmPlan('cancel')">取消</el-button>
-        <el-button size="large" :loading="planSaving" @click="saveCurrentPlan">存为测试用例</el-button>
+        <el-button size="large" :loading="planSaving" @click="saveCurrentPlan">存为测试意图</el-button>
         <el-button size="large" type="primary" @click="confirmPlan('confirm')">
           确认并开始执行
         </el-button>
@@ -489,7 +489,7 @@ const activeMenu = ref("workspace");
 const activeMenuTitle = computed(() => ({
   workspace: '工作台',
   reports: '报告中心',
-  plans: '测试用例',
+  plans: '测试意图',
   apps: 'APP 管理',
   settings: '设置',
   knowledge: '知识库',
@@ -852,7 +852,7 @@ async function saveCurrentPlan() {
   }
   let name = '';
   try {
-    const result = await ElMessageBox.prompt('请输入测试用例名称', '保存测试用例', {
+    const result = await ElMessageBox.prompt('请输入测试意图名称', '保存测试意图', {
       inputValue: plan.goal.substring(0, 40),
       confirmButtonText: '保存',
       cancelButtonText: '取消',
@@ -874,7 +874,7 @@ async function saveCurrentPlan() {
     });
     const data = await res.json();
     if (res.ok && data.status === 'success') {
-      ElMessage.success(`已保存为测试用例「${name}」`);
+      ElMessage.success(`已保存为测试意图「${name}」`);
       await loadPlans();
     } else {
       ElMessage.error(data.detail || data.message || '保存失败');
@@ -901,7 +901,7 @@ async function runSavedPlan(row) {
   }
   plansRunning.value = true;
   executing.value = true;
-  workspaceRef.value?.addEntry({ type: 'log', text: `复跑测试用例: ${row.name}` });
+  workspaceRef.value?.addEntry({ type: 'log', text: `复跑测试意图: ${row.name}` });
   startSnapshotPolling();
   try {
     const res = await fetch(`/api/plans/${encodeURIComponent(row.name)}/run`, { method: 'POST' });
@@ -923,7 +923,7 @@ async function runSelectedPlans() {
   }
   plansRunning.value = true;
   executing.value = true;
-  workspaceRef.value?.addEntry({ type: 'log', text: `批量复跑 ${names.length} 个测试用例` });
+  workspaceRef.value?.addEntry({ type: 'log', text: `批量复跑 ${names.length} 个测试意图` });
   startSnapshotPolling();
   try {
     const res = await fetch('/api/plans/run/batch', {
@@ -948,7 +948,7 @@ async function runSelectedPlans() {
 
 async function deleteSavedPlan(row) {
   try {
-    await ElMessageBox.confirm(`确定删除测试用例「${row.name}」？`, '删除确认', {
+    await ElMessageBox.confirm(`确定删除测试意图「${row.name}」？`, '删除确认', {
       type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消'
     });
   } catch (e) { return; }
