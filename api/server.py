@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -246,63 +247,110 @@ set_ws_emit_callback(lambda t, p: ws_manager.broadcast_sync(t, p))
 
 # ── USB 热插拔监听 ──
 _usb_monitor_proc: subprocess.Popen | None = None
+_usb_monitor_stop = threading.Event()
+_shutdown_done = False
+
+
+def shutdown_adb() -> None:
+    """应用退出前清理所有 ADB 相关资源。可重复调用，只执行一次。"""
+    import subprocess
+    import time as _time
+
+    global _shutdown_done
+    if _shutdown_done:
+        return
+    _shutdown_done = True
+
+    _log = logging.getLogger(__name__)
+    _t0 = _time.time()
+
+    # 0) 设置停止标志，阻止 USB 监控线程重启 adb
+    _usb_monitor_stop.set()
+    _log.info("[shutdown] step0 stop_flag set (%.2fs)", _time.time() - _t0)
+
+    # 1) 释放设备引用（不调 close()，避免 TCP 关闭等待超时）
+    global _device
+    _device = None
+    _log.info("[shutdown] step1 device released (%.2fs)", _time.time() - _t0)
+
+    # 2) 终止 adb track-devices 监控子进程
+    global _usb_monitor_proc
+    if _usb_monitor_proc is not None:
+        try:
+            _usb_monitor_proc.kill()
+        except Exception:
+            pass
+        _usb_monitor_proc = None
+    _log.info("[shutdown] step2 monitor killed (%.2fs)", _time.time() - _t0)
+
+    # 3) Windows: taskkill 强杀所有 adb.exe
+    import sys as _sys
+    if _sys.platform == "win32":
+        try:
+            subprocess.Popen(  # fire-and-forget，不等结果
+                ["taskkill", "/F", "/IM", "adb.exe"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            subprocess.run(
+                ["adb", "kill-server"],
+                capture_output=True,
+                timeout=2,
+            )
+        except Exception:
+            pass
+    _log.info("[shutdown] step3 taskkill fired (%.2fs total)", _time.time() - _t0)
 
 
 def _start_usb_monitor() -> None:
     """后台线程：adb track-devices 实时监听 USB 插拔，毫秒级响应。"""
     import subprocess
-    import threading
     import atexit
 
-    def _kill_adb():
-        global _usb_monitor_proc
-        if _usb_monitor_proc is not None:
-            try:
-                _usb_monitor_proc.terminate()
-            except Exception:
-                pass
-
-    atexit.register(_kill_adb)
+    atexit.register(shutdown_adb)
 
     def _monitor():
         global _device, _perceiver, _usb_monitor_proc
         logger = logging.getLogger(__name__)
         prev_has_device = _device is not None
-        while True:
-            try:
-                _usb_monitor_proc = subprocess.Popen(
-                    ["adb", "track-devices"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    bufsize=1,
-                )
-                for line in _usb_monitor_proc.stdout:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    has_device = "\tdevice" in line and "offline" not in line
-                    if has_device != prev_has_device:
-                        prev_has_device = has_device
-                        if has_device:
-                            logger.info("USB device connected via ADB track-devices")
-                            reconnect_device()
-                        else:
-                            logger.info("USB device disconnected via ADB track-devices")
-                            _device = None
-                            _perceiver = None
-                            _rebuild_tool_context()
-                        try:
-                            ws_manager.broadcast_sync(
-                                "device_status_change",
-                                {"connected": has_device},
-                            )
-                        except Exception:
-                            pass
-                logger.warning("adb track-devices exited, restarting in 2s...")
-            except Exception as exc:
-                logger.warning("adb track-devices error: %s, retrying in 2s...", exc)
-            threading.Event().wait(2)
+        try:
+            _usb_monitor_proc = subprocess.Popen(
+                ["adb", "track-devices"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            for line in _usb_monitor_proc.stdout:
+                if _usb_monitor_stop.is_set():
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                has_device = "\tdevice" in line and "offline" not in line
+                if has_device != prev_has_device:
+                    prev_has_device = has_device
+                    if has_device:
+                        logger.info("USB device connected via ADB track-devices")
+                        reconnect_device()
+                    else:
+                        logger.info("USB device disconnected via ADB track-devices")
+                        _device = None
+                        _perceiver = None
+                        _rebuild_tool_context()
+                    try:
+                        ws_manager.broadcast_sync(
+                            "device_status_change",
+                            {"connected": has_device},
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("adb track-devices error: %s", exc)
 
     t = threading.Thread(target=_monitor, daemon=True, name="usb-monitor")
     t.start()

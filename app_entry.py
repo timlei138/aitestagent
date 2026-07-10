@@ -32,6 +32,17 @@ if sys.platform == "win32":
 
     subprocess.Popen = _SilentPopen
 
+# ── 关键：切换工作目录到安全位置，避免子进程继承 PyInstaller 临时目录 ──
+# console=False 时子进程脱离控制台，不会被系统自动清理，若 CWD 指向
+# _MEIxxxxx 临时目录，会导致目录被锁住无法删除、弹出"adb 占用"提示。
+if getattr(sys, "frozen", False):
+    _safe_cwd = _os.path.expanduser("~")
+    try:
+        _os.chdir(_safe_cwd)
+        print(f"[app_entry] CWD changed to {_safe_cwd}")
+    except Exception:
+        pass
+
 import app_paths
 
 # ── 调试输出：确认路径模式 ──
@@ -59,18 +70,22 @@ if _adb:
 else:
     print("[app_entry] WARNING: adb not found, device features will not work")
 
-# 文件日志：写入 AppData，即使无控制台也可见
+# 文件日志：写入 AppData + stderr，即使无控制台也可见
 app_paths.ensure_dirs()
-_file_handler = logging.FileHandler(
-    str(app_paths.LOG_DIR / "app_entry.log"), encoding="utf-8", mode="w"
-)
-_file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+_log_fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+# 文件 handler（行缓冲，确保立即写入）
+_log_path = str(app_paths.LOG_DIR / "app_entry.log")
+_file_handler = logging.FileHandler(_log_path, encoding="utf-8", mode="w")
+_file_handler.setFormatter(_log_fmt)
 logging.getLogger().addHandler(_file_handler)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+# stderr handler（控制台即时可见）
+_stderr_handler = logging.StreamHandler(sys.stderr)
+_stderr_handler.setFormatter(_log_fmt)
+logging.getLogger().addHandler(_stderr_handler)
+
+logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger("app_entry")
 
 HOST = "127.0.0.1"
@@ -78,6 +93,51 @@ PORT = 8080
 TITLE = "AI 自动化测试 Agent"
 WINDOW_WIDTH = 1400
 WINDOW_HEIGHT = 900
+APP_URL = f"http://{HOST}:{PORT}"
+HEALTH_URL = f"{APP_URL}/api/health"
+
+# ── 启动加载页：纯静态，由 Python 侧轮询服务就绪后跳转 ──
+# 注意：不能靠 JS fetch 轮询，WebView2 中 html= 加载的页面 origin 为 null，
+# 对 localhost 的请求会被跨域拦截。
+_LOADING_HTML = r"""
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    display: flex; justify-content: center; align-items: center;
+    height: 100vh; background: #1a1a2e; color: #e0e0e0;
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  .splash { text-align: center; }
+  .spinner {
+    width: 48px; height: 48px; margin: 0 auto 24px;
+    border: 4px solid rgba(255,255,255,.15);
+    border-top-color: #4fc3f7; border-radius: 50%;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  h2 { font-size: 20px; font-weight: 500; margin-bottom: 8px; }
+  p { font-size: 14px; color: #999; }
+  .progress { margin-top: 32px; width: 180px; height: 3px; background: rgba(255,255,255,.1); border-radius: 2px; overflow: hidden; }
+  .progress-bar { height: 100%; width: 0%; background: #4fc3f7; border-radius: 2px; transition: width .5s ease; }
+  #error { color: #ef5350; display: none; margin-top: 16px; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="splash">
+  <div class="spinner"></div>
+  <h2>AI 自动化测试 Agent</h2>
+  <p id="status">正在初始化服务...</p>
+  <div class="progress"><div class="progress-bar" id="bar"></div></div>
+  <p id="error">服务启动超时，请重启应用</p>
+</div>
+</body>
+</html>
+"""
 
 
 def _start_server():
@@ -99,20 +159,47 @@ def _start_server():
         logger.exception("uvicorn 启动失败")
 
 
-def _wait_for_server(timeout: float = 120.0) -> bool:
-    """等待服务就绪。"""
+def _make_poll_server():
+    """返回一个后台轮询函数，服务就绪后自动跳转到应用页面。"""
     import urllib.request
+    import webview as _wv
 
-    url = f"http://{HOST}:{PORT}/api/health"
-    start = time.time()
-    while time.time() - start < timeout:
+    MAX_RETRIES = 400       # 400 × 0.3s ≈ 120s
+    INTERVAL = 0.3
+
+    def _poll():
+        logger.info("后台轮询服务就绪 (timeout=%.0fs)...", MAX_RETRIES * INTERVAL)
+        for i in range(MAX_RETRIES):
+            try:
+                urllib.request.urlopen(HEALTH_URL, timeout=1)
+                logger.info("服务已就绪 (第 %d 次轮询)，跳转到 %s", i + 1, APP_URL)
+                _wv.windows[0].load_url(APP_URL)
+                return
+            except Exception:
+                pass
+
+            # 非线性进度：平方根曲线，前期快后期慢，感知更流畅
+            ratio = (i + 1) / MAX_RETRIES
+            pct = int(min(95, ratio ** 0.35 * 100))
+            try:
+                _wv.windows[0].evaluate_js(
+                    f'document.getElementById("bar").style.width="{pct}%";'
+                )
+            except Exception:
+                pass
+            time.sleep(INTERVAL)
+
+        # 超时
+        logger.error("服务启动超时 (%ds)", int(MAX_RETRIES * INTERVAL))
         try:
-            urllib.request.urlopen(url, timeout=1)
-            return True
+            _wv.windows[0].evaluate_js(
+                'document.getElementById("status").textContent="服务启动超时";'
+                'document.getElementById("error").style.display="block";'
+            )
         except Exception:
-            time.sleep(0.3)
-    logger.error("Server did not start within %ds", timeout)
-    return False
+            pass
+
+    return _poll
 
 
 def main():
@@ -122,23 +209,25 @@ def main():
     server_thread = threading.Thread(target=_start_server, daemon=True)
     server_thread.start()
 
-    logger.info("等待服务就绪 (timeout=120s)...")
-    if not _wait_for_server():
-        logger.error("无法启动服务，请检查端口 %d 是否被占用", PORT)
-        try:
-            input("按 Enter 退出...")
-        except (RuntimeError, EOFError):
-            pass
-        sys.exit(1)
-
-    logger.info("服务已就绪，正在创建窗口…")
     try:
         import webview
-        logger.info("pywebview 导入成功，创建窗口…")
+    except ImportError:
+        logger.warning("pywebview 未安装，自动打开浏览器")
+        import webbrowser
+        webbrowser.open(APP_URL)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        return
 
-        window = webview.create_window(
+    logger.info("pywebview 导入成功，立即显示加载窗口（服务后台初始化中）…")
+    _t0 = _t1 = _t2 = 0.0
+    try:
+        webview.create_window(
             TITLE,
-            url=f"http://{HOST}:{PORT}",
+            html=_LOADING_HTML,
             width=WINDOW_WIDTH,
             height=WINDOW_HEIGHT,
             min_size=(800, 600),
@@ -146,31 +235,42 @@ def main():
             text_select=True,
         )
         logger.info("窗口已创建，启动 webview 事件循环…")
-        webview.start(debug=False)
+        webview.start(func=_make_poll_server(), debug=False)
+        _t0 = time.time()
         logger.info("webview 事件循环结束")
-        # 窗口关闭后清理 adb 子进程
-        try:
-            subprocess.run(["adb", "kill-server"], capture_output=True, timeout=5)
-            logger.info("adb server killed")
-        except Exception:
-            pass
-    except ImportError:
-        logger.warning("pywebview 未安装，自动打开浏览器")
-        import webbrowser
 
-        webbrowser.open(f"http://{HOST}:{PORT}")
+        # ── 计时：定位退出延迟 ──
+        _t1 = time.time()
+        logger.info("[shutdown] 开始清理 (webview.start 返回耗时 %.1fs)", _t1 - _t0)
+
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
+            from api.server import shutdown_adb
+            shutdown_adb()
+        except Exception:
+            logger.exception("shutdown_adb 失败")
+
+        _t2 = time.time()
+        logger.info("[shutdown] 清理完成 (耗时 %.1fs, 总计 %.1fs)", _t2 - _t1, _t2 - _t0)
     except Exception:
         logger.exception("窗口启动失败")
 
+    logger.info("[shutdown] main() 即将返回 (%.1fs since window close)", time.time() - _t0)
+    # 强制刷盘
+    for _h in logging.getLogger().handlers:
+        try:
+            _h.flush()
+        except Exception:
+            pass
+    # 跳过 Python 退出阶段的非 daemon 线程等待（uvicorn 线程池等会阻塞 ~5s）
+    _os._exit(0)
+
 
 if __name__ == "__main__":
+    _main_t0 = time.time()
     try:
         main()
+        _main_t1 = time.time()
+        logger.info("[shutdown] main() 已返回 (耗时 %.1fs)", _main_t1 - _main_t0)
     except Exception:
         import traceback
         logger.exception("Fatal error in main")
@@ -186,3 +286,5 @@ if __name__ == "__main__":
             input("发生错误，按 Enter 退出...")
         except Exception:
             pass
+    # 确保所有日志刷盘
+    logging.shutdown()
