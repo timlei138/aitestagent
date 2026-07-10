@@ -19,8 +19,8 @@
         <div class="float-win-actions">
           <el-switch v-model="showOverlay" size="small" active-text="元素" inactive-text=""
                      @change="drawElementOverlay" />
-          <el-button size="small" text @click="emit('refresh', true)" :disabled="!deviceOnline"
-                     style="margin-left:6px;color:#fff;">刷新</el-button>
+          <button class="float-win-refresh" @click="emit('refresh', true)" :disabled="!deviceOnline"
+                  title="手动刷新截图">🔄</button>
           <button class="float-win-close" @click="close">×</button>
         </div>
       </div>
@@ -95,7 +95,7 @@ const props = defineProps({
   elementList: Array,
 });
 
-const emit = defineEmits(["refresh", "send-key", "stop-polling"]);
+const emit = defineEmits(["refresh", "send-key"]);
 
 // ── 窗口状态 ──
 const visible = ref(false);
@@ -140,14 +140,11 @@ function toggle() {
     posX.value = window.innerWidth - winW.value - 24;
     posY.value = 80;
     emit("refresh", true);
-  } else {
-    emit("stop-polling");
   }
 }
 
 function close() {
   visible.value = false;
-  emit("stop-polling");
 }
 
 // ── 拖拽 ──
@@ -175,7 +172,7 @@ function onResizeStart(e) {
   _resizeStartW = winW.value;
   const onMove = (ev) => {
     if (!_resizing) return;
-    winW.value = Math.max(220, Math.min(600, _resizeStartW + ev.clientX - _resizeStartX));
+    winW.value = Math.max(180, Math.min(window.innerWidth - 40, _resizeStartW + ev.clientX - _resizeStartX));
   };
   const onUp = () => { _resizing = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   window.addEventListener('mousemove', onMove);
@@ -379,6 +376,19 @@ defineExpose({ toggle, isVisible: visible });
   transition: color 0.15s, background 0.15s;
 }
 .float-win-close:hover { color: var(--danger); background: #fef2f2; }
+.float-win-refresh {
+  margin-left: 6px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+  transition: color 0.15s, background 0.15s;
+}
+.float-win-refresh:hover:not(:disabled) { color: var(--accent); background: var(--accent-light); }
+.float-win-refresh:disabled { opacity: 0.3; cursor: not-allowed; }
 .float-win-meta {
   display: flex;
   align-items: baseline;

@@ -245,11 +245,11 @@ def _calc_budget(goal: dict) -> dict[str, int]:
     verifications = (
         _safe_len(goal.get("verification", [])) if isinstance(goal, dict) else 0
     )
-    max_tool_calls_total = 16 + pages * 9 + verifications * 8
-    max_agent_iterations = min(max(2 + pages + verifications, 6), 18)
+    max_tool_calls_total = 24 + pages * 12 + verifications * 10
+    max_agent_iterations = min(max(2 + pages + verifications, 8), 24)
     # 每轮子图预算作为断路器，不应过小导致在关键动作前被截断。
-    # 迭代层(route)负责主导结束；这里取较宽上限，避免“即将点击关键元素时 __end__”。
-    max_turns_per_iteration = min(max(max_tool_calls_total, 10), 50)
+    # 迭代层(route)负责主导结束；这里取较宽上限，避免"即将点击关键元素时 __end__"。
+    max_turns_per_iteration = min(max(max_tool_calls_total, 10), 64)
     return {
         "max_tool_calls_total": max_tool_calls_total,
         "max_agent_iterations": max_agent_iterations,
@@ -277,7 +277,7 @@ def _cooldown_group(name: str, args: dict, target: str = "") -> str:
         )
         if any(k in txt for k in ("应用列表", "所有应用")):
             return "app_entry_retry"
-        # “应用”需要精确边界，避免误命中“应用商店”等复合词
+        # "应用"需要精确边界，避免误命中"应用商店"等复合词
         if re.search(r"(^|[^\u4e00-\u9fff])应用([^\u4e00-\u9fff]|$)", txt):
             return "app_entry_retry"
     return ""
@@ -289,8 +289,12 @@ def _resolve_click_match_mode(name: str, args: dict, output: str) -> str:
     if "ambiguous" in out_lower:
         return "ambiguous"
     index_val = args.get("index", -1)
-    if (isinstance(index_val, int) and index_val >= 0) or (args.get("rid") or "").strip() or (
-        args.get("class_name") or "").strip() or (args.get("path_contains") or "").strip():
+    if (
+        (isinstance(index_val, int) and index_val >= 0)
+        or (args.get("rid") or "").strip()
+        or (args.get("class_name") or "").strip()
+        or (args.get("path_contains") or "").strip()
+    ):
         return "exact"
     return "semantic"
 
@@ -339,6 +343,7 @@ def _run_agent(
             "assistant message with 'tool_calls' must be followed by tool messages"
             in text.lower()
         )
+
     if provider == "zhipu":
         from zhipuai import ZhipuAI
 
@@ -467,8 +472,9 @@ def _run_agent(
             except Exception as e:
                 output = f"ERROR: {e}"
             page_sig_after = _build_page_signature(_ctx)
-            progress_milestone = name == "assert_verification" or _output_has_page_change(
-                output, page_sig_once, page_sig_after
+            progress_milestone = (
+                name == "assert_verification"
+                or _output_has_page_change(output, page_sig_once, page_sig_after)
             )
             # 设备断开快速终止：工具执行后立即检测，避免继续执行无意义操作
             try:
@@ -814,7 +820,9 @@ def _call_retry_should_retry(provider: str, exc: Exception, on_error=None) -> bo
             on_error(exc)
         except Exception:
             logger.debug("on_error callback failed", exc_info=True)
-    return _is_rate_limit_error(exc) if provider == "zhipu" else _default_should_retry(exc)
+    return (
+        _is_rate_limit_error(exc) if provider == "zhipu" else _default_should_retry(exc)
+    )
 
 
 def _zhipu_schemas(tools):
@@ -917,7 +925,7 @@ def _apply_click_preferences(
 
 
 def _should_include_rag(state: TestState, effective_app_package: str) -> bool:
-    """Phase 1: 从“每轮预注入”收敛为“首轮 + 触发式注入”。
+    """Phase 1: 从"每轮预注入"收敛为"首轮 + 触发式注入"。
 
     触发条件：
     1) 首轮；
@@ -1100,7 +1108,9 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
         ctx_cleanup = get_tool_context()
         if ctx_cleanup:
             ctx_cleanup._rag_query_cache = {}
-            ctx_cleanup._run_tag = config.get("configurable", {}).get("thread_id", "") or ""
+            ctx_cleanup._run_tag = (
+                config.get("configurable", {}).get("thread_id", "") or ""
+            )
             ctx_cleanup._rag_query_count = 0
             ctx_cleanup._rag_same_app_count = 0
             ctx_cleanup._rag_cross_app_count = 0
@@ -1700,9 +1710,19 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     # ── 点击质量指标 ──
     _tool_log = state.get("_tool_calls_log", [])
     click_count = sum(1 for s in _tool_log if s.get("name") == "click")
-    exact_count = sum(1 for s in _tool_log if s.get("name") == "click" and s.get("match_mode") == "exact")
-    fuzzy_count = sum(1 for s in _tool_log if s.get("name") == "click" and s.get("fallback_used"))
-    ambiguous_count = sum(1 for s in _tool_log if s.get("name") == "click" and s.get("match_mode") == "ambiguous")
+    exact_count = sum(
+        1
+        for s in _tool_log
+        if s.get("name") == "click" and s.get("match_mode") == "exact"
+    )
+    fuzzy_count = sum(
+        1 for s in _tool_log if s.get("name") == "click" and s.get("fallback_used")
+    )
+    ambiguous_count = sum(
+        1
+        for s in _tool_log
+        if s.get("name") == "click" and s.get("match_mode") == "ambiguous"
+    )
     rag_query_count = int(getattr(ctx, "_rag_query_count", 0) or 0)
 
     # RAG same_app ratio: 统计 query_app_knowledge 调用中 same_app 回应的占比

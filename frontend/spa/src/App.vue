@@ -62,7 +62,6 @@
         :elementList="elementList"
         @refresh="refreshSnapshot"
         @send-key="sendDeviceKey"
-        @stop-polling="stopSnapshotPolling"
       />
     </el-aside>
 
@@ -447,7 +446,7 @@
 </template>
 
 <script setup>
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { onMounted, ref } from "vue";
 import ReportDetail from "./components/ReportDetail.vue";
 import KnowledgePanel from "./components/KnowledgePanel.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
@@ -595,7 +594,6 @@ function fmtDuration(ms) {
 }
 
 let ws = null;
-let snapshotTimer = null;
 let snapshotInFlight = false;
 
 
@@ -626,7 +624,6 @@ function handleEvent(data) {
     case "snapshot": if (content.image) snapshotImage.value = content.image; break;
     case "device_status_change":
       deviceOnline.value = !!content.connected;
-      if (!content.connected) stopSnapshotPolling();
       break;
     case "knowledge_hint":
       wp?.addEntry({ type: "log", icon: "🧠", text: content.message || "建议先查询知识再执行动作" });
@@ -635,10 +632,10 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopSnapshotPolling(); break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopSnapshotPolling();
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; /* cleaned */; break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; /* cleaned */;
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
       wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports(); break;
-    case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; stopSnapshotPolling(); break;
+    case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; break;
     default: wp?.addEntry({ type: "log", text: "[" + type + "] " + JSON.stringify(content).substring(0, 200) });
   }
 }
@@ -678,7 +675,6 @@ async function startRun(text) {
   }
   if (workspaceRef.value) workspaceRef.value.addEntry({ type: "user", icon: "🧑", text });
   executing.value = true;
-  startSnapshotPolling();
 
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "run", message: text }));
@@ -705,7 +701,6 @@ async function sendHumanDecision(decision) {
   executing.value = true;
   humanDialogVisible.value = false;
   if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", text: "人工决定: " + decision });
-  startSnapshotPolling();
 
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "human_decision", thread_id: currentThreadId.value, decision }));
@@ -754,7 +749,6 @@ async function confirmPlan(action) {
   planReviewSubmitting.value = true;
   planReviewVisible.value = false;
   executing.value = true;
-  startSnapshotPolling();
 
   const resumePayload = action === "cancel" ? "cancel" : {
     action: "confirm",
@@ -1159,18 +1153,6 @@ async function deleteKbByFilter() {
   }
 }
 
-function startSnapshotPolling() {
-  if (snapshotTimer) return;
-  if (!(deviceFloatRef.value?.isVisible)) return;  // 投屏未打开时不启动
-  snapshotTimer = window.setInterval(() => { if (executing.value) refreshSnapshot(); }, 2500);
-}
-
-function stopSnapshotPolling() {
-  if (!snapshotTimer) return;
-  clearInterval(snapshotTimer);
-  snapshotTimer = null;
-}
-
 // ═══════════ 设备状态轮询 ═══════════
 
 async function checkDeviceStatus() {
@@ -1261,9 +1243,6 @@ onMounted(() => {
   fetchConfig();
 });
 
-onBeforeUnmount(() => {
-  stopSnapshotPolling();
-  });
 </script>
 
 <style scoped src="./App.css"></style>
