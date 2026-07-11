@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from config import TestConfig as AppTestConfig
 from agents import graph
+from agents import nodes
 import tools as tools_module
 
 
@@ -47,7 +48,7 @@ def test_reporter_keeps_verification_results_for_exhausted(monkeypatch):
             }
         ]
     )
-    monkeypatch.setattr(graph, "get_tool_context", lambda: fake_ctx)
+    monkeypatch.setattr(nodes, "get_tool_context", lambda: fake_ctx)
     state = {
         "status": "fail",
         "conclusion": "ABORT: MAX_TURNS_EXHAUSTED",
@@ -141,10 +142,10 @@ def test_agent_node_accumulates_tool_call_400_metrics(monkeypatch):
         device=None,
         _verifications=[],
     )
-    monkeypatch.setattr(graph, "get_tool_context", lambda: fake_ctx)
-    monkeypatch.setattr(graph, "_ensure_device_alive", lambda max_retries=2, wait_sec=5.0: True)
+    monkeypatch.setattr(nodes, "get_tool_context", lambda: fake_ctx)
+    monkeypatch.setattr(nodes, "_ensure_device_alive", lambda max_retries=2, wait_sec=5.0: True)
     monkeypatch.setattr(
-        graph,
+        nodes,
         "_run_agent",
         lambda *args, **kwargs: (
             "CONTINUE",
@@ -192,7 +193,7 @@ def test_reporter_persists_tool_call_400_metrics(monkeypatch):
             captured.update(kwargs)
 
     fake_ctx = SimpleNamespace(_verifications=[{"key": "v0", "item": "验证1", "result": "passed"}])
-    monkeypatch.setattr(graph, "get_tool_context", lambda: fake_ctx)
+    monkeypatch.setattr(nodes, "get_tool_context", lambda: fake_ctx)
     monkeypatch.setattr(graph, "_relational_db", FakeDB())
     state = {
         "status": "success",

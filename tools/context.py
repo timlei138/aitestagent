@@ -51,3 +51,24 @@ class ToolContext:
             except Exception:
                 self._screen_size = (0, 0)
         return self._screen_size
+
+
+# ── 进程级唯一 ToolContext（所有 Tool 通过 get_tool_context() 获取依赖）──
+# 从 tools/__init__.py 拆出（重构 T2），使各 tools 子模块可直接
+# `from tools.context import get_tool_context` 而不产生循环依赖。
+_CONTEXT: "ToolContext | None" = None
+
+
+def set_tool_context(context: "ToolContext") -> None:
+    global _CONTEXT
+    _CONTEXT = context
+    # 延迟 import 避免加载期循环依赖（reset_session_click_ids 仍在 tools/__init__.py）
+    from tools import reset_session_click_ids
+
+    reset_session_click_ids()  # 每次新执行时重置 session 去重
+
+
+def get_tool_context() -> "ToolContext":
+    if _CONTEXT is None:
+        raise RuntimeError("ToolContext 未初始化")
+    return _CONTEXT
