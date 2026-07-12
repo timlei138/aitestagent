@@ -17,6 +17,7 @@ from typing import Any
 
 from llm.safety import check_dangerous
 from tools.context import ToolContext, get_tool_context
+from tools.results import AMBIGUOUS, ERROR, NOT_FOUND, make_result, parse_status
 from tools.text_utils import _has_cjk, _normalize_text
 from tools.element_match import (
     _extract_click_preferences_from_rag,
@@ -38,6 +39,10 @@ except Exception:  # pragma: no cover
 
 
 logger = logging.getLogger(__name__)
+
+# R3: 精确定位「未找到」时的有限重试（等待页面/元素延迟出现后重感知再试）
+_CLICK_LOCATE_RETRY_MAX = 2
+_CLICK_LOCATE_RETRY_WAIT = 0.5
 
 
 def _query_known_identities(description: str) -> list[dict[str, Any]]:
@@ -269,6 +274,7 @@ def _exact_clickable_candidates(
     class_name: str = "",
     path_contains: str = "",
     index: int = -1,
+    label: str = "",
 ) -> tuple[list[Any], str]:
     if understanding is None:
         return [], "ERROR: 页面信息不可用，无法执行精确点击"
@@ -277,20 +283,23 @@ def _exact_clickable_candidates(
         for e in (understanding.elements or [])
         if e.clickable and (e.label or "").strip()
     ]
+    rid_filter = (rid or "").strip()
+    cls_filter = _normalize_text(class_name).split(".")[-1]
+    path_filter = _normalize_text(path_contains)
+
+    # 契约：index 与 page_info 的 [n] 一一对应。给了 index 就按全局位置直接选位——
+    # 这是最直接、模型最常用的方式（clickables 的顺序与 page_info [n] 一致）。
+    # 同名/同类兄弟（如弹窗多个图标）也各有独立 [n]，用各自的 index 即可精确区分。
     if index >= 0:
         if index >= len(clickables):
             return (
                 [],
                 f"ERROR: index={index} 越界（当前可点击元素 {len(clickables)} 个）",
             )
-        candidates = [clickables[index]]
-    else:
-        candidates = list(clickables)
+        return [clickables[index]], ""
 
-    rid_filter = (rid or "").strip()
-    cls_filter = _normalize_text(class_name).split(".")[-1]
-    path_filter = _normalize_text(path_contains)
-
+    # 无 index：按稳定属性（rid/class/path）过滤
+    candidates = list(clickables)
     if rid_filter:
         candidates = [
             e
@@ -312,15 +321,39 @@ def _exact_clickable_candidates(
         ]
 
     if not candidates:
-        return [], "ERROR: 未找到匹配元素，请调整 rid/class_name/path_contains/index"
+        return [], make_result(
+            NOT_FOUND, "未找到匹配元素，请调整 rid/class_name/path_contains/index"
+        )
+    # 修复B：结构过滤命中多个时，若同时给了 label，则用 label 收窄——
+    # 避免 path_contains 指向共享容器路径时把多个兄弟元素全算歧义。
+    # 有 label 命中就取命中的；无命中则保持原候选（退回 AMBIGUOUS，不会更差）。
+    if len(candidates) > 1 and (label or "").strip():
+        _lab = _normalize_text(label)
+        if _lab:
+            narrowed = [
+                e
+                for e in candidates
+                if _lab in _normalize_text(getattr(e, "label", "") or "")
+                or _lab in _normalize_text(getattr(e, "associated_label", "") or "")
+            ]
+            if narrowed:
+                candidates = narrowed
     if len(candidates) > 1:
         labels = []
         for e in candidates[:6]:
             name = (getattr(e, "label", "") or "").strip() or "?"
             labels.append(name)
+        # 同名兄弟（label 全相同）无法靠 rid/path 区分 → 提示用 page_info 里各自的 [n]（index）。
+        if len(set(labels)) == 1:
+            hint = "这些候选 label 相同，请用 page_info 中它们各自的 [n] 作为 index 精确选中"
+        else:
+            hint = "请追加 path_contains 或 rid 缩小范围"
         return (
             [],
-            f"ERROR: {len(candidates)} 个候选匹配（{'/'.join(labels)}），请追加 path_contains 或 rid 缩小范围",
+            make_result(
+                AMBIGUOUS,
+                f"{len(candidates)} 个候选匹配（{'/'.join(labels)}），{hint}",
+            ),
         )
     return candidates, ""
 
@@ -446,7 +479,33 @@ def click(
                 class_name=class_name,
                 path_contains=path_contains,
                 index=index,
+                label=label,
             )
+            # R3: "未找到匹配元素" 可能是页面尚未稳定/元素延迟出现 → 等待+重感知+重试
+            # （不重试 AMBIGUOUS「N 个候选」和 index 越界——那是参数问题，应透传给 LLM）
+            _retry = 0
+            while (
+                err
+                and parse_status(err) == NOT_FOUND
+                and ctx.perceiver is not None
+                and _retry < _CLICK_LOCATE_RETRY_MAX
+            ):
+                _retry += 1
+                time.sleep(_CLICK_LOCATE_RETRY_WAIT)
+                try:
+                    understanding = ctx.perceiver.perceive()
+                except Exception:
+                    break
+                exact_candidates, err = _exact_clickable_candidates(
+                    understanding,
+                    rid=rid,
+                    class_name=class_name,
+                    path_contains=path_contains,
+                    index=index,
+                    label=label,
+                )
+                if not err:
+                    logger.info("click exact: 重试第 %d 次后命中", _retry)
             if err:
                 return err
             best_el = exact_candidates[0]
@@ -605,7 +664,9 @@ def click(
                 return _with_snapshot(result, best_el)
             return _with_snapshot(result, best_el)
         # 不在工具内自动猜测次优候选；直接透传给 LLM 做下一步精确决策
-        return result or f"未能点击目标元素: {label}，请用 index/class/rid 精确定位"
+        return result or make_result(
+            ERROR, f"未能点击目标元素: {label}，请用 index/class/rid 精确定位"
+        )
 
     # 兆底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):
@@ -680,7 +741,7 @@ def click(
             click_context=_build_click_context("rid-fallback", None),
         )
         return _with_snapshot(f"已点击资源: {label} (strategy=rid-fallback)", None)
-    return f"未找到可点击元素: {label}"
+    return make_result(NOT_FOUND, f"未找到可点击元素: {label}")
 
 
 def _check_switch_state(ctx: Any, target_el: Any) -> bool | None:
@@ -992,7 +1053,9 @@ def scroll_find_and_click(label: str, max_swipes: int = 3, panel: str = "") -> s
                     e.label for e in understanding.elements if e.label and e.clickable
                 }
                 if attempt > 0 and cur_labels == pre_labels:
-                    return f"滑动后仍未找到: {label}（已到末尾，无新元素出现）"
+                    return make_result(
+                        NOT_FOUND, f"滑动后仍未找到: {label}（已到末尾，无新元素出现）"
+                    )
                 pre_labels = cur_labels
             except Exception as exc:
                 logger.warning("scroll_find[%d]: perceive failed | %s", attempt, exc)
@@ -1016,7 +1079,7 @@ def scroll_find_and_click(label: str, max_swipes: int = 3, panel: str = "") -> s
     logger.warning(
         "scroll_find: exhausted %d swipes, NOT found label=%r", max_swipes, label
     )
-    return f"滑动后仍未找到: {label}"
+    return make_result(NOT_FOUND, f"滑动后仍未找到: {label}")
 
 
 @tool
@@ -1056,7 +1119,7 @@ def long_press(label: str, duration: float = 0.8) -> str:
     if ctx.device.device(resourceId=label).exists(timeout=2.0):
         ctx.device.device(resourceId=label).long_click()
         return f"已长按: {label}"
-    return f"long_press: 未找到 '{label}'"
+    return make_result(NOT_FOUND, f"long_press: 未找到 '{label}'")
 
 
 def _has_meaningful_ui_elements(device) -> bool:

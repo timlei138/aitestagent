@@ -6,6 +6,29 @@
 
 ---
 
+## 0) 执行状态（2026-07-11 更新）
+
+**核心目标已达成，重构收尾于此；剩余 3 项经评估「有意保持现状」（不做，因边际收益低、边际风险高）。**
+
+✅ **已完成并验证**（全程 pytest 绿：44 passed / 3 个既有失败与重构无关；import 路径零变更；pyflakes 无未定义名）：
+
+| 文件 | 拆分前 | 拆分后 | 拆出的模块 |
+|---|--:|--:|---|
+| `tools/__init__.py` | 2752 | **352** | click(1077)/element_match(522)/verify(308)/perceive_tools(311)/device_ops(227)/knowledge_tools(145)/text_utils(55)/context(74) |
+| `agents/graph.py` | 1945 | **152** | nodes(865)/llm_runtime(707)/verification(166)/loop_control(110)/rag_context(103)/budget(60) |
+
+> 顺带修复了 pyflakes 发现的一个潜在真实 bug：`click.py` 引用了已移到 `device_ops` 的 `scroll_panel`（测试未覆盖），已用延迟 import 修复。
+
+⏸️ **有意保持现状（不做）：**
+
+1. **G1 `runtime_state.py`（模块全局单一来源）—— 有意跳过**。`_relational_db` / `_ws_emit_callback` / `set_*` 保留在 `graph.py`，因为 `api/server`、`tools`、测试都通过 `from agents.graph import` 在运行时读取它，搬走会破坏可变全局共享（高风险、无实际收益）。
+2. **Phase 3 `device/perceiver.py`（888 行）拆分 —— 未做**。原计划标 P2 可选；文件能正常运行，再拆需承担重构风险，而其运行路径测试覆盖薄。
+3. **少数模块仍超 ≤500 行软目标**：`click.py`(1077，click 簇本身大)、`nodes.py`(865)、`llm_runtime.py`(707，后两者原计划即注明「可略高」)、`element_match.py`(522)。均能正常运行，进一步细分收益有限、风险与前述相同。
+
+> 结论：**风险在于「继续动」，不在于「留着不动」。** 核心的两个巨型文件已拆小、职责清晰、对外无感，收益已兑现。以下 §1~§7 为原始计划全文，保留作背景与将来（若需要）收尾 perceiver/click.py 的依据。
+
+---
+
 ## 1) 现状：文件规模盘点
 
 | 文件 | 行数 | 结论 |

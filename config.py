@@ -47,6 +47,22 @@ class TestConfig:
     langchain_debug: bool = True
     vision_enabled: bool = True
 
+    # ── 上下文优化 (O2) ──
+    # 历史消息中，除最新一次外的 get_screen_info 大输出折叠为占位符，
+    # 抑制上下文/token 膨胀（最新一份仍保留全量）。可在 config.yaml 关闭。
+    context_summarize_stale_screens: bool = True
+
+    # ── 降低模型依赖 (M1) ──
+    # 单轮启发式软提示（FINALIZATION/KNOWLEDGE_QUERY/SELF_DOUBT/APP_SWITCH）
+    # 多条命中时只注入优先级最高的 1 条，避免弱模型被多条提示淹没。
+    # 关闭则回退旧行为（全部注入）。
+    single_hint_per_turn: bool = True
+
+    # ── 本地可观测 ──
+    # 每次运行结束把「逐轮动作 + 状态码 + match_mode/fallback + token + 验证」
+    # 串成结构化 JSON 落盘到 logs/runs/*_trace.json（离线，替代 LangSmith 云）。
+    write_run_trace: bool = True
+
     # ──────────────── YAML 加载 ────────────────
 
     @classmethod

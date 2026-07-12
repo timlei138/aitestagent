@@ -62,9 +62,11 @@ def _cooldown_group(name: str, args: dict, target: str = "") -> str:
 
 
 def _resolve_click_match_mode(name: str, args: dict, output: str) -> str:
-    """从 click 参数和输出推断 match_mode：exact / semantic / ambiguous。"""
-    out_lower = (output or "").lower()
-    if "ambiguous" in out_lower:
+    """从 click 参数和输出推断 match_mode：exact / semantic / ambiguous。
+    L1：优先读规范状态码（AMBIGUOUS），旧格式回退到子串启发式。"""
+    from tools.results import parse_status, AMBIGUOUS
+
+    if parse_status(output) == AMBIGUOUS or "ambiguous" in (output or "").lower():
         return "ambiguous"
     index_val = args.get("index", -1)
     if (
@@ -78,9 +80,11 @@ def _resolve_click_match_mode(name: str, args: dict, output: str) -> str:
 
 
 def _resolve_click_fallback(output: str) -> bool:
-    """从 click 输出判断是否走了兜底路径。仅 fallback 标记为兜底，WARNING 模糊匹配不算。"""
-    out_lower = (output or "").lower()
-    return "fallback" in out_lower
+    """从 click 输出判断是否走了兜底路径。L1：按 strategy= 枚举判定，
+    旧格式回退到 'fallback' 子串启发式（见 tools.results.is_fallback_output）。"""
+    from tools.results import is_fallback_output
+
+    return is_fallback_output(output)
 
 
 def _output_has_page_change(

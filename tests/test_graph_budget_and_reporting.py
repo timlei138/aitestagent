@@ -57,7 +57,9 @@ def test_reporter_keeps_verification_results_for_exhausted(monkeypatch):
         "messages": [],
         "budget_violation_count": 0,
     }
-    cmd = graph.reporter_node(state, {"configurable": {"test_config": AppTestConfig()}})
+    cmd = graph.reporter_node(
+        state, {"configurable": {"test_config": AppTestConfig(write_run_trace=False)}}
+    )
     assert cmd.update["execution_status"] == "exhausted"
     assert cmd.update["test_verdict"] == "inconclusive"
     assert len(cmd.update["verification_results"]) == 1
@@ -210,7 +212,15 @@ def test_reporter_persists_tool_call_400_metrics(monkeypatch):
         "app_package": "pkg",
         "app_name": "app",
     }
-    graph.reporter_node(state, {"configurable": {"test_config": AppTestConfig(), "thread_id": "rid"}})
+    graph.reporter_node(
+        state,
+        {
+            "configurable": {
+                "test_config": AppTestConfig(write_run_trace=False),
+                "thread_id": "rid",
+            }
+        },
+    )
     assert captured["llm_call_count"] == 11
     assert captured["tool_call_400_count"] == 2
     assert captured["tool_call_400_rate"] == 0.1818

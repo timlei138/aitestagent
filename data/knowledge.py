@@ -239,17 +239,20 @@ class KnowledgeBase:
 
         # Layer 1: 精确过滤当前 App（有包名时，同 App 内导航最常见）
         if app_package:
-            precise = self.backend.get_by_metadata(
+            raw_precise = self.backend.get_by_metadata(
                 where={"app_package": app_package, "knowledge_type": "experience"},
                 limit=top_k * 3,
             )
-            # 仅保留 strong（缺失 quality_score 的历史数据默认 0，排除）
-            precise = [
+            # 优先 strong（quality>=门槛；缺失 quality_score 的历史默认 0）
+            strong = [
                 r
-                for r in precise
+                for r in raw_precise
                 if float((r.get("metadata", {}) or {}).get("quality_score", 0.0) or 0.0)
                 >= self._EXPERIENCE_MIN_QUALITY
             ]
+            # G3: strong 为空时用未过滤结果兜底，避免"有数据但查不到"
+            # （缺分/低分历史被硬门槛静默丢弃）。仅在无强数据时启用，不削弱强数据优先。
+            precise = strong if strong else raw_precise
             # ChromaDB get() 不保证顺序，Python 侧按质量+时间排序
             precise.sort(
                 key=lambda r: (
@@ -396,25 +399,42 @@ class KnowledgeBase:
         universal_slots = max(1, top_k // 5)
         _fetch_n = max(top_k * 3, 50)
 
+        # G2: 人工知识是 prompt 第一优先级，不该只取 metadata 任意顺序前 N；
+        # 按 (quality_score, last_verified_at) 降序排序后再截断（确定性、无需 query）。
+        def _rule_rank(r: dict) -> tuple[float, str]:
+            m = r.get("metadata", {}) or {}
+            return (
+                float(m.get("quality_score", 0.0) or 0.0),
+                str(m.get("last_verified_at", "") or ""),
+            )
+
+        def _non_auto(rows: list) -> list:
+            return [
+                r
+                for r in rows
+                if not str(r.get("metadata", {}).get("scenario", "")).startswith("auto_")
+            ]
+
         app_lines: list[str] = []
         if app_package:
-            raw = self.backend.get_by_metadata(
-                {**type_filter, "app_package": app_package},
-                limit=_fetch_n,
+            raw = _non_auto(
+                self.backend.get_by_metadata(
+                    {**type_filter, "app_package": app_package},
+                    limit=_fetch_n,
+                )
             )
-            app_lines = [
-                f"- {str(r.get('content', '') or '')}"
-                for r in raw
-                if not str(r.get("metadata", {}).get("scenario", "")).startswith("auto_")
-            ][:top_k]
+            raw.sort(key=_rule_rank, reverse=True)
+            app_lines = [f"- {str(r.get('content', '') or '')}" for r in raw][:top_k]
 
-        raw_univ = self.backend.get_by_metadata(
-            {**type_filter, "app_package": "", "scope": "universal"},
-            limit=universal_slots,
+        raw_univ = _non_auto(
+            self.backend.get_by_metadata(
+                {**type_filter, "app_package": "", "scope": "universal"},
+                limit=max(universal_slots * 3, 20),
+            )
         )
+        raw_univ.sort(key=_rule_rank, reverse=True)
         universal_lines = [
             f"- {str(r.get('content', '') or '')}" for r in raw_univ
-            if not str(r.get("metadata", {}).get("scenario", "")).startswith("auto_")
         ][:universal_slots]
 
         parts = []

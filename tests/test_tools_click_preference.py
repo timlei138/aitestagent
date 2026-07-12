@@ -292,8 +292,9 @@ def test_click_exact_mode_reports_ambiguous_matches(monkeypatch):
                 page_title="16:53",
                 primary_paths=[],
                 elements=[
+                    # 两个同名同类元素 → 即便按 label 收窄仍无法区分，应报 AMBIGUOUS
                     _el(label="应用列表", cls="android.widget.TextView", path="a"),
-                    _el(label="搜索", cls="android.widget.TextView", path="b"),
+                    _el(label="应用列表", cls="android.widget.TextView", path="b"),
                 ],
             )
 

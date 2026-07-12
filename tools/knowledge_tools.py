@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 
 from tools.context import get_tool_context
 
@@ -96,13 +97,37 @@ def query_app_knowledge(query: str, app_package: str = "") -> str:
     return result
 
 
+def _query_tokens(query_lower: str) -> set[str]:
+    """把 query 切成可匹配的 token，中英文都work（R6 修复）。
+
+    旧实现用 `.split()` 按空格分词——中文没有空格，整句变成一个 token，
+    `if 整句 in content` 几乎永不命中 → relevance 恒 0 → rerank 形同虚设。
+    现改为：英文按词、中文按**字符 2-gram**（外加单字兜底），让中文查询也有真实信号。
+    """
+    q = (query_lower or "").strip()
+    tokens: set[str] = set()
+    # 英文/数字词（长度 >= 2）
+    for w in re.findall(r"[a-z0-9_]{2,}", q):
+        tokens.add(w)
+    # 中文字符 2-gram（无空格分词的通用做法）
+    cjk = re.findall(r"[\u4e00-\u9fff]", q)
+    for i in range(len(cjk) - 1):
+        tokens.add(cjk[i] + cjk[i + 1])
+    # 兜底：query 只有单个中文字时，用单字
+    if not tokens and cjk:
+        tokens.update(cjk)
+    return tokens
+
+
 def _experience_relevance(entry: dict, query_lower: str) -> int:
-    """轻量语义相关性：content 中 query 词命中数。"""
+    """轻量语义相关性：content 中命中的 query token 数（中英文通用）。"""
     content = str(entry.get("content", "") or "").lower()
-    words = [w for w in query_lower.split() if len(w) >= 2]
-    if not words:
+    if not content:
         return 0
-    return sum(1 for w in words if w in content)
+    tokens = _query_tokens(query_lower)
+    if not tokens:
+        return 0
+    return sum(1 for t in tokens if t in content)
 
 
 @tool

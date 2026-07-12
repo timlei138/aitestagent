@@ -78,18 +78,6 @@ def _truncate_text(value: Any, limit: int = 1200) -> str:
     return f"{text[:limit]}...(truncated)"
 
 
-def _to_dicts(messages: list[Any]) -> list[dict[str, Any]]:
-    """将 LangChain message 对象转为纯 dict，兼容 Zhipu SDK。"""
-    result = []
-    for m in messages or []:
-        if isinstance(m, dict):
-            result.append(m)
-        else:
-            role = _msg_role(m)
-            result.append({"role": role, "content": str(getattr(m, "content", "") or "")})
-    return result
-
-
 def _msg_role(item: Any) -> str:
     if isinstance(item, dict):
         return str(item.get("role", ""))
@@ -193,80 +181,14 @@ class OpenAIVisionClient(VLMClient):
         return content
 
 
-# ── 智谱实现 ──
-
-class ZhipuTextClient(LLMClient):
-    def __init__(self, model: str, api_key: str, base_url: str | None = None, temperature: float = 0.1):
-        from zhipuai import ZhipuAI
-        self.model = model
-        self.temperature = temperature
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = ZhipuAI(max_retries=0, **kwargs)
-
-    def should_retry(self, exc: Exception) -> bool:
-        """智谱文本模型：仅 429 限流可重试。"""
-        return _is_rate_limit_error(exc)
-
-    def invoke(self, messages: list[Any]) -> str:
-        logger.info("LLM request provider=zhipu messages=%s", _messages_preview(messages))
-        resp = _call_with_retry(
-            self.should_retry, self._client.chat.completions.create,
-            model=self.model, messages=_to_dicts(messages), temperature=self.temperature,
-        )
-        if resp is None:
-            return ""
-        content = str(resp.choices[0].message.content)
-        logger.info("LLM response provider=zhipu content=%s", _truncate_text(content))
-        return content
-
-
-class ZhipuVisionClient(VLMClient):
-    def __init__(self, model: str, api_key: str, base_url: str | None = None, temperature: float = 0.1):
-        from zhipuai import ZhipuAI
-        self.model = model
-        self.temperature = temperature
-        kwargs: dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = ZhipuAI(max_retries=0, **kwargs)
-
-    def should_retry(self, exc: Exception) -> bool:
-        """智谱视觉模型：仅 429 限流可重试。"""
-        return _is_rate_limit_error(exc)
-
-    def describe(self, prompt: str, image_base64: str, context: str = "") -> str:
-        image_url = f"data:image/png;base64,{image_base64}"
-        logger.info("VLM request provider=zhipu image_len=%s", len(image_base64 or ""))
-        resp = _call_with_retry(
-            self.should_retry, self._client.chat.completions.create,
-            model=self.model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": context or "请分析该截图"},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]},
-            ],
-            temperature=self.temperature,
-        )
-        if resp is None:
-            return ""
-        content = str(resp.choices[0].message.content)
-        logger.info("VLM response provider=zhipu content=%s", _truncate_text(content))
-        return content
-
-
 # ── 能力检查（无需实例化）──
 
 def supports_structured_output(provider: str, base_url: str | None = None) -> bool:
-    """检查指定 provider 是否支持 structured output (response_format 参数)。
+    """检查指定 OpenAI 兼容端点是否支持 structured output (response_format 参数)。
 
-    注：deepseek/groq/together 等 OpenAI 兼容 provider 不支持此功能。
+    统一 OpenAI 兼容接入后仅按 base_url 判定：deepseek/groq/together/openrouter
+    等兼容 provider 不支持此功能（provider 名不再参与判断）。
     """
-    if (provider or "").lower() != "openai":
-        return False
     url = (base_url or "").lower()
     return not any(h in url for h in ("deepseek", "together", "groq", "openrouter"))
 
@@ -282,9 +204,7 @@ def create_llm_client(
 ) -> LLMClient | None:
     if not api_key:
         return None
-    name = (provider or "openai").lower()
-    if name == "zhipu":
-        return ZhipuTextClient(model=model, api_key=api_key, base_url=base_url, temperature=temperature)
+    # 统一走 OpenAI 兼容接入：zhipu 等 provider 通过 base_url 指向其 OpenAI 兼容端点。
     return OpenAITextClient(model=model, api_key=api_key, base_url=base_url, temperature=temperature)
 
 
@@ -297,7 +217,5 @@ def create_vlm_client(
 ) -> VLMClient | None:
     if not api_key:
         return None
-    name = (provider or "openai").lower()
-    if name == "zhipu":
-        return ZhipuVisionClient(model=model, api_key=api_key, base_url=base_url, temperature=temperature)
+    # 统一走 OpenAI 兼容接入：zhipu / 多模态 provider 通过 base_url 指向其 OpenAI 兼容端点。
     return OpenAIVisionClient(model=model, api_key=api_key, base_url=base_url, temperature=temperature)

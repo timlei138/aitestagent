@@ -184,7 +184,6 @@
                 <el-form-item label="Provider">
                   <el-select v-model="configData.llm_provider" style="width:100%">
                     <el-option label="OpenAI (兼容)" value="openai" />
-                    <el-option label="智谱 Zhipu" value="zhipu" />
                   </el-select>
                 </el-form-item>
                 <el-form-item label="模型名称">

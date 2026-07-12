@@ -1,12 +1,12 @@
 llm_provider: openai
 model: deepseek-v4-flash
 base_url: https://api.deepseek.com
-vision_provider: zhipu
+vision_provider: openai
 vision_model: glm-4.6v-flash
-vision_base_url: ''
+vision_base_url: https://open.bigmodel.cn/api/paas/v4
 embedding_provider: huggingface
 embedding_model: BAAI/bge-large-zh-v1.5
-embedding_base_url: ''
+embedding_base_url: null
 perception_mode: ui_tree
 safety_level: strict
 vision_enabled: false

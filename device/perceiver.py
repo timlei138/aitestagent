@@ -5,6 +5,7 @@ import hashlib
 import logging
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
@@ -12,6 +13,15 @@ from io import BytesIO
 from typing import Any, Callable
 
 import app_paths
+
+
+def _write_screenshot_bytes(path: str, image_base64: str) -> None:
+    """R5：把截图字节写盘。可在后台线程执行，绝不抛异常。"""
+    try:
+        with open(path, "wb") as _f:
+            _f.write(base64.b64decode(image_base64))
+    except Exception:
+        pass
 
 
 class PerceptionMode:
@@ -95,13 +105,25 @@ class SmartPerceiver:
         mode: str = PerceptionMode.HYBRID,
         auto_switch: bool = True,
         stuck_threshold: int = 2,
+        settle_enabled: bool = True,
+        settle_timeout: float = 1.5,
+        settle_stable_count: int = 2,
+        settle_poll_interval: float = 0.3,
+        screenshot_async: bool = True,
     ):
         self.device = device
         self._vision_call = vision_call
         self._screenshot_sink = screenshot_sink
+        # R5: cache-miss 截图写盘放到后台线程，移出感知关键路径（降单步延迟/缩小 R1 竞态窗口）
+        self._screenshot_async = screenshot_async
         self.mode = mode
         self.auto_switch = auto_switch
         self.stuck_threshold = stuck_threshold
+        # R1: 感知前「页面稳定」等待，过滤动画/异步加载的中间态（见综合评审 §4 R1）
+        self._settle_enabled = settle_enabled
+        self._settle_timeout = settle_timeout
+        self._settle_stable_count = max(1, settle_stable_count)
+        self._settle_poll_interval = settle_poll_interval
         self._last_hash: str = ""
         self._stuck_count: int = 0
         self._vision_calls: int = 0
@@ -115,9 +137,34 @@ class SmartPerceiver:
         self._vision_cache_img_hash: str = ""
         self._vision_cache_text: str = ""
 
+    def _stable_dump_hierarchy(self) -> str:
+        """R1: 采样前等待页面稳定——轮询 dump_hierarchy 的 hash，连续
+        settle_stable_count 次不变或超时 settle_timeout 秒后返回，过滤中间态
+        （动画/异步加载/Toast/状态栏刷新）。settle_enabled=False 时退化为单次采样。"""
+        if not self._settle_enabled:
+            return self.device.dump_hierarchy()
+        deadline = time.monotonic() + self._settle_timeout
+        xml = self.device.dump_hierarchy()
+        last_hash = hashlib.md5(xml.encode()).hexdigest()
+        consecutive = 1
+        while (
+            consecutive < self._settle_stable_count
+            and time.monotonic() < deadline
+        ):
+            time.sleep(self._settle_poll_interval)
+            xml = self.device.dump_hierarchy()
+            h = hashlib.md5(xml.encode()).hexdigest()
+            if h == last_hash:
+                consecutive += 1
+            else:
+                consecutive = 1
+                last_hash = h
+        return xml
+
     def perceive(self, force_vision: bool = False) -> PageUnderstanding:
         # 短时缓存：相同页面+相同mode + 3秒内直接返回
-        xml = self.device.dump_hierarchy()
+        # R1: 采样前先等页面稳定，避免拿到过渡态快照
+        xml = self._stable_dump_hierarchy()
         sig = hashlib.md5(f"{xml}|{self.mode}".encode()).hexdigest()
         now = time.monotonic()
         if (
@@ -140,10 +187,17 @@ class SmartPerceiver:
                     app_paths.SCREENSHOT_DIR
                     / f"perceive_{_dt.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
                 )
-                with open(_shot_path, "wb") as _f:
-                    _f.write(base64.b64decode(snapshot.image_base64))
+                # R5: 写盘移出关键路径——异步落盘（默认），失败/关闭时退回同步
+                if self._screenshot_async:
+                    threading.Thread(
+                        target=_write_screenshot_bytes,
+                        args=(_shot_path, snapshot.image_base64),
+                        daemon=True,
+                    ).start()
+                else:
+                    _write_screenshot_bytes(_shot_path, snapshot.image_base64)
                 if self._screenshot_sink is not None:
-                    # 发送绝对路径，消费方按需转换为相对路径
+                    # 发送绝对路径（同步即可用，字节由后台线程写入）
                     self._screenshot_sink(_shot_path)
         except Exception:
             pass

@@ -27,6 +27,43 @@ except Exception:
         return wrapper(func) if func else wrapper
 
 
+def _record_deterministic_check(text: str, kind: str, passed: bool) -> None:
+    """M4：记录一次确定性断言（page_contains/element_exists）的结果，
+    供 assert_verification 反查作为 ground truth。仅追加、绝不抛异常。"""
+    try:
+        ctx = get_tool_context()
+    except Exception:
+        return
+    if ctx is None:
+        return
+    if not getattr(ctx, "_deterministic_checks", None):
+        ctx._deterministic_checks = []
+    ctx._deterministic_checks.append(
+        {
+            "text": str(text or ""),
+            "kind": kind,
+            "result": "pass" if passed else "fail",
+        }
+    )
+
+
+def _lookup_deterministic_ground_truth(ctx: ToolContext, condition: str):
+    """M4：在已记录的确定性断言中，反查与验证项 condition 匹配的最近一条结果。
+    采用保守的「子串包含」匹配（断言文本 ⊆ 验证项，或反之），最近的优先。
+    返回 "pass" / "fail" / None。"""
+    checks = getattr(ctx, "_deterministic_checks", None) or []
+    cond_norm = _normalize_verification_text(condition)
+    if not cond_norm:
+        return None
+    for check in reversed(checks):
+        text_norm = _normalize_verification_text(check.get("text", ""))
+        if not text_norm:
+            continue
+        if text_norm in cond_norm or cond_norm in text_norm:
+            return check.get("result")
+    return None
+
+
 @tool
 def assert_page_contains(text: str, pattern: bool = False) -> str:
     """断言当前页面包含指定文本或匹配正则模式。
@@ -36,6 +73,13 @@ def assert_page_contains(text: str, pattern: bool = False) -> str:
       注意: 传入时需双反斜杠转义
     返回: PASS 或 FAIL: <原因>
     """
+    _result = _assert_page_contains_impl(text, pattern)
+    # M4：记录确定性核实结果，供 assert_verification 反查 ground truth
+    _record_deterministic_check(text, "page_contains", _result.startswith("PASS"))
+    return _result
+
+
+def _assert_page_contains_impl(text: str, pattern: bool = False) -> str:
     from tools import get_screen_info  # 延迟 import 避免加载期循环依赖
 
     ctx = get_tool_context()
@@ -113,7 +157,9 @@ def assert_element_exists(label: str) -> str:
     understanding = ctx.perceiver.perceive()
     for element in understanding.elements:
         if label in (element.label or ""):
+            _record_deterministic_check(label, "element_exists", True)
             return "PASS"
+    _record_deterministic_check(label, "element_exists", False)
     return f"FAIL: 元素不存在 {label}"
 
 
@@ -260,6 +306,26 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
                     detail = f"{detail} | {vis}" if detail else vis
             except Exception:
                 pass
+
+        # M4（方案A）：确定性断言参与核实，但 PASS 与 FAIL **不对称**——
+        # PASS = 权威 ground truth（文字/元素确实存在，可确认甚至 override）；
+        # FAIL = **不权威**（文字未匹配 ≠ 元素不存在，如图标/canvas 绘制/无 content-desc），
+        #        只作弱证据，绝不否定模型、绝不 override，避免对图标类 UI 误判为冲突。
+        code_gt = _lookup_deterministic_ground_truth(ctx, condition)
+        if code_gt == "pass" and normalized in ("passed", "failed"):
+            if normalized == "passed":
+                tag = "[代码核实=PASS]"
+            elif getattr(ctx, "deterministic_verification_override", False):
+                normalized = "passed"
+                tag = f"[已按代码核实修正为PASS(模型原判定={result})]"
+            else:
+                tag = f"[⚠️代码核实=PASS，与模型判定({result})冲突]"
+            detail = f"{detail} | {tag}" if detail else tag
+        elif code_gt == "fail" and normalized == "failed":
+            # 模型也判 failed，文字未匹配与之一致 → 作弱佐证（不改判定）。
+            # 注意：model=passed 时故意不加任何标记（FAIL 不足以否定，可能是图标）。
+            tag = "[代码核实=文字未匹配(与判定一致)]"
+            detail = f"{detail} | {tag}" if detail else tag
 
         ctx._verifications.append(
             {

@@ -70,6 +70,10 @@ import app_paths
 
 logger = logging.getLogger(__name__)
 
+# R4: 注入给 LLM 的 page_info 可点击元素上限（原为 ~25，导致目标常被截断在视野外）。
+# 保持原始顺序以与 click() 的 index 解析一致；超限补提示而非静默截断。
+_AGENT_PAGE_INFO_MAX_ELEMENTS = 60
+
 
 def _load_prompt(name: str) -> str:
     _dir = os.path.dirname(os.path.abspath(__file__))
@@ -243,9 +247,16 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 ),
                 "clickable=" + str(n_clickable),
             ]
+            # R4: 上限从 25 提到 _AGENT_PAGE_INFO_MAX_ELEMENTS（按元素个数而非行数计），
+            # 让目标控件更可能出现在视野内；超限不静默 break，而是补一条提示，
+            # 引导 LLM 用 get_screen_info 看全量或用 rid/path 精确定位。
+            # 注意：保持原始元素顺序，使 [index] 与 click() 的 _exact_clickable_candidates
+            # 解析顺序严格一致（不重排，避免 index 漂移）。
             click_idx = 0
             for e in u.elements:
                 if e.clickable and e.label:
+                    if click_idx >= _AGENT_PAGE_INFO_MAX_ELEMENTS:
+                        break
                     role = e.role or ""
                     rid = (e.resource_id or "").split("/")[-1] if e.resource_id else ""
                     extra = ""
@@ -255,8 +266,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                         extra += " rid=" + rid
                     lines.append(f"  - [{click_idx}] " + e.label + extra)
                     click_idx += 1
-                    if len(lines) > 25:
-                        break
+            if n_clickable > click_idx:
+                lines.append(
+                    f"  ...（另有 {n_clickable - click_idx} 个可点击元素未列出；"
+                    "用 get_screen_info 查看全部，或直接用 rid/path_contains 精确定位）"
+                )
             page_info = "\n".join(lines)
             logger.info(
                 "Agent perceive: %.1fs page=%s clickable=%d", dt, pid, n_clickable
@@ -312,42 +326,14 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     used_tool_calls_before = len(state.get("_tool_calls_log", []) or [])
     remaining_tool_budget = budget["max_tool_calls_total"] - used_tool_calls_before
     finalization_hint_injected = bool(state.get("_finalization_hint_injected", False))
-    if (
-        remaining_tool_budget <= _FINALIZATION_REMAINING_TOOL_BUDGET
-        and not finalization_hint_injected
-    ):
-        msgs.append(
-            SystemMessage(
-                content=(
-                    "FINALIZATION_HINT: 剩余工具预算较低。请优先对可判定项调用 "
-                    'assert_verification；若无法继续，请立即 report_done(status="abort")。'
-                )
-            )
-        )
-        finalization_hint_injected = True
     force_query_hint = _should_force_query_app_knowledge(
         state, include_rag, rag_summary
     )
     knowledge_query_hint_injected = bool(
         state.get("_knowledge_query_hint_injected", False)
     )
-    if force_query_hint and not knowledge_query_hint_injected:
-        query_text = (state.get("user_request", "") or "").strip()[:40]
-        if not query_text:
-            query_text = "当前页面下一步"
-        hint_text = (
-            "检测到循环或无进展风险，下一步先调用 "
-            f'query_app_knowledge(query="{query_text}", app_package="{effective_app_package}") '
-            "再执行点击/滑动。"
-        )
-        msgs.append(SystemMessage(content=("KNOWLEDGE_QUERY_REQUIRED: " + hint_text)))
-        if ctx and getattr(ctx, "_ws_emit", None):
-            try:
-                ctx._ws_emit("knowledge_hint", {"message": hint_text})
-            except Exception:
-                pass
-        knowledge_query_hint_injected = True
-    elif not force_query_hint:
+    # force_query_hint 不再成立时清除标记，使后续再次命中可重新注入
+    if not force_query_hint:
         knowledge_query_hint_injected = False
 
     self_doubt_reasons: list[str] = []
@@ -372,28 +358,72 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             8, int(last_clickable_count * 0.6)
         ):
             self_doubt_reasons.append("页面元素数量突变，可能存在弹窗或页面异常")
-    if self_doubt_reasons:
-        doubt_text = (
-            "SELF_DOUBT_HINT: 检测到不确定状态（"
-            + "；".join(self_doubt_reasons[:2])
-            + "）。下一步先调用 get_screen_info 复核；若仍无法确认路径，请立即 "
-            'report_done(status="abort", summary="页面异常，建议人工确认")。'
-        )
-        msgs.append(SystemMessage(content=doubt_text))
-
     last_page_app_key = str(state.get("_last_page_app_key", "") or "")
-    app_switch_hint = ""
+
+    # ── M1：收集启发式提示候选，单轮只注入优先级最高 1 条（config 可关）──
+    # 元组：(priority[越小越高], kind, content, emit_msg)
+    hint_candidates: list[tuple[int, str, str, str]] = []
+
+    if (
+        remaining_tool_budget <= _FINALIZATION_REMAINING_TOOL_BUDGET
+        and not finalization_hint_injected
+    ):
+        hint_candidates.append(
+            (
+                0,
+                "finalization",
+                "FINALIZATION_HINT: 剩余工具预算较低。请优先对可判定项调用 "
+                'assert_verification；若无法继续，请立即 report_done(status="abort")。',
+                "",
+            )
+        )
+    if force_query_hint and not knowledge_query_hint_injected:
+        query_text = (state.get("user_request", "") or "").strip()[:40]
+        if not query_text:
+            query_text = "当前页面下一步"
+        _kq = (
+            "检测到循环或无进展风险，下一步先调用 "
+            f'query_app_knowledge(query="{query_text}", app_package="{effective_app_package}") '
+            "再执行点击/滑动。"
+        )
+        hint_candidates.append(
+            (1, "knowledge", "KNOWLEDGE_QUERY_REQUIRED: " + _kq, _kq)
+        )
+    if self_doubt_reasons:
+        hint_candidates.append(
+            (
+                2,
+                "self_doubt",
+                "SELF_DOUBT_HINT: 检测到不确定状态（"
+                + "；".join(self_doubt_reasons[:2])
+                + "）。下一步先调用 get_screen_info 复核；若仍无法确认路径，请立即 "
+                'report_done(status="abort", summary="页面异常，建议人工确认")。',
+                "",
+            )
+        )
     if current_app_key and current_app_key != last_page_app_key and last_page_app_key:
-        app_switch_hint = (
+        _as = (
             f"已进入新应用上下文（{current_app_key}），如不确定下一步，优先调用 "
             f'query_app_knowledge(query="当前页面下一步", app_package="{effective_app_package}")。'
         )
-        msgs.append(SystemMessage(content="APP_SWITCH_HINT: " + app_switch_hint))
-        if ctx and getattr(ctx, "_ws_emit", None):
+        hint_candidates.append((3, "app_switch", "APP_SWITCH_HINT: " + _as, _as))
+
+    if getattr(cfg, "single_hint_per_turn", True):
+        selected = sorted(hint_candidates, key=lambda c: c[0])[:1]
+    else:
+        selected = hint_candidates
+    for _prio, _kind, _content, _emit in selected:
+        msgs.append(SystemMessage(content=_content))
+        if _kind == "finalization":
+            finalization_hint_injected = True
+        elif _kind == "knowledge":
+            knowledge_query_hint_injected = True
+        if _emit and ctx and getattr(ctx, "_ws_emit", None):
             try:
-                ctx._ws_emit("knowledge_hint", {"message": app_switch_hint})
+                ctx._ws_emit("knowledge_hint", {"message": _emit})
             except Exception:
                 pass
+
     msgs.append(
         HumanMessage(
             content="Goal:\n"
@@ -575,7 +605,10 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 um.append(HumanMessage(content=dup_warning))
 
     # Phase 1.4: 裁剪时保留 system prompt + 带 Goal 的消息 + 最近消息
-    _prune_messages(um)
+    # O2: 折叠历史 get_screen_info 大输出（config 可关闭）
+    _prune_messages(
+        um, summarize_stale_screens=getattr(cfg, "context_summarize_stale_screens", True)
+    )
 
     if done or abort:
         return Command(
@@ -672,6 +705,25 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     llm_call_count = int(state.get("llm_call_count", 0) or 0)
     tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
     tool_call_400_rate = float(state.get("tool_call_400_rate", 0.0) or 0.0)
+    # 修复A：全部 goal 验证项通过即视为达成目标——即便因 max_turns/预算在最后一步收尾
+    # 未及时 report_done，也不应把 passed 降级为 inconclusive。route_after_agent 已按
+    # 「全部通过」路由到 reporter，此处把 exhausted/error 归正为 completed，避免成功被误判。
+    _goal_v_items = (
+        [v for v in (goal.get("verification", []) or []) if str(v or "").strip()]
+        if isinstance(goal, dict)
+        else []
+    )
+    if (
+        _goal_v_items
+        and test_verdict == "passed"
+        and execution_status in ("exhausted", "error")
+    ):
+        logger.info(
+            "Reporter: 全部 %d 项验证通过（原 execution_status=%s）→ 归正为 completed",
+            len(_goal_v_items),
+            execution_status,
+        )
+        execution_status = "completed"
     if execution_status not in ("completed",):
         test_verdict = "inconclusive"
     # 向后兼容 status
@@ -706,6 +758,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     rag_total_resolved = _rag_same_app + _rag_cross_app + _rag_empty
     rag_same_app_ratio = round(_rag_same_app / max(rag_total_resolved, 1), 4)
     rag_empty_hit_rate = round(_rag_empty / max(rag_total_resolved, 1), 4)
+
+    # O1: 单次运行 token 消耗（纯观测）
+    token_usage = dict(getattr(ctx, "_token_usage", {}) or {})
 
     # 延迟 import：读取 graph 的可变全局当前值（set_relational_db 会更新它）
     from agents.graph import _relational_db
@@ -747,7 +802,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     fc = sum(1 for s in dd if s.get("status") == "fail")
     cc = sum(1 for s in dd if s.get("status") == "continue")
     logger.info(
-        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f click=%d exact=%d fuzzy=%d ambiguous=%d rag_q=%d rag_same=%.2f conclusion=%s",
+        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f click=%d exact=%d fuzzy=%d ambiguous=%d rag_q=%d rag_same=%.2f tokens(in=%d out=%d total=%d cached=%d calls=%d) conclusion=%s",
         execution_status,
         test_verdict,
         len(dd),
@@ -765,8 +820,48 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         ambiguous_count,
         rag_query_count,
         rag_same_app_ratio,
+        int(token_usage.get("input_tokens", 0) or 0),
+        int(token_usage.get("output_tokens", 0) or 0),
+        int(token_usage.get("total_tokens", 0) or 0),
+        int(token_usage.get("cached_input_tokens", 0) or 0),
+        int(token_usage.get("llm_calls", 0) or 0),
         str(conclusion)[:120],
     )
+    # 本地逐轮 trace 落盘（离线可观测；config 可关；绝不影响主流程）
+    if getattr(cfg, "write_run_trace", True):
+        try:
+            from agents.run_trace import build_run_trace, write_run_trace
+
+            _trace = build_run_trace(
+                run_id=config.get("configurable", {}).get("thread_id", ""),
+                user_request=state.get("user_request", ""),
+                app_package=state.get("app_package", ""),
+                app_name=state.get("app_name", ""),
+                execution_status=execution_status,
+                test_verdict=test_verdict,
+                duration_seconds=duration,
+                tool_log=_tool_log,
+                verification_results=verification_results,
+                token_usage=token_usage,
+                metrics={
+                    "llm_call_count": llm_call_count,
+                    "tool_call_400_count": tool_call_400_count,
+                    "tool_call_400_rate": tool_call_400_rate,
+                    "click_count": click_count,
+                    "exact_click_count": exact_count,
+                    "fuzzy_click_count": fuzzy_count,
+                    "ambiguous_count": ambiguous_count,
+                    "rag_query_count": rag_query_count,
+                    "rag_same_app_ratio": rag_same_app_ratio,
+                    "rag_empty_hit_rate": rag_empty_hit_rate,
+                },
+            )
+            _trace_path = write_run_trace(_trace)
+            if _trace_path:
+                logger.info("Run trace written: %s", _trace_path)
+        except Exception as exc:
+            logger.warning("run trace skipped: %s", exc)
+
     return Command(
         update={
             "conclusion": str(conclusion),
@@ -779,6 +874,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             "llm_call_count": llm_call_count,
             "tool_call_400_count": tool_call_400_count,
             "tool_call_400_rate": tool_call_400_rate,
+            "token_usage": token_usage,
         }
     )
 
@@ -819,8 +915,47 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
 # ═══ ROUTING ═══
 
 
-def _prune_messages(um: list[Any], max_len: int = 16) -> None:
-    """Phase 1.4: 裁剪消息列表，保留 system prompt + Goal 上下文 + 最近消息。"""
+_STALE_SCREEN_TOOLS = ("get_screen_info",)
+_STALE_SCREEN_PLACEHOLDER_PREFIX = "[历史页面已折叠]"
+
+
+def _summarize_stale_screen_dumps(um: list[Any]) -> None:
+    """O2：把历史消息中除最新一次外的 get_screen_info 大输出折叠为占位符，
+    抑制上下文/token 膨胀。最新一份保留全量；折叠时保留 tool_call_id 以维持
+    与 AIMessage tool_calls 的配对（OpenAI 协议要求）。就地替换，绝不抛异常。"""
+    try:
+        idxs = [
+            i
+            for i, m in enumerate(um)
+            if getattr(m, "name", "") in _STALE_SCREEN_TOOLS
+        ]
+        for i in idxs[:-1]:  # 保留最后一份全量
+            m = um[i]
+            content = getattr(m, "content", "")
+            if not isinstance(content, str) or content.startswith(
+                _STALE_SCREEN_PLACEHOLDER_PREFIX
+            ):
+                continue
+            first_line = content.split("\n", 1)[0]
+            um[i] = ToolMessage(
+                content=(
+                    f"{_STALE_SCREEN_PLACEHOLDER_PREFIX} {first_line}"
+                    "（页面可能已变化，如需当前状态请重新调用 get_screen_info）"
+                ),
+                name=getattr(m, "name", None),
+                tool_call_id=getattr(m, "tool_call_id", ""),
+            )
+    except Exception:
+        pass
+
+
+def _prune_messages(
+    um: list[Any], max_len: int = 16, summarize_stale_screens: bool = True
+) -> None:
+    """Phase 1.4: 裁剪消息列表，保留 system prompt + Goal 上下文 + 最近消息。
+    O2: summarize_stale_screens=True 时先折叠历史 get_screen_info 大输出。"""
+    if summarize_stale_screens:
+        _summarize_stale_screen_dumps(um)
     if len(um) <= max_len:
         return
     # 找到包含 Goal 的消息（agent_node 注入的 HumanMessage 以 "Goal:\n" 开头）

@@ -6,39 +6,26 @@ _run_agent 读取 graph 的可变全局 _ws_emit_callback，通过函数内延�
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import json
 import logging
 import os
 import re
-import time
-from datetime import datetime
 from typing import Any, Annotated
 
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.runnables import RunnableConfig
+from langgraph.prebuilt import tools_condition
 
 from config import TestConfig
-from llm.clients import (
-    create_llm_client,
-    _call_with_retry,
-    _is_rate_limit_error,
-    _default_should_retry,
-)
-from agents.budget import _clip_to_token_budget, _estimate_tokens
+from llm.clients import _call_with_retry, _default_should_retry
 from agents.loop_control import (
     _build_call_signature,
     _build_page_signature,
     _cooldown_group,
-    _detect_termination,
     _output_has_page_change,
     _resolve_click_fallback,
     _resolve_click_match_mode,
 )
-from tools import AGENT_TOOLS, get_tool_context
+from tools import get_tool_context
 
 import app_paths
 
@@ -148,6 +135,34 @@ _NO_PROGRESS_ACTIONS = {
 }
 
 
+def _accumulate_token_usage(ctx, msg) -> None:
+    """O1：把一次 LLM 响应的 usage_metadata 累加到 ctx._token_usage（run 级观测）。
+    绝不抛异常，缺字段按 0 处理。"""
+    if ctx is None or msg is None:
+        return
+    um = getattr(msg, "usage_metadata", None)
+    if not isinstance(um, dict):
+        return
+    tu = getattr(ctx, "_token_usage", None)
+    if not isinstance(tu, dict):
+        return
+    tu["input_tokens"] = int(tu.get("input_tokens", 0) or 0) + int(
+        um.get("input_tokens", 0) or 0
+    )
+    tu["output_tokens"] = int(tu.get("output_tokens", 0) or 0) + int(
+        um.get("output_tokens", 0) or 0
+    )
+    tu["total_tokens"] = int(tu.get("total_tokens", 0) or 0) + int(
+        um.get("total_tokens", 0) or 0
+    )
+    tu["llm_calls"] = int(tu.get("llm_calls", 0) or 0) + 1
+    details = um.get("input_token_details") or {}
+    if isinstance(details, dict):
+        tu["cached_input_tokens"] = int(tu.get("cached_input_tokens", 0) or 0) + int(
+            details.get("cache_read", 0) or 0
+        )
+
+
 def _run_agent(
     messages,
     tools,
@@ -179,81 +194,35 @@ def _run_agent(
             in text.lower()
         )
 
-    if provider == "zhipu":
-        from zhipuai import ZhipuAI
+    # 统一走 OpenAI 兼容接入（zhipu / 多模态等通过 base_url 指向其 OpenAI 兼容端点）。
+    from langchain_openai import ChatOpenAI
 
-        c = ZhipuAI(max_retries=0, api_key=api_key)
-        if base_url:
-            c.base_url = base_url
-        schemas = _zhipu_schemas(tools)
+    lc = ChatOpenAI(
+        model=model, temperature=0.1, api_key=api_key, base_url=base_url
+    ).bind_tools(tools)
 
-        def _llm(s: _SubState) -> dict:
-            nonlocal llm_call_count
-            llm_call_count += 1
-            if _ctx and _ctx._ws_emit:
-                try:
-                    _ctx._ws_emit("stream_token", "thinking")
-                except Exception:
-                    pass
-            ms = _to_zhipu(s["messages"])
-            r = _call_retry(
-                "zhipu",
-                c.chat.completions.create,
-                model=model,
-                messages=ms,
-                tools=schemas,
-                tool_choice="auto",
-            )
-            if r is None:
-                return {"messages": [AIMessage(content="LLM failed")]}
-            m = r.choices[0].message
-            tcs = [
-                {
-                    "id": t.id,
-                    "name": t.function.name,
-                    "args": (
-                        json.loads(t.function.arguments)
-                        if isinstance(t.function.arguments, str)
-                        else (t.function.arguments or {})
-                    ),
-                    "type": "tool_call",
-                }
-                for t in (m.tool_calls or [])
-            ]
-            return {
-                "messages": [
-                    AIMessage(content=m.content or "", tool_calls=tcs if tcs else None)
-                ]
-            }
+    def _llm(s: _SubState) -> dict:
+        nonlocal llm_call_count, tool_call_400_count
+        llm_call_count += 1
+        if _ctx and _ctx._ws_emit:
+            try:
+                _ctx._ws_emit("stream_token", "thinking")
+            except Exception:
+                pass
+        current_call_has_tool_400 = False
 
-        llm_node = _llm
-    else:
-        from langchain_openai import ChatOpenAI
+        def _on_llm_error(exc: Exception) -> None:
+            nonlocal current_call_has_tool_400, tool_call_400_count
+            if _is_tool_call_400_error(exc) and not current_call_has_tool_400:
+                tool_call_400_count += 1
+                current_call_has_tool_400 = True
 
-        lc = ChatOpenAI(
-            model=model, temperature=0.1, api_key=api_key, base_url=base_url
-        ).bind_tools(tools)
+        r = _call_retry("openai", lc.invoke, s["messages"], on_error=_on_llm_error)
+        # O1：累计本次 LLM 调用的 token 消耗（run 级，存 ToolContext）
+        _accumulate_token_usage(_ctx, r)
+        return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
 
-        def _llm(s: _SubState) -> dict:
-            nonlocal llm_call_count, tool_call_400_count
-            llm_call_count += 1
-            if _ctx and _ctx._ws_emit:
-                try:
-                    _ctx._ws_emit("stream_token", "thinking")
-                except Exception:
-                    pass
-            current_call_has_tool_400 = False
-
-            def _on_llm_error(exc: Exception) -> None:
-                nonlocal current_call_has_tool_400, tool_call_400_count
-                if _is_tool_call_400_error(exc) and not current_call_has_tool_400:
-                    tool_call_400_count += 1
-                    current_call_has_tool_400 = True
-
-            r = _call_retry("openai", lc.invoke, s["messages"], on_error=_on_llm_error)
-            return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
-
-        llm_node = _llm
+    llm_node = _llm
 
     # ── 自定义工具执行节点（替代 ToolNode，支持实时事件发射）──
     _tool_map = {t.name: t for t in tools}
@@ -316,7 +285,9 @@ def _run_agent(
                 _live_ctx = get_tool_context()
                 if _live_ctx.device is None:
                     output = "ERROR: 设备已断开连接"
-                    outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
+                    outputs.append(
+                ToolMessage(content=output, name=name, tool_call_id=tc["id"])
+            )
                     # 为剩余未执行的 tool_calls 补占位 ToolMessage，避免 LangChain 报错
                     _remaining = last_ai.tool_calls or []
                     _idx = _remaining.index(tc) + 1 if tc in _remaining else -1
@@ -347,7 +318,9 @@ def _run_agent(
                 except Exception as e:
                     logger.warning("Step screenshot failed for %s: %s", name, e)
                     _screenshot_path = ""
-            outputs.append(ToolMessage(content=output, tool_call_id=tc["id"]))
+            outputs.append(
+                ToolMessage(content=output, name=name, tool_call_id=tc["id"])
+            )
 
             # 最小断路器：连续无进展动作判定为空转（assert 或页面变化均算进展）。
             if progress_milestone:
@@ -639,60 +612,7 @@ def _call_retry_should_retry(provider: str, exc: Exception, on_error=None) -> bo
             on_error(exc)
         except Exception:
             logger.debug("on_error callback failed", exc_info=True)
-    return (
-        _is_rate_limit_error(exc) if provider == "zhipu" else _default_should_retry(exc)
-    )
-
-
-def _zhipu_schemas(tools):
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description or "",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        n: {
-                            "type": m.get("type", "string"),
-                            "description": m.get("description", ""),
-                        }
-                        for n, m in (getattr(t, "args", {}) or {}).items()
-                    },
-                    "required": list((getattr(t, "args", {}) or {}).keys()),
-                },
-            },
-        }
-        for t in tools
-    ]
-
-
-def _to_zhipu(msgs):
-    r = []
-    for m in msgs:
-        role = getattr(m, "type", "system")
-        if role == "human":
-            role = "user"
-        elif role == "ai":
-            role = "assistant"
-        e = {"role": role, "content": str(getattr(m, "content", "") or "")}
-        if hasattr(m, "tool_calls") and m.tool_calls:
-            e["tool_calls"] = [
-                {
-                    "id": t.get("id", ""),
-                    "type": "function",
-                    "function": {
-                        "name": t["name"],
-                        "arguments": json.dumps(t.get("args", {}), ensure_ascii=False),
-                    },
-                }
-                for t in m.tool_calls
-            ]
-        if tid := getattr(m, "tool_call_id", None):
-            e["tool_call_id"] = tid
-        r.append(e)
-    return r
+    return _default_should_retry(exc)
 
 
 # ═══ LLM config ═══

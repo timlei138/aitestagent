@@ -20,6 +20,10 @@ class ToolContext:
     llm_base_url: str | None = None
     llm_vision_enabled: bool = True
     verification_auto_vision: bool = True
+    # M4：确定性断言（assert_page_contains/assert_element_exists）作为 ground truth
+    # 参与 assert_verification 结果核实。默认「仅证据」（annotate 不改判定）；
+    # 置 True 时开启「硬核实」——代码核实与模型判定冲突时按代码结果修正。
+    deterministic_verification_override: bool = False
     _screen_size: tuple[int, int] | None = field(default=None, repr=False)
     _ws_emit: Any = field(
         default=None, repr=False
@@ -37,6 +41,20 @@ class ToolContext:
     _rag_cross_app_count: int = 0
     _rag_empty_hit_count: int = 0
     _run_tag: str = ""  # 当前 run 标识，用于缓存键隔离
+    # M4：确定性断言结果记录（{"text","kind","result": "pass"/"fail"}），
+    # assert_verification 反查最近一条与验证项匹配的确定性核实作为 ground truth。
+    _deterministic_checks: list = field(default_factory=list, repr=False)
+    # O1：单次运行 token 消耗累计（纯观测）。每次 LLM 调用累加 usage_metadata。
+    _token_usage: dict = field(
+        default_factory=lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cached_input_tokens": 0,
+            "llm_calls": 0,
+        },
+        repr=False,
+    )
 
     @property
     def screen_size(self) -> tuple[int, int]:

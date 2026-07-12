@@ -13,7 +13,6 @@ _CAP_FAIL_STREAK = 0
 _CAP_LOCK = Lock()
 _CLIENT_CACHE_LOCK = Lock()
 _OPENAI_CLIENTS: dict[tuple[str, str, str, int], Any] = {}
-_ZHIPU_CLIENTS: dict[tuple[str, str, int], Any] = {}
 _FAIL_STREAK_UNSUPPORTED_THRESHOLD = 2
 
 
@@ -161,48 +160,6 @@ def _invoke_openai_multimodal(
     return str(getattr(resp, "content", "") or "")
 
 
-def _invoke_zhipu_multimodal(
-    model: str,
-    api_key: str,
-    base_url: str | None,
-    prompt: str,
-    image_base64: str,
-    timeout_sec: int,
-) -> str:
-    from zhipuai import ZhipuAI
-
-    kwargs: dict[str, Any] = {"api_key": api_key, "timeout": timeout_sec}
-    if base_url:
-        kwargs["base_url"] = base_url
-    cache_key = (api_key, base_url or "", timeout_sec)
-    with _CLIENT_CACHE_LOCK:
-        client = _ZHIPU_CLIENTS.get(cache_key)
-        if client is None:
-            try:
-                client = ZhipuAI(max_retries=0, **kwargs)
-            except TypeError:
-                kwargs.pop("timeout", None)
-                client = ZhipuAI(max_retries=0, **kwargs)
-            _ZHIPU_CLIENTS[cache_key] = client
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_base64}"},
-                    },
-                ],
-            }
-        ],
-        temperature=0.0,
-    )
-    return str(resp.choices[0].message.content or "")
-
-
 def _invoke_multimodal(
     provider: str,
     model: str,
@@ -212,11 +169,7 @@ def _invoke_multimodal(
     image_base64: str,
     timeout_sec: int,
 ) -> str:
-    name = (provider or "openai").lower()
-    if name == "zhipu":
-        return _invoke_zhipu_multimodal(
-            model, api_key, base_url, prompt, image_base64, timeout_sec
-        )
+    # 统一走 OpenAI 兼容多模态接口（zhipu 等通过 base_url 指向其 OpenAI 兼容端点）。
     return _invoke_openai_multimodal(
         model, api_key, base_url, prompt, image_base64, timeout_sec
     )

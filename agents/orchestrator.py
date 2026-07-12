@@ -14,6 +14,24 @@ from agents.state import TestState
 logger = logging.getLogger(__name__)
 
 
+def _reset_run_scoped(ctx) -> None:
+    """重置 run 级累加器：验证结果 / M4 确定性核实 / O1 token 统计。
+    每次新执行前调用，避免跨 run 数据串扰。绝不抛异常。"""
+    if not ctx:
+        return
+    try:
+        if isinstance(getattr(ctx, "_verifications", None), list):
+            ctx._verifications.clear()
+        if isinstance(getattr(ctx, "_deterministic_checks", None), list):
+            ctx._deterministic_checks.clear()
+        tu = getattr(ctx, "_token_usage", None)
+        if isinstance(tu, dict):
+            for k in list(tu.keys()):
+                tu[k] = 0
+    except Exception:
+        pass
+
+
 class TestOrchestrator:
     """测试编排器 — 对外唯一入口。
 
@@ -55,8 +73,7 @@ class TestOrchestrator:
         from tools import get_tool_context
 
         ctx = get_tool_context()
-        if ctx and hasattr(ctx, "_verifications"):
-            ctx._verifications.clear()
+        _reset_run_scoped(ctx)
         if getattr(ctx, "device", None) is None:
             msg = "Android 设备未连接，请检查 USB/ADB 连接后重试"
             self._emit("error", {"message": msg})
@@ -163,8 +180,7 @@ class TestOrchestrator:
         from tools import get_tool_context as _gtc
 
         _sctx = _gtc()
-        if _sctx and hasattr(_sctx, "_verifications"):
-            _sctx._verifications.clear()
+        _reset_run_scoped(_sctx)
 
         from config import start_run_log
 
@@ -271,8 +287,7 @@ class TestOrchestrator:
         from tools import get_tool_context as _gtc
 
         _sctx = _gtc()
-        if _sctx and hasattr(_sctx, "_verifications"):
-            _sctx._verifications.clear()
+        _reset_run_scoped(_sctx)
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
@@ -321,8 +336,7 @@ class TestOrchestrator:
         from tools import get_tool_context as _gtc
 
         _sctx = _gtc()
-        if _sctx and hasattr(_sctx, "_verifications"):
-            _sctx._verifications.clear()
+        _reset_run_scoped(_sctx)
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
