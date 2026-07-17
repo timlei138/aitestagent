@@ -137,7 +137,7 @@ def test_route_after_agent_prefers_reporter_when_all_verifications_passed(monkey
     assert graph.route_after_agent(state) == "reporter"
 
 
-def test_agent_node_accumulates_tool_call_400_metrics(monkeypatch):
+def test_agent_node_accumulates_llm_call_metrics(monkeypatch):
     fake_ctx = SimpleNamespace(
         perceiver=None,
         knowledge_base=None,
@@ -187,7 +187,7 @@ def test_call_retry_should_retry_triggers_on_error_callback():
     assert len(captured) == 1
 
 
-def test_reporter_persists_tool_call_400_metrics(monkeypatch):
+def test_reporter_persists_metrics(monkeypatch):
     captured = {}
 
     class FakeDB:
@@ -205,8 +205,6 @@ def test_reporter_persists_tool_call_400_metrics(monkeypatch):
         "messages": [],
         "budget_violation_count": 0,
         "llm_call_count": 11,
-        "tool_call_400_count": 2,
-        "tool_call_400_rate": 0.1818,
         "_tool_calls_log": [],
         "user_request": "u",
         "app_package": "pkg",
@@ -222,8 +220,8 @@ def test_reporter_persists_tool_call_400_metrics(monkeypatch):
         },
     )
     assert captured["llm_call_count"] == 11
-    assert captured["tool_call_400_count"] == 2
-    assert captured["tool_call_400_rate"] == 0.1818
+    assert "exact_click_rate" in captured
+    assert "input_tokens" in captured
 
 
 def test_should_include_rag_on_first_iteration():

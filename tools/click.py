@@ -520,6 +520,14 @@ def click(
                 getattr(best_el, "label", ""),
             )
         else:
+            # L3 kill switch: native_strict 模式下无精确参数 → 直接返回 AMBIGUOUS，
+            # 不进入语义搜索/fallback 兜底，强制 LLM 下发精确参数（index/rid/class/path）。
+            if getattr(ctx, "click_mode", "legacy") == "native_strict":
+                return make_result(
+                    AMBIGUOUS,
+                    "未提供精确参数（index/rid/class_name/path_contains），"
+                    "请在 page_info 中选择后重试",
+                )
             for target in search_targets:
                 try:
                     best_el, known_ids = _find_best_element_with_known(

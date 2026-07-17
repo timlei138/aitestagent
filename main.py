@@ -103,6 +103,7 @@ def _init_tool_context(config: TestConfig) -> None:
             llm_api_key=config.api_key,
             llm_base_url=config.base_url,
             llm_vision_enabled=config.vision_enabled,
+            click_mode=config.click_mode,
         )
         ctx_holder["ctx"] = ctx
         set_tool_context(ctx)

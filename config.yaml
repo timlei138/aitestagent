@@ -10,3 +10,4 @@ embedding_base_url: null
 perception_mode: ui_tree
 safety_level: strict
 vision_enabled: false
+click_mode: legacy

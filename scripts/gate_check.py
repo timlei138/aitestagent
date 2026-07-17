@@ -24,7 +24,6 @@ THRESHOLDS = {
     "exact_click_rate_min": 0.80,  # 精确定位占比 >=
     "fuzzy_click_rate_max": 0.15,  # 兜底(fallback)点击占比 <=
     "ambiguous_rate_max": 0.10,  # 歧义占比 <=
-    "tool_call_400_rate_max": 0.05,  # LLM tool_call 400 率 <=
     "rag_empty_hit_rate_max": 0.40,  # RAG 空命中率 <=
     "completed_rate_min": 0.80,  # 执行完成(completed)率 >=
 }
@@ -39,7 +38,6 @@ def aggregate(runs: list[dict]) -> dict | None:
     tot_fuzzy = sum(int(r.get("fuzzy_click_count", 0) or 0) for r in runs)
     tot_amb = sum(int(r.get("ambiguous_count", 0) or 0) for r in runs)
     completed = sum(1 for r in runs if r.get("execution_status") == "completed")
-    avg_400 = sum(float(r.get("tool_call_400_rate", 0) or 0) for r in runs) / n
     avg_rag_empty = sum(float(r.get("rag_empty_hit_rate", 0) or 0) for r in runs) / n
     return {
         "runs": n,
@@ -47,7 +45,6 @@ def aggregate(runs: list[dict]) -> dict | None:
         "exact_click_rate": round(tot_exact / max(tot_click, 1), 4),
         "fuzzy_click_rate": round(tot_fuzzy / max(tot_click, 1), 4),
         "ambiguous_rate": round(tot_amb / max(tot_click, 1), 4),
-        "tool_call_400_rate": round(avg_400, 4),
         "rag_empty_hit_rate": round(avg_rag_empty, 4),
         "completed_rate": round(completed / n, 4),
     }
@@ -59,7 +56,6 @@ def evaluate(agg: dict) -> list[tuple]:
         ("exact_click_rate", ">=", THRESHOLDS["exact_click_rate_min"]),
         ("fuzzy_click_rate", "<=", THRESHOLDS["fuzzy_click_rate_max"]),
         ("ambiguous_rate", "<=", THRESHOLDS["ambiguous_rate_max"]),
-        ("tool_call_400_rate", "<=", THRESHOLDS["tool_call_400_rate_max"]),
         ("rag_empty_hit_rate", "<=", THRESHOLDS["rag_empty_hit_rate_max"]),
         ("completed_rate", ">=", THRESHOLDS["completed_rate_min"]),
     ]

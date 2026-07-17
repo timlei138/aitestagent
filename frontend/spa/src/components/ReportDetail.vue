@@ -43,8 +43,16 @@
         <b class="rd-metric-value">{{ Number(report.rag_cross_app_used_count || 0) }}</b>
       </div>
       <div class="rd-metric-item">
-        <span class="rd-metric-label">tool_call 400</span>
-        <b class="rd-metric-value">{{ Number(report.tool_call_400_count || 0) }}</b>
+        <span class="rd-metric-label">Token 消耗 (入/出/总)</span>
+        <b class="rd-metric-value">{{ fmtTokens(report.input_tokens) }} / {{ fmtTokens(report.output_tokens) }} / {{ fmtTokens(report.total_tokens) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">Token 缓存命中</span>
+        <b class="rd-metric-value">{{ fmtTokens(report.cached_input_tokens) }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">LLM调用 (token统计)</span>
+        <b class="rd-metric-value">{{ Number(report.llm_token_calls || 0) }}</b>
       </div>
     </div>
 
@@ -148,6 +156,13 @@ function execStatusLabel(s) { return (execStatusMap[s] || execStatusMap.error).l
 function fmtRate(v) {
   const n = Number(v || 0)
   return (n * 100).toFixed(2) + '%'
+}
+
+function fmtTokens(v) {
+  const n = Number(v || 0)
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
+  return String(n)
 }
 
 function fmtDuration(ms) {

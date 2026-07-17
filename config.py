@@ -63,6 +63,13 @@ class TestConfig:
     # 串成结构化 JSON 落盘到 logs/runs/*_trace.json（离线，替代 LangSmith 云）。
     write_run_trace: bool = True
 
+    # ── 点击策略 (L3 kill switch) ──
+    # legacy: 精确参数不存在时走语义搜索 + fallback 兜底（当前默认）。
+    # native_strict: 精确参数不存在时直接返回 AMBIGUOUS，强制 LLM 下精确参数；
+    #   精确参数存在时行为与 legacy 一致。用于验证 LLM 能否脱离语义搜索独立工作，
+    #   是下线 ~500 行 legacy 语义匹配代码的前置开关。
+    click_mode: str = "legacy"
+
     # ──────────────── YAML 加载 ────────────────
 
     @classmethod

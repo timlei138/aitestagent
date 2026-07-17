@@ -24,6 +24,9 @@ class ToolContext:
     # 参与 assert_verification 结果核实。默认「仅证据」（annotate 不改判定）；
     # 置 True 时开启「硬核实」——代码核实与模型判定冲突时按代码结果修正。
     deterministic_verification_override: bool = False
+    # L3 kill switch：点击策略分流
+    # legacy: 精确参数不存在时走语义搜索；native_strict: 精确参数不存在→AMBIGUOUS
+    click_mode: str = "legacy"
     _screen_size: tuple[int, int] | None = field(default=None, repr=False)
     _ws_emit: Any = field(
         default=None, repr=False

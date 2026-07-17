@@ -137,15 +137,28 @@ _NO_PROGRESS_ACTIONS = {
 
 def _accumulate_token_usage(ctx, msg) -> None:
     """O1：把一次 LLM 响应的 usage_metadata 累加到 ctx._token_usage（run 级观测）。
-    绝不抛异常，缺字段按 0 处理。"""
+    绝不抛异常，缺字段按 0 处理。
+
+    LangChain 的 ChatOpenAI 通常把 token 放在 msg.usage_metadata；
+    部分 provider/版本可能仅放在 msg.response_metadata["token_usage"]，
+    此处以 usage_metadata 为主，缺失时回退到 response_metadata。
+    """
     if ctx is None or msg is None:
-        return
-    um = getattr(msg, "usage_metadata", None)
-    if not isinstance(um, dict):
         return
     tu = getattr(ctx, "_token_usage", None)
     if not isinstance(tu, dict):
         return
+    # llm_calls 始终递增（即使拿不到 token 详情，至少记录调用次数）
+    tu["llm_calls"] = int(tu.get("llm_calls", 0) or 0) + 1
+
+    um = getattr(msg, "usage_metadata", None)
+    if not isinstance(um, dict):
+        # 回退：部分 provider 仅放在 response_metadata["token_usage"]
+        rm = getattr(msg, "response_metadata", None) or {}
+        um = rm.get("token_usage") if isinstance(rm, dict) else None
+    if not isinstance(um, dict):
+        return
+
     tu["input_tokens"] = int(tu.get("input_tokens", 0) or 0) + int(
         um.get("input_tokens", 0) or 0
     )
@@ -155,7 +168,6 @@ def _accumulate_token_usage(ctx, msg) -> None:
     tu["total_tokens"] = int(tu.get("total_tokens", 0) or 0) + int(
         um.get("total_tokens", 0) or 0
     )
-    tu["llm_calls"] = int(tu.get("llm_calls", 0) or 0) + 1
     details = um.get("input_token_details") or {}
     if isinstance(details, dict):
         tu["cached_input_tokens"] = int(tu.get("cached_input_tokens", 0) or 0) + int(

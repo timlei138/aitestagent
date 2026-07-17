@@ -68,7 +68,26 @@ class SqliteBackend(RelationalBackend):
                 conclusion TEXT,
                 steps_json TEXT,
                 duration_seconds REAL,
-                created_at TEXT
+                created_at TEXT,
+                execution_status TEXT DEFAULT '',
+                test_verdict TEXT DEFAULT '',
+                verification_json TEXT DEFAULT '[]',
+                llm_call_count INTEGER DEFAULT 0,
+                click_count INTEGER DEFAULT 0,
+                fuzzy_click_count INTEGER DEFAULT 0,
+                ambiguous_count INTEGER DEFAULT 0,
+                exact_click_count INTEGER DEFAULT 0,
+                exact_click_rate REAL DEFAULT 0,
+                fuzzy_click_rate REAL DEFAULT 0,
+                rag_query_count INTEGER DEFAULT 0,
+                rag_same_app_ratio REAL DEFAULT 0,
+                rag_empty_hit_rate REAL DEFAULT 0,
+                rag_cross_app_used_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                total_tokens INTEGER DEFAULT 0,
+                cached_input_tokens INTEGER DEFAULT 0,
+                llm_token_calls INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS human_decisions (
@@ -106,87 +125,12 @@ class SqliteBackend(RelationalBackend):
                 last_used_at TEXT,
                 created_at TEXT,
                 updated_at TEXT,
+                screen_width INTEGER DEFAULT 0,
+                screen_height INTEGER DEFAULT 0,
+                bounds_json TEXT DEFAULT '',
                 UNIQUE(app_package, page_signature, alias)
             );
         """)
-        self._conn.commit()
-        # ── V2: 新增列（兼容已有数据库） ──
-        self._migrate_v2_columns()
-        # ── V3: 双维度结果列 ──
-        self._migrate_v3_columns()
-        # ── V4: LLM 400 观测列 ──
-        self._migrate_v4_columns()
-        # ── V5: 点击质量指标列 ──
-        self._migrate_v5_columns()
-        self._migrate_v6_columns()
-
-    def _migrate_v2_columns(self) -> None:
-        """V2 迁移：为 element_identities 新增 screen_width/screen_height/bounds_json 列。"""
-        for col, typedef in [
-            ("screen_width", "INTEGER DEFAULT 0"),
-            ("screen_height", "INTEGER DEFAULT 0"),
-            ("bounds_json", "TEXT DEFAULT ''"),
-        ]:
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE element_identities ADD COLUMN {col} {typedef}"
-                )
-            except sqlite3.OperationalError:
-                pass  # 列已存在
-        self._conn.commit()
-
-    def _migrate_v3_columns(self) -> None:
-        """V3 迁移：为 test_runs 新增 execution_status / test_verdict / verification_json 列。"""
-        for col, typedef in [
-            ("execution_status", "TEXT DEFAULT ''"),
-            ("test_verdict", "TEXT DEFAULT ''"),
-            ("verification_json", "TEXT DEFAULT '[]'"),
-        ]:
-            try:
-                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
-            except sqlite3.OperationalError:
-                pass
-        self._conn.commit()
-
-    def _migrate_v4_columns(self) -> None:
-        """V4 迁移：为 test_runs 新增 tool_call_400 观测列。"""
-        for col, typedef in [
-            ("llm_call_count", "INTEGER DEFAULT 0"),
-            ("tool_call_400_count", "INTEGER DEFAULT 0"),
-            ("tool_call_400_rate", "REAL DEFAULT 0"),
-        ]:
-            try:
-                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
-            except sqlite3.OperationalError:
-                pass
-        self._conn.commit()
-
-    def _migrate_v5_columns(self) -> None:
-        """V5 迁移：为 test_runs 新增点击质量指标列。"""
-        for col, typedef in [
-            ("click_count", "INTEGER DEFAULT 0"),
-            ("fuzzy_click_count", "INTEGER DEFAULT 0"),
-            ("ambiguous_count", "INTEGER DEFAULT 0"),
-            ("exact_click_count", "INTEGER DEFAULT 0"),
-        ]:
-            try:
-                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
-            except sqlite3.OperationalError:
-                pass
-        self._conn.commit()
-
-    def _migrate_v6_columns(self) -> None:
-        """V6 迁移：为 test_runs 新增 RAG 观测列。"""
-        for col, typedef in [
-            ("rag_query_count", "INTEGER DEFAULT 0"),
-            ("rag_same_app_ratio", "REAL DEFAULT 0"),
-            ("rag_empty_hit_rate", "REAL DEFAULT 0"),
-            ("rag_cross_app_used_count", "INTEGER DEFAULT 0"),
-        ]:
-            try:
-                self._conn.execute(f"ALTER TABLE test_runs ADD COLUMN {col} {typedef}")
-            except sqlite3.OperationalError:
-                pass
         self._conn.commit()
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
@@ -255,16 +199,22 @@ class SqliteBackend(RelationalBackend):
         test_verdict: str = "",
         verification_json: str = "[]",
         llm_call_count: int = 0,
-        tool_call_400_count: int = 0,
-        tool_call_400_rate: float = 0.0,
         click_count: int = 0,
         fuzzy_click_count: int = 0,
         ambiguous_count: int = 0,
         exact_click_count: int = 0,
+        exact_click_rate: float = 0.0,
+        fuzzy_click_rate: float = 0.0,
         rag_query_count: int = 0,
         rag_same_app_ratio: float = 0.0,
         rag_empty_hit_rate: float = 0.0,
         rag_cross_app_used_count: int = 0,
+        # O1: token 消耗观测
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+        cached_input_tokens: int = 0,
+        llm_token_calls: int = 0,
     ) -> None:
         """快捷方法：记录一次测试执行。"""
         self.upsert(
@@ -282,16 +232,21 @@ class SqliteBackend(RelationalBackend):
                 "test_verdict": test_verdict,
                 "verification_json": verification_json,
                 "llm_call_count": llm_call_count,
-                "tool_call_400_count": tool_call_400_count,
-                "tool_call_400_rate": tool_call_400_rate,
                 "click_count": click_count,
                 "fuzzy_click_count": fuzzy_click_count,
                 "ambiguous_count": ambiguous_count,
                 "exact_click_count": exact_click_count,
+                "exact_click_rate": exact_click_rate,
+                "fuzzy_click_rate": fuzzy_click_rate,
                 "rag_query_count": rag_query_count,
                 "rag_same_app_ratio": rag_same_app_ratio,
                 "rag_empty_hit_rate": rag_empty_hit_rate,
                 "rag_cross_app_used_count": rag_cross_app_used_count,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "llm_token_calls": llm_token_calls,
                 "created_at": datetime.now().isoformat(),
             },
             key="id",
@@ -318,10 +273,12 @@ class SqliteBackend(RelationalBackend):
             "SELECT id, user_request, app_package, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
             "execution_status, test_verdict, "
-            "llm_call_count, tool_call_400_count, tool_call_400_rate, "
+            "llm_call_count, "
             "click_count, fuzzy_click_count, ambiguous_count, exact_click_count, "
+            "exact_click_rate, fuzzy_click_rate, "
             "rag_query_count, rag_same_app_ratio, rag_empty_hit_rate, "
-            "rag_cross_app_used_count "
+            "rag_cross_app_used_count, "
+            "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls "
             "FROM test_runs "
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
@@ -337,7 +294,6 @@ class SqliteBackend(RelationalBackend):
             d["pass_count"] = pass_count
             d["fail_count"] = fail_count
             d["total_steps"] = len(steps)
-            # 旧数据兼容：无新列时从 status 推导
             if not d.get("execution_status"):
                 d["execution_status"] = (
                     "completed" if d["status"] == "success" else "error"
@@ -347,19 +303,17 @@ class SqliteBackend(RelationalBackend):
                     "passed" if d["status"] == "success" else "inconclusive"
                 )
             d["llm_call_count"] = int(d.get("llm_call_count", 0) or 0)
-            d["tool_call_400_count"] = int(d.get("tool_call_400_count", 0) or 0)
-            d["tool_call_400_rate"] = float(d.get("tool_call_400_rate", 0.0) or 0.0)
             d["click_count"] = int(d.get("click_count", 0) or 0)
             d["fuzzy_click_count"] = int(d.get("fuzzy_click_count", 0) or 0)
             d["ambiguous_count"] = int(d.get("ambiguous_count", 0) or 0)
             d["exact_click_count"] = int(d.get("exact_click_count", 0) or 0)
-            # 派生比率
-            d["fuzzy_click_rate"] = round(
-                d["fuzzy_click_count"] / max(d["click_count"], 1), 4
-            )
-            d["exact_click_rate"] = round(
-                d["exact_click_count"] / max(d["click_count"], 1), 4
-            )
+            d["exact_click_rate"] = float(d.get("exact_click_rate", 0) or 0)
+            d["fuzzy_click_rate"] = float(d.get("fuzzy_click_rate", 0) or 0)
+            d["input_tokens"] = int(d.get("input_tokens", 0) or 0)
+            d["output_tokens"] = int(d.get("output_tokens", 0) or 0)
+            d["total_tokens"] = int(d.get("total_tokens", 0) or 0)
+            d["cached_input_tokens"] = int(d.get("cached_input_tokens", 0) or 0)
+            d["llm_token_calls"] = int(d.get("llm_token_calls", 0) or 0)
             result.append(d)
         return result
 
@@ -369,10 +323,12 @@ class SqliteBackend(RelationalBackend):
             "SELECT id, user_request, app_package, app_name, status, conclusion, "
             "steps_json, duration_seconds, created_at, "
             "execution_status, test_verdict, verification_json, "
-            "llm_call_count, tool_call_400_count, tool_call_400_rate, "
+            "llm_call_count, "
             "click_count, fuzzy_click_count, ambiguous_count, exact_click_count, "
+            "exact_click_rate, fuzzy_click_rate, "
             "rag_query_count, rag_same_app_ratio, rag_empty_hit_rate, "
-            "rag_cross_app_used_count "
+            "rag_cross_app_used_count, "
+            "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls "
             "FROM test_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
@@ -386,24 +342,22 @@ class SqliteBackend(RelationalBackend):
         d["pass_count"] = pass_count
         d["fail_count"] = fail_count
         d["total_steps"] = len(steps)
-        # 旧数据兼容
         if not d.get("execution_status"):
             d["execution_status"] = "completed" if d["status"] == "success" else "error"
         if not d.get("test_verdict"):
             d["test_verdict"] = "passed" if d["status"] == "success" else "inconclusive"
         d["llm_call_count"] = int(d.get("llm_call_count", 0) or 0)
-        d["tool_call_400_count"] = int(d.get("tool_call_400_count", 0) or 0)
-        d["tool_call_400_rate"] = float(d.get("tool_call_400_rate", 0.0) or 0.0)
         d["click_count"] = int(d.get("click_count", 0) or 0)
         d["fuzzy_click_count"] = int(d.get("fuzzy_click_count", 0) or 0)
         d["ambiguous_count"] = int(d.get("ambiguous_count", 0) or 0)
         d["exact_click_count"] = int(d.get("exact_click_count", 0) or 0)
-        d["fuzzy_click_rate"] = round(
-            d["fuzzy_click_count"] / max(d["click_count"], 1), 4
-        )
-        d["exact_click_rate"] = round(
-            d["exact_click_count"] / max(d["click_count"], 1), 4
-        )
+        d["exact_click_rate"] = float(d.get("exact_click_rate", 0) or 0)
+        d["fuzzy_click_rate"] = float(d.get("fuzzy_click_rate", 0) or 0)
+        d["input_tokens"] = int(d.get("input_tokens", 0) or 0)
+        d["output_tokens"] = int(d.get("output_tokens", 0) or 0)
+        d["total_tokens"] = int(d.get("total_tokens", 0) or 0)
+        d["cached_input_tokens"] = int(d.get("cached_input_tokens", 0) or 0)
+        d["llm_token_calls"] = int(d.get("llm_token_calls", 0) or 0)
         verification_results = json.loads(d.pop("verification_json", "[]") or "[]")
         if isinstance(verification_results, list):
             for item in verification_results:

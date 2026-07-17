@@ -5,7 +5,7 @@ import json
 from data.relational import SqliteBackend
 
 
-def test_record_and_read_tool_call_400_metrics(tmp_path):
+def test_record_and_read_token_metrics(tmp_path):
     db = SqliteBackend(str(tmp_path / "metrics.db"))
     run_id = "run-metrics-1"
     db.record_test_run(
@@ -21,16 +21,27 @@ def test_record_and_read_tool_call_400_metrics(tmp_path):
         test_verdict="passed",
         verification_json=json.dumps([], ensure_ascii=False),
         llm_call_count=20,
-        tool_call_400_count=1,
-        tool_call_400_rate=0.05,
+        exact_click_rate=0.9,
+        fuzzy_click_rate=0.05,
+        input_tokens=50000,
+        output_tokens=3000,
+        total_tokens=53000,
+        cached_input_tokens=48000,
+        llm_token_calls=20,
     )
     detail = db.get_test_run(run_id)
     assert detail is not None
     assert detail["llm_call_count"] == 20
-    assert detail["tool_call_400_count"] == 1
-    assert abs(detail["tool_call_400_rate"] - 0.05) < 1e-9
+    assert abs(detail["exact_click_rate"] - 0.9) < 1e-9
+    assert abs(detail["fuzzy_click_rate"] - 0.05) < 1e-9
+    assert detail["input_tokens"] == 50000
+    assert detail["output_tokens"] == 3000
+    assert detail["total_tokens"] == 53000
+    assert detail["cached_input_tokens"] == 48000
+    assert detail["llm_token_calls"] == 20
     listing = db.list_test_runs(limit=5)
     assert len(listing) >= 1
     assert "llm_call_count" in listing[0]
-    assert "tool_call_400_count" in listing[0]
-    assert "tool_call_400_rate" in listing[0]
+    assert "exact_click_rate" in listing[0]
+    assert "input_tokens" in listing[0]
+    assert "llm_token_calls" in listing[0]

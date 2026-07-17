@@ -783,16 +783,21 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 test_verdict=test_verdict,
                 verification_json=json.dumps(verification_results, ensure_ascii=False),
                 llm_call_count=llm_call_count,
-                tool_call_400_count=tool_call_400_count,
-                tool_call_400_rate=tool_call_400_rate,
                 click_count=click_count,
                 fuzzy_click_count=fuzzy_count,
                 ambiguous_count=ambiguous_count,
                 exact_click_count=exact_count,
+                exact_click_rate=round(exact_count / max(click_count, 1), 4),
+                fuzzy_click_rate=round(fuzzy_count / max(click_count, 1), 4),
                 rag_query_count=rag_query_count,
                 rag_same_app_ratio=rag_same_app_ratio,
                 rag_empty_hit_rate=rag_empty_hit_rate,
                 rag_cross_app_used_count=_rag_cross_app,
+                input_tokens=int(token_usage.get("input_tokens", 0) or 0),
+                output_tokens=int(token_usage.get("output_tokens", 0) or 0),
+                total_tokens=int(token_usage.get("total_tokens", 0) or 0),
+                cached_input_tokens=int(token_usage.get("cached_input_tokens", 0) or 0),
+                llm_token_calls=int(token_usage.get("llm_calls", 0) or 0),
             )
         except:
             pass
