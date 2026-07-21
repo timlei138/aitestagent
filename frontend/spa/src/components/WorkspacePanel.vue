@@ -46,9 +46,21 @@
                   @keydown.enter.ctrl="$emit('run', inputText)" />
         <div class="wp-input-actions">
           <span class="wp-input-hint">Ctrl + Enter 发送</span>
-          <el-button type="primary" :loading="executing" @click="$emit('run', inputText)" round>
-            {{ executing ? '执行中...' : '开始执行' }}
-          </el-button>
+          <div class="wp-input-buttons">
+            <el-button
+              v-if="executing"
+              type="danger"
+              :loading="stopping"
+              @click="$emit('stop')"
+              round
+              plain
+            >
+              停止运行
+            </el-button>
+            <el-button type="primary" :loading="executing && !stopping" @click="$emit('run', inputText)" round>
+              {{ executing ? '执行中...' : '开始执行' }}
+            </el-button>
+          </div>
         </div>
       </div>
     </div>
@@ -58,8 +70,11 @@
 <script setup>
 import { ref, nextTick, watch } from 'vue'
 
-const props = defineProps({ executing: { type: Boolean, default: false } })
-defineEmits(['run'])
+const props = defineProps({
+  executing: { type: Boolean, default: false },
+  stopping: { type: Boolean, default: false },
+})
+defineEmits(['run', 'stop'])
 
 const timeline = ref([])
 const thinkingEntry = ref(null)
@@ -67,9 +82,9 @@ const inputText = ref('')
 
 // ── 双维度标签 ──
 const _execMap = { completed: '已完成', exhausted: '步骤耗尽', error: '异常中断', cancelled: '已取消', device_offline: '设备离线' }
-const _verdictMap = { passed: '通过', failed: '未通过', inconclusive: '待确认' }
+const _verdictMap = { passed: '通过', failed: '未通过', inconclusive: '待人工复核' }
 function execLabel(s) { return _execMap[s] || '异常中断' }
-function verdictLabel(s) { return _verdictMap[s] || '待确认' }
+function verdictLabel(s) { return _verdictMap[s] || '待人工复核' }
 
 // ── 工具函数 ──
 function now() { return new Date().toLocaleTimeString('zh-CN', { hour12: false }) }
@@ -125,9 +140,12 @@ function addResult(execStatus, verdict, conclusion, verificationResults) {
   const icon = verdict === 'passed' ? '✅' : verdict === 'failed' ? '❌' : '⚠️'
   addEntry({ type: 'result', icon, text: `${execLabel(execStatus)} | ${verdictLabel(verdict)}`, detail: conclusion })
   if (verificationResults && verificationResults.length) {
-    verificationResults.forEach(v =>
-      addEntry({ type: 'log', text: `${v.result === 'passed' ? '✓' : '✗'} ${v.item}` })
-    )
+    verificationResults.forEach(v => {
+      const needsReview = v.review_required || v.result === 'unknown'
+      const icon = v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '⚠️'
+      const suffix = needsReview ? '（需人工复核）' : ''
+      addEntry({ type: 'log', text: `${icon} ${v.item}${suffix}` })
+    })
   }
 }
 
@@ -282,6 +300,11 @@ watch(() => timeline.value.length, () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+.wp-input-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 .wp-input-hint {
   font-size: 11px;

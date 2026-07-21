@@ -37,8 +37,10 @@ from tools.element_match import (
 )
 from tools.device_ops import (
     check_desktop_mode,
+    clear_app_data,
     copy,
     launch_app,
+    open_app_permission_settings,
     open_notification,
     open_quick_settings,
     paste,
@@ -71,8 +73,10 @@ from tools.perceive_tools import (
     detect_popup,
     dismiss_popup,
     recover_from_anomaly,
+    respond_to_permission_dialog,
     switch_perception_mode,
     visual_check,
+    wait_for_permission_dialog,
     wait_seconds,
 )
 from tools.click import (
@@ -294,12 +298,16 @@ AGENT_TOOLS: list[Any] = [
     set_orientation,
     toggle_auto_rotate,
     check_desktop_mode,
+    clear_app_data,
     launch_app,
+    open_app_permission_settings,
     visual_check,
     detect_overlay,
     detect_popup,
     dismiss_popup,
     wait_seconds,
+    wait_for_permission_dialog,
+    respond_to_permission_dialog,
     check_page_health,
     recover_from_anomaly,
     assert_page_contains,

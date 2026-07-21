@@ -137,26 +137,20 @@ _NO_PROGRESS_ACTIONS = {
 
 def _accumulate_token_usage(ctx, msg) -> None:
     """O1：把一次 LLM 响应的 usage_metadata 累加到 ctx._token_usage（run 级观测）。
-    绝不抛异常，缺字段按 0 处理。
 
-    LangChain 的 ChatOpenAI 通常把 token 放在 msg.usage_metadata；
-    部分 provider/版本可能仅放在 msg.response_metadata["token_usage"]，
-    此处以 usage_metadata 为主，缺失时回退到 response_metadata。
+    ChatOpenAI 返回的 AIMessage 自带 usage_metadata，包含 input_tokens /
+    output_tokens / total_tokens / input_token_details.cache_read。
+    绝不抛异常，缺字段按 0 处理。
     """
     if ctx is None or msg is None:
         return
-    tu = getattr(ctx, "_token_usage", None)
-    if not isinstance(tu, dict):
-        return
-    # llm_calls 始终递增（即使拿不到 token 详情，至少记录调用次数）
-    tu["llm_calls"] = int(tu.get("llm_calls", 0) or 0) + 1
 
     um = getattr(msg, "usage_metadata", None)
     if not isinstance(um, dict):
-        # 回退：部分 provider 仅放在 response_metadata["token_usage"]
-        rm = getattr(msg, "response_metadata", None) or {}
-        um = rm.get("token_usage") if isinstance(rm, dict) else None
-    if not isinstance(um, dict):
+        return
+
+    tu = getattr(ctx, "_token_usage", None)
+    if not isinstance(tu, dict):
         return
 
     tu["input_tokens"] = int(tu.get("input_tokens", 0) or 0) + int(
@@ -168,6 +162,8 @@ def _accumulate_token_usage(ctx, msg) -> None:
     tu["total_tokens"] = int(tu.get("total_tokens", 0) or 0) + int(
         um.get("total_tokens", 0) or 0
     )
+    tu["llm_calls"] = int(tu.get("llm_calls", 0) or 0) + 1
+
     details = um.get("input_token_details") or {}
     if isinstance(details, dict):
         tu["cached_input_tokens"] = int(tu.get("cached_input_tokens", 0) or 0) + int(
@@ -215,6 +211,16 @@ def _run_agent(
 
     def _llm(s: _SubState) -> dict:
         nonlocal llm_call_count, tool_call_400_count
+        # 用户手动停止：立刻终止子图，不再发新的 LLM 请求。
+        # 把 stop 转成 loop_break_reason 复用既有"循环检测到终止"的 END 收敛路径。
+        if _ctx is not None:
+            _ev = getattr(_ctx, "_stop_event", None)
+            if _ev is not None and _ev.is_set():
+                logger.info("_llm: stop flag hit, returning USER_STOPPED")
+                return {
+                    "messages": [],
+                    "_loop_break_reason": "USER_STOPPED",
+                }
         llm_call_count += 1
         if _ctx and _ctx._ws_emit:
             try:
@@ -240,6 +246,15 @@ def _run_agent(
     _tool_map = {t.name: t for t in tools}
 
     def _tools_node(s: _SubState) -> dict:
+        # 用户手动停止：立刻终止，不执行后续工具。
+        if _ctx is not None:
+            _ev = getattr(_ctx, "_stop_event", None)
+            if _ev is not None and _ev.is_set():
+                logger.info("_tools_node: stop flag hit, returning USER_STOPPED")
+                return {
+                    "messages": [],
+                    "_loop_break_reason": "USER_STOPPED",
+                }
         last_ai = next(m for m in reversed(s["messages"]) if isinstance(m, AIMessage))
         outputs = []
         recent = list(s.get("_recent_call_sigs", []))
@@ -484,6 +499,20 @@ def _run_agent(
     _tool_calls_log = result.get("_tool_calls_log", [])
 
     if loop_break_reason:
+        # 用户手动停止：子图内 _llm/_tools_node 命中 stop，单独返回，
+        # 不被 REPORT_ABORT 的 ABORT 兜底覆盖（语义不同）。
+        if loop_break_reason == "USER_STOPPED":
+            return (
+                "ABORT: USER_STOPPED — 用户手动停止当前运行",
+                _tool_calls_log,
+                {
+                    "loop_detected": False,
+                    "loop_pattern": "",
+                    "loop_break_action": "user_stopped",
+                    "llm_call_count": llm_call_count,
+                    "tool_call_400_count": tool_call_400_count,
+                },
+            )
         # report_done 结构化终止：提取状态而非当 ABORT 处理
         if loop_break_reason.startswith("REPORT_DONE:"):
             _summary = loop_break_reason[len("REPORT_DONE:") :].strip()

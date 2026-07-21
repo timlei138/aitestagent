@@ -639,10 +639,25 @@ def click(
         }
 
     def _with_snapshot(base_result: str, clicked_el: Any) -> str:
-        """为成功的点击结果追加操作后页面状态。"""
+        """为成功的点击结果追加操作后页面状态和可核实的权限弹窗事实。"""
+        from tools.perceive_tools import _permission_popup_buttons
+
         _save_click_identity(ctx, label, clicked_el, understanding)
         snap = _post_click_snapshot(ctx, _pre_title, label)
-        return f"{base_result} | {snap}" if snap else base_result
+        parts = [base_result]
+        if snap:
+            parts.append(snap)
+        permission_info = _permission_popup_buttons(ctx)
+        if permission_info:
+            activity, controls = permission_info
+            buttons = "|".join(text for text, _ in controls)
+            return (
+                " | ".join(parts)
+                + " || permission_dialog=true"
+                + f"; permission_activity={activity}"
+                + f"; permission_buttons={buttons}"
+            )
+        return " | ".join(parts)
 
     if best_el is not None:
         promoted = _promote_to_clickable_parent(best_el, understanding)

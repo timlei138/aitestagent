@@ -50,10 +50,6 @@
         <span class="rd-metric-label">Token 缓存命中</span>
         <b class="rd-metric-value">{{ fmtTokens(report.cached_input_tokens) }}</b>
       </div>
-      <div class="rd-metric-item">
-        <span class="rd-metric-label">LLM调用 (token统计)</span>
-        <b class="rd-metric-value">{{ Number(report.llm_token_calls || 0) }}</b>
-      </div>
     </div>
 
     <!-- 请求文本 -->
@@ -66,6 +62,7 @@
         <span class="rd-verify-icon" :class="v.result">{{ v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?' }}</span>
         <div class="rd-verify-main">
           <span class="rd-verify-text">{{ v.item }}</span>
+          <span v-if="v.review_required || v.result === 'unknown'" class="rd-review-badge">需人工复核</span>
           <div v-if="v.detail" class="rd-verify-reason">理由：{{ v.detail }}</div>
         </div>
         <el-image v-if="v.screenshot" :src="shotUrl(v.screenshot, i)" :preview-src-list="[shotUrl(v.screenshot, i)]"
@@ -125,7 +122,7 @@ const bannerIcon = computed(() => {
 const bannerTitle = computed(() => {
   if (!props.report) return ''
   const v = props.report.test_verdict || 'inconclusive'
-  const m = { passed: '测试通过', failed: '测试未通过', inconclusive: '无法判定' }
+  const m = { passed: '测试通过', failed: '测试未通过', inconclusive: '待人工复核' }
   return m[v] || v
 })
 
@@ -208,6 +205,7 @@ function shotUrl(path, index) {
 .rd-verify-icon { font-weight: 700; width: 22px; text-align: center; }
 .rd-verify-icon.passed { color: var(--success); } .rd-verify-icon.failed { color: var(--danger); } .rd-verify-icon.unknown { color: var(--warning); }
 .rd-verify-text { flex: 1; color: var(--text-secondary); }
+.rd-review-badge { align-self: flex-start; width: fit-content; padding: 1px 6px; border-radius: var(--radius-xs); background: #fef3c7; color: #92400e; font-size: 11px; font-weight: 600; }
 .rd-verify-main { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .rd-verify-reason { color: var(--text-muted); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
 .verify-shot { width: 48px; height: 36px; border-radius: var(--radius-xs); cursor: pointer; object-fit: cover; border: 1px solid var(--line); }

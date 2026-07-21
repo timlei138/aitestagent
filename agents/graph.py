@@ -110,7 +110,11 @@ def route_after_agent(state: TestState) -> str:
         return "reporter"
     n = len(state.get("step_history", []))
     budget = _calc_budget_from_state(state)
-    if state.get("status") in ("success", "fail"):
+    if state.get("status") in ("success", "fail", "stopped"):
+        # "stopped" 是 _stop_or_continue 写入的 stop 收敛态。_stop_or_continue
+        # 已显式 goto="reporter"，正常路径不会走到这里；保留这条分支作为防御——
+        # 万一 LangGraph 未来忽略 Command.goto，路由仍能正确收敛（避免在
+        # agent ↔ agent 之间死循环到 max_iterations）。
         logger.info("Route: reporter (status=%s, steps=%d)", state.get("status"), n)
         return "reporter"
     if n >= budget["max_agent_iterations"]:

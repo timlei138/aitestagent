@@ -46,3 +46,8 @@ apps:
   keywords:
   - 图库
   - 相册
+- name: 联想日历
+  package: com.zui.calendar
+  keywords:
+  - 联想日历
+  - PRC日历

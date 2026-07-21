@@ -186,12 +186,19 @@ def _resolve_verification_key(ctx: ToolContext, condition: str) -> str:
 
 @tool
 def assert_verification(condition: str, result: str, detail: str = "") -> str:
-    """逐条报告验证条件的结果。condition 对应 goal.verification 中的验证项，
-    result 为 "passed" 或 "failed"，detail 可选补充说明。
+    """逐条报告验证条件的结果。
+
+    condition 对应 goal.verification 中的验证项；result 只能为 ``passed``、
+    ``failed`` 或 ``unknown``。``unknown`` 表示当前架构缺少可核实证据，
+    需要人工复核，不能被当作功能失败或模型猜测通过。所有结果均需 detail。
     截图策略：每个验证点都实时截图，保证验证清单中每条记录对应独立证据。"""
     # 延迟 import：避免加载期循环依赖；同时让测试对 tools.get_tool_context 的
     # monkeypatch 生效（局部名遮蔽模块级 import）。
     from tools import _run_multimodal_from_context, get_tool_context
+
+    normalized_result = str(result or "").strip().lower()
+    if normalized_result not in ("passed", "failed", "unknown"):
+        return "ERROR: assert_verification result 必须为 passed、failed 或 unknown"
 
     ctx = get_tool_context()
     if ctx:
@@ -202,7 +209,7 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
         if not hasattr(ctx, "_duplicate_assert_count"):
             ctx._duplicate_assert_count = 0
         verification_key = _resolve_verification_key(ctx, condition)
-        normalized = result if result in ("passed", "failed") else "unknown"
+        normalized = normalized_result
         if normalized == "passed":
             for index, existing in enumerate(ctx._verifications):
                 if (
@@ -217,14 +224,18 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
                         + verification_key
                         + f" already passed at step={index + 1}"
                     )
-        if normalized in ("passed", "failed") and not (detail or "").strip():
+        if not (detail or "").strip():
             retries = int(
                 ctx._verification_detail_retries.get(verification_key, 0) or 0
             )
             if retries < 2:
                 ctx._verification_detail_retries[verification_key] = retries + 1
                 return f"ERROR: detail is required for assert_verification (attempt {retries + 1}/2)"
-            detail = "detail unavailable after retries"
+            detail = (
+                "需要人工复核：未提供可核实证据说明"
+                if normalized == "unknown"
+                else "detail unavailable after retries"
+            )
         else:
             ctx._verification_detail_retries.pop(verification_key, None)
         shot_path = ""  # 相对路径（供前端 /storage 挂载解析）
@@ -334,9 +345,11 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
                 "result": normalized,
                 "detail": detail,
                 "screenshot": shot_path,
+                "review_required": normalized == "unknown",
             }
         )
-    return f"记录完成: {condition} → {result}"
+    suffix = "（需要人工复核）" if normalized_result == "unknown" else ""
+    return f"记录完成: {condition} → {normalized_result}{suffix}"
 
 
 @tool

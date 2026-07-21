@@ -70,6 +70,73 @@ import app_paths
 
 logger = logging.getLogger(__name__)
 
+
+class RunStopped(Exception):
+    """保留作 orchestrator 最外层兜底——`agents/orchestrator.py:start` 的
+    `except RunStopped` 分支是「深度防御」：如果未来某次 LangGraph 演进忽略了
+    节点内的 stop 检查、或 stop 检查路径被绕过，最外层这里仍能把图收敛到
+    cancelled 返回。实际当前 stop 机制**完全**通过 Command(..., goto="reporter")
+    + _loop_break_reason="USER_STOPPED" 实现，不走异常路径。
+    """
+
+
+def _check_stop(ctx) -> bool:
+    """检查 stop 标志，命中时返回 True。绝不抛异常。"""
+    if ctx is None:
+        return False
+    ev = getattr(ctx, "_stop_event", None)
+    if ev is not None and ev.is_set():
+        return True
+    return False
+
+
+def _stop_or_continue(state: TestState, ctx) -> Command | None:
+    """节点入口 stop 拦截器。命中 stop 时返回带 goto 的 Command；未命中返回 None。
+
+    **必须**显式 `goto="reporter"`——否则图按既有 routing 会：
+    - planner_node 走固定边 planner → plan_review，触发 interrupt 弹计划确认
+    - agent_node 走 route_after_agent，"stopped" 不在 ("success", "fail") 中，
+      不在 max_iterations 时会被路由回 agent_node 死循环，直到 step_history 撞
+      max_agent_iterations 才收敛——既浪费回合又污染 step_history。
+
+    返回的 Command 携带：
+    - conclusion: 标准 ABORT 前缀，便于 _detect_termination 识别
+    - status: "stopped"（与 success/fail/cancelled 并列的语义状态）
+    - _stop_requested: True，供 reporter 写入 execution_status="cancelled"
+    """
+    if not _check_stop(ctx):
+        return None
+    history = state.get("step_history", []) if isinstance(state, dict) else []
+    si = len(history) + 1
+    conclusion = "ABORT: USER_STOPPED — 用户手动停止当前运行"
+    nh = list(history) + [
+        {
+            "index": si,
+            "intent": "user_stop",
+            "action_type": "user_stop",
+            "target": "",
+            "page_from": "",
+            "page_to": "",
+            "duration_ms": 0,
+            "status": "fail",
+            "observation": conclusion,
+            "raw_observation": conclusion,
+            "screenshot_path": "",
+            "anomaly": None,
+        }
+    ]
+    logger.info("Node entry: stop flag hit, redirecting to reporter (step=%d)", si)
+    return Command(
+        update={
+            "conclusion": conclusion,
+            "status": "stopped",
+            "step_history": nh,
+            "_stop_requested": True,
+        },
+        goto="reporter",
+    )
+
+
 # R4: 注入给 LLM 的 page_info 可点击元素上限（原为 ~25，导致目标常被截断在视野外）。
 # 保持原始顺序以与 click() 的 index 解析一致；超限补提示而非静默截断。
 _AGENT_PAGE_INFO_MAX_ELEMENTS = 60
@@ -112,6 +179,10 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     llm = _llm_cfg(cfg)
     ctx = get_tool_context()
+    # 入口 stop 检查：在 LLM 调用之前拦截，避免无意义的规划开销
+    _stop_cmd = _stop_or_continue(state, ctx)
+    if _stop_cmd is not None:
+        return _stop_cmd
     kb = ctx.knowledge_base if ctx else None
     rag = _rag_ctx(kb, state.get("app_package", ""), state.get("user_request", ""))
     budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
@@ -183,6 +254,12 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
 def agent_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     llm = _llm_cfg(cfg)
+    ctx = get_tool_context()
+
+    # 入口 stop 检查：优先于设备检查、感知、LLM 调用——命中直接收敛
+    _stop_cmd = _stop_or_continue(state, ctx)
+    if _stop_cmd is not None:
+        return _stop_cmd
 
     # ── 设备健康检查：断开时等待重连，重试 2 次仍失败则直接终止 ──
     if not _ensure_device_alive(max_retries=2, wait_sec=5.0):
@@ -214,8 +291,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             }
         )
 
-    # Page info
-    ctx = get_tool_context()
+    # Page info（ctx 已在函数顶部获取，stop 检查在更早）
     page_info = "unknown"
     pid = ""
     current_app_key = ""
@@ -705,6 +781,15 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     llm_call_count = int(state.get("llm_call_count", 0) or 0)
     tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
     tool_call_400_rate = float(state.get("tool_call_400_rate", 0.0) or 0.0)
+    # 用户手动停止：优先级最高，**不**被 V1 全过归正覆盖。
+    # 即便所有验证都通过了，用户主动停止也只记 cancelled——停止是一种
+    # 主动意图，不是"自然完成"。同时保证 test_verdict 为 inconclusive。
+    if _check_stop(ctx) or bool(state.get("_stop_requested", False)):
+        logger.info(
+            "Reporter: 用户手动停止 → execution_status=cancelled, test_verdict=inconclusive"
+        )
+        execution_status = "cancelled"
+        test_verdict = "inconclusive"
     # 修复A：全部 goal 验证项通过即视为达成目标——即便因 max_turns/预算在最后一步收尾
     # 未及时 report_done，也不应把 passed 降级为 inconclusive。route_after_agent 已按
     # 「全部通过」路由到 reporter，此处把 exhausted/error 归正为 completed，避免成功被误判。
@@ -886,6 +971,12 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
 
 def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
     """Pause to let user confirm (and optionally edit) the generated goal before Agent runs."""
+    # 用户手动停止：在调 interrupt() 之前拦截，避免「点了停止却弹出计划确认」
+    # 命中时直接 goto reporter，与其他节点的 stop 收敛路径一致。
+    _ctx = get_tool_context()
+    _stop_cmd = _stop_or_continue(state, _ctx)
+    if _stop_cmd is not None:
+        return _stop_cmd
     goal = state.get("goal_description", {})
     from langgraph.types import interrupt
 

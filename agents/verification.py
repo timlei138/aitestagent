@@ -68,8 +68,9 @@ def _merge_goal_verification_results(
             "key": key,
             "item": item,
             "result": "unknown",
-            "detail": "",
+            "detail": "需要人工复核：未获得该验证项的自动化证据",
             "screenshot": "",
+            "review_required": True,
         }
         for key, item in key_to_item.items()
     }
@@ -86,6 +87,10 @@ def _merge_goal_verification_results(
             "result": incoming_result,
             "detail": str(assertion.get("detail", "") or ""),
             "screenshot": str(assertion.get("screenshot", "") or ""),
+            "review_required": (
+                bool(assertion.get("review_required", False))
+                or incoming_result == "unknown"
+            ),
         }
         current = merged[key]
         current_result = str(current.get("result", "unknown") or "unknown")

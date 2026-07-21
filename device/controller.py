@@ -236,15 +236,55 @@ class DeviceController:
         except Exception:
             self.device.app_stop(package)
 
-    def current_app(self) -> dict[str, Any]:
+    def clear_app_data(self, package: str) -> str:
+        """清理指定 App 的用户数据，等价于 ``adb shell pm clear <package>``。"""
+        package = (package or "").strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+", package):
+            raise ValueError(f"无效的 Android 包名: {package or '<empty>'}")
+
+        result = self.device.shell(["pm", "clear", package])
+        output = str(getattr(result, "output", result) or "").strip()
+        exit_code = getattr(result, "exit_code", None)
+        if exit_code not in (None, 0) or output.lower() != "success":
+            detail = output or f"exit_code={exit_code}"
+            raise RuntimeError(f"pm clear 执行失败: {detail}")
+        logger.info("Device app data cleared package=%s", package)
+        return output
+
+    def open_app_permission_settings(self, package: str) -> str:
+        """打开指定 App 的系统详情页，供人工或 Agent 继续处理权限。"""
+        package = (package or "").strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+", package):
+            raise ValueError(f"无效的 Android 包名: {package or '<empty>'}")
+
+        result = self.device.shell(
+            [
+                "am",
+                "start",
+                "-a",
+                "android.settings.APPLICATION_DETAILS_SETTINGS",
+                "-d",
+                f"package:{package}",
+            ]
+        )
+        output = str(getattr(result, "output", result) or "").strip()
+        exit_code = getattr(result, "exit_code", None)
+        if exit_code not in (None, 0):
+            detail = output or f"exit_code={exit_code}"
+            raise RuntimeError(f"打开应用权限设置失败: {detail}")
+        logger.info("Opened app settings package=%s", package)
+        return output
+
+    def current_app(self, refresh: bool = False) -> dict[str, Any]:
         """
         获取当前前台应用
-        优先读取 app_current，必要时回退 dumpsys；带短时缓存，避免高频调用与刷屏日志
+        优先读取 app_current，必要时回退 dumpsys；带短时缓存，避免高频调用与刷屏日志。
+        refresh=True 时绕过缓存，适用于短生命周期的系统弹窗检测。
         """
         now = time.monotonic()
         cache_ttl = float(getattr(self, "_current_app_cache_ttl_sec", 0.4) or 0.4)
         last_ts = float(getattr(self, "_last_current_app_ts", 0.0) or 0.0)
-        if now - last_ts <= max(0.0, cache_ttl):
+        if not refresh and now - last_ts <= max(0.0, cache_ttl):
             return dict(
                 getattr(self, "_last_current_app", {"package": "", "activity": ""})
             )

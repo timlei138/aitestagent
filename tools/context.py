@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,6 +59,11 @@ class ToolContext:
         },
         repr=False,
     )
+    # 手动停止事件（threading.Event 而非 asyncio.Event：start() 同步路径
+    # 跑在 asyncio.to_thread 的工作线程上，Event.is_set() 是 O(1) 原子读）。
+    # orchestrator.request_stop 会 set；节点入口 / _run_agent 主循环检查。
+    # run 结束（finally）清回 None，避免下个 run 看到上一次的 flag。
+    _stop_event: threading.Event | None = field(default=None, repr=False)
 
     @property
     def screen_size(self) -> tuple[int, int]:

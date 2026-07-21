@@ -377,6 +377,10 @@ class HumanDecisionRequest(BaseModel):
     decision: Any
 
 
+class StopRunRequest(BaseModel):
+    thread_id: str
+
+
 class IdentityConfirmRequest(BaseModel):
     identities: list[dict]  # [{target, resource_id, class_name, role, ...}]
 
@@ -440,6 +444,21 @@ async def human_decision(request: HumanDecisionRequest):
         decision=request.decision,
     )
     return {"status": result.get("status", "error"), "data": result}
+
+
+@app.post("/api/run/stop")
+async def stop_run(request: StopRunRequest):
+    """手动停止一个正在执行的 run（HTTP 路径）。
+
+    幂等：未知 thread_id 或已结束的 run 都会返回 noop，不抛错。
+    """
+    if not request.thread_id:
+        return {"status": "error", "message": "缺少 thread_id"}
+    ok = orchestrator.request_stop(request.thread_id, reason="http_stop")
+    return {
+        "status": "ok" if ok else "noop",
+        "thread_id": request.thread_id,
+    }
 
 
 @app.post("/api/element_identities/confirm")
@@ -518,6 +537,20 @@ async def websocket_chat(websocket: WebSocket):
                 try:
                     await ws_manager.send(
                         websocket, {"type": "result", "content": result}
+                    )
+                except RuntimeError:
+                    pass
+
+            elif msg_type == "stop_run":
+                thread_id = data.get("thread_id", "")
+                ok = orchestrator.request_stop(thread_id, reason="ws_stop")
+                try:
+                    await ws_manager.send(
+                        websocket,
+                        {
+                            "type": "stop_ack",
+                            "content": {"ok": ok, "thread_id": thread_id},
+                        },
                     )
                 except RuntimeError:
                     pass

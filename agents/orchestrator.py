@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import datetime
 from typing import Any, AsyncIterator, Callable
 
@@ -9,6 +10,7 @@ from langgraph.types import Command
 
 from config import TestConfig
 from agents.graph import build_graph
+from agents.nodes import RunStopped
 from agents.state import TestState
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,11 @@ class TestOrchestrator:
         self._resume_in_flight: set[str] = (
             set()
         )  # 防重：同一 thread_id 不能同时 resume 两次
+        # 用户手动停止：thread_id → threading.Event
+        # 用 threading.Event 而非 asyncio.Event：start() 同步路径跑在
+        # asyncio.to_thread 的工作线程上，Event.is_set() 是 O(1) 原子读。
+        self._stop_flags: dict[str, threading.Event] = {}
+        self._active_runs: dict[str, dict[str, Any]] = {}  # tid → {started_at, mode}
 
     def set_event_callback(
         self, callback: Callable[[str, dict[str, Any]], None]
@@ -58,6 +65,52 @@ class TestOrchestrator:
                 self._event_callback(event_type, payload)
             except Exception:
                 pass
+
+    # ── 手动停止（用户主动中断） ──
+
+    def _register_run(self, thread_id: str) -> threading.Event:
+        """为一次 run 注册独立的 stop flag。返回 Event 供调用方挂到 ToolContext。"""
+        ev = threading.Event()
+        self._stop_flags[thread_id] = ev
+        self._active_runs[thread_id] = {
+            "started_at": datetime.now().isoformat(),
+            "mode": "run",
+        }
+        return ev
+
+    def _cleanup_run(self, thread_id: str) -> None:
+        """run 结束后清理 stop flag。绝不抛异常。"""
+        self._stop_flags.pop(thread_id, None)
+        self._active_runs.pop(thread_id, None)
+
+    def _attach_stop_event(self, ctx, ev: threading.Event) -> None:
+        """把 Event 挂到 ToolContext._stop_event，让节点快速检查。"""
+        if ctx is None:
+            return
+        try:
+            ctx._stop_event = ev
+        except Exception:
+            pass
+
+    def request_stop(self, thread_id: str, reason: str = "user_requested") -> bool:
+        """幂等：置位指定 thread 的停止标志。
+
+        返回 True 表示确实置位了新信号；False 表示无活跃 run 或信号已置位。
+        """
+        ev = self._stop_flags.get(thread_id)
+        if ev is None:
+            logger.info(
+                "request_stop: no active run for thread %s (already done?)", thread_id
+            )
+            return False
+        if not ev.is_set():
+            ev.set()
+            self._emit(
+                "status",
+                {"type": "stopping", "thread_id": thread_id, "reason": reason},
+            )
+            logger.info("request_stop: stop flag set for thread %s", thread_id)
+        return True
 
     # ── 同步执行 ──
 
@@ -91,6 +144,16 @@ class TestOrchestrator:
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+        # 注册 stop flag + 挂到 ctx（让节点 / _run_agent 子图能检查）
+        _stop_ev = self._register_run(thread_id)
+        self._attach_stop_event(ctx, _stop_ev)
+
+        # 广播 run_started（让前端能拿到 thread_id 来停止）
+        self._emit(
+            "run_started",
+            {"thread_id": thread_id, "started_at": datetime.now().isoformat()},
+        )
+
         initial_state: TestState = {
             "user_request": user_request,
             "app_package": app_package,
@@ -100,6 +163,7 @@ class TestOrchestrator:
             "messages": [],
             "conclusion": "",
             "status": "",
+            "_stop_requested": False,
         }
 
         config_ctx = {
@@ -113,9 +177,18 @@ class TestOrchestrator:
 
         run_log = start_run_log(thread_id)
 
+        _stopped = False
         try:
             final_state = self.graph.invoke(initial_state, config_ctx)
             self._state_cache[thread_id] = final_state
+            # 检测本次是否由 stop 触发：ctx._stop_event 已 set 或 state._stop_requested
+            _stopped = bool(
+                _stop_ev.is_set()
+                or (
+                    isinstance(final_state, dict)
+                    and bool(final_state.get("_stop_requested", False))
+                )
+            )
 
             # invoke() 不会抛 GraphInterrupt — 通过 get_state 检测中断
             snapshot = self.graph.get_state(config_ctx)
@@ -140,10 +213,39 @@ class TestOrchestrator:
                         "test_verdict": "inconclusive",
                         "verification_results": [],
                     }
-            return self._build_result(thread_id, final_state)
+            result = self._build_result(thread_id, final_state)
+            if _stopped:
+                self._emit(
+                    "run_stopped",
+                    {"thread_id": thread_id, "reason": "user_requested"},
+                )
+            return result
+        except RunStopped:
+            # 兜底：子图内 stop 检查没命中，start 在最外层兜住
+            self._emit(
+                "run_stopped",
+                {"thread_id": thread_id, "reason": "user_requested"},
+            )
+            return {
+                "thread_id": thread_id,
+                "status": "cancelled",
+                "mode": "run",
+                "conclusion": "ABORT: USER_STOPPED — 用户手动停止当前运行",
+                "steps": [],
+                "execution_status": "cancelled",
+                "test_verdict": "inconclusive",
+                "verification_results": [],
+            }
         except Exception as exc:
             return self._handle_exception(thread_id, exc)
         finally:
+            self._cleanup_run(thread_id)
+            # 清 ctx 上的 event 引用，避免下个 run 看到上一次的 flag
+            if ctx is not None:
+                try:
+                    ctx._stop_event = None
+                except Exception:
+                    pass
             run_log["cleanup"]()
 
     # ── 流式执行 (LangGraph astream_events) ──
@@ -159,6 +261,14 @@ class TestOrchestrator:
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+        # 清空上次测试的验证结果 + 注册 stop flag
+        from tools import get_tool_context as _gtc
+
+        _sctx = _gtc()
+        _reset_run_scoped(_sctx)
+        _stop_ev = self._register_run(thread_id)
+        self._attach_stop_event(_sctx, _stop_ev)
+
         initial_state: TestState = {
             "user_request": user_request,
             "app_package": app_package,
@@ -168,19 +278,21 @@ class TestOrchestrator:
             "messages": [],
             "conclusion": "",
             "status": "",
+            "_stop_requested": False,
         }
 
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
 
+        yield {
+            "type": "run_started",
+            "content": {
+                "thread_id": thread_id,
+                "started_at": datetime.now().isoformat(),
+            },
+        }
         yield {"type": "status", "content": f"开始执行: {user_request}"}
-
-        # 清空上次测试的验证结果
-        from tools import get_tool_context as _gtc
-
-        _sctx = _gtc()
-        _reset_run_scoped(_sctx)
 
         from config import start_run_log
 
@@ -189,6 +301,26 @@ class TestOrchestrator:
             async for event in self.graph.astream_events(
                 initial_state, config_ctx, version="v2"
             ):
+                # 关键：每个事件之间检查 stop，命中就主动退出流。
+                # 节点入口 / _run_agent 子图会负责把 _stop_requested 写到 state，
+                # 但 astream 还在跑——必须主动 cancel 当前 async generator。
+                if _stop_ev.is_set():
+                    logger.info(
+                        "start_stream: stop detected mid-stream for %s", thread_id
+                    )
+                    self._emit(
+                        "run_stopped",
+                        {"thread_id": thread_id, "reason": "user_requested"},
+                    )
+                    yield {
+                        "type": "run_stopped",
+                        "content": {
+                            "thread_id": thread_id,
+                            "reason": "user_requested",
+                        },
+                    }
+                    return
+
                 kind = event.get("event", "")
 
                 if kind == "on_chat_model_stream":
@@ -260,6 +392,15 @@ class TestOrchestrator:
                         "steps": final_state.values.get("step_history", []),
                     },
                 }
+            if _stop_ev.is_set():
+                self._emit(
+                    "run_stopped",
+                    {"thread_id": thread_id, "reason": "user_requested"},
+                )
+                yield {
+                    "type": "run_stopped",
+                    "content": {"thread_id": thread_id, "reason": "user_requested"},
+                }
 
         except Exception as exc:
             exc_msg = str(exc)
@@ -271,6 +412,12 @@ class TestOrchestrator:
                 logger.exception("Stream execution failed")
                 yield {"type": "error", "content": exc_msg}
         finally:
+            self._cleanup_run(thread_id)
+            if _sctx is not None:
+                try:
+                    _sctx._stop_event = None
+                except Exception:
+                    pass
             run_log["cleanup"]()
 
     # ── 恢复执行 ──
@@ -288,6 +435,10 @@ class TestOrchestrator:
 
         _sctx = _gtc()
         _reset_run_scoped(_sctx)
+        # resume 同样支持 stop：复用同 thread_id 的 flag（若仍存在），
+        # 不存在则新建一个，让用户能中断刚点完「确认」后继续运行的图。
+        _stop_ev = self._stop_flags.get(thread_id) or self._register_run(thread_id)
+        self._attach_stop_event(_sctx, _stop_ev)
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
@@ -318,6 +469,12 @@ class TestOrchestrator:
         except Exception as exc:
             return self._handle_exception(thread_id, exc)
         finally:
+            self._cleanup_run(thread_id)
+            if _sctx is not None:
+                try:
+                    _sctx._stop_event = None
+                except Exception:
+                    pass
             run_log["cleanup"]()
             self._resume_in_flight.discard(thread_id)
 
@@ -337,6 +494,8 @@ class TestOrchestrator:
 
         _sctx = _gtc()
         _reset_run_scoped(_sctx)
+        _stop_ev = self._stop_flags.get(thread_id) or self._register_run(thread_id)
+        self._attach_stop_event(_sctx, _stop_ev)
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
@@ -364,6 +523,23 @@ class TestOrchestrator:
                 async for event in self.graph.astream_events(
                     Command(resume=resume_value), config_ctx, version="v2"
                 ):
+                    # resume 路径同样支持 stop
+                    if _stop_ev.is_set():
+                        logger.info(
+                            "resume_stream: stop detected mid-stream for %s", thread_id
+                        )
+                        self._emit(
+                            "run_stopped",
+                            {"thread_id": thread_id, "reason": "user_requested"},
+                        )
+                        yield {
+                            "type": "run_stopped",
+                            "content": {
+                                "thread_id": thread_id,
+                                "reason": "user_requested",
+                            },
+                        }
+                        return
                     kind = event.get("event", "")
                     if kind == "on_chat_model_stream":
                         chunk = event.get("data", {}).get("chunk")
@@ -415,6 +591,12 @@ class TestOrchestrator:
             except Exception as exc:
                 yield {"type": "error", "content": str(exc)}
         finally:
+            self._cleanup_run(thread_id)
+            if _sctx is not None:
+                try:
+                    _sctx._stop_event = None
+                except Exception:
+                    pass
             run_log["cleanup"]()
             self._resume_in_flight.discard(thread_id)
 

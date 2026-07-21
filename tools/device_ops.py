@@ -201,6 +201,43 @@ def scroll_panel(panel: str = "left_navigation", direction: str = "down") -> str
 
 
 @tool
+def clear_app_data(package: str, confirmation: str = "") -> str:
+    """清理指定 App 的用户数据（不可恢复）。仅在获得明确确认后调用。
+
+    confirmation 必须严格为 ``CLEAR_DATA:<package>``，例如
+    ``CLEAR_DATA:com.example.app``。该操作会删除该 App 的账号、设置和本地文件。
+    """
+    normalized_package = (package or "").strip()
+    expected_confirmation = f"CLEAR_DATA:{normalized_package}"
+    if confirmation != expected_confirmation:
+        return (
+            "NEEDS_HUMAN: 清理 App 数据会删除账号、设置和本地文件；"
+            f"需明确确认 confirmation={expected_confirmation}"
+        )
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备，无法清理应用数据"
+    try:
+        result = ctx.device.clear_app_data(normalized_package)
+    except Exception as exc:
+        return f"ERROR: 清理应用数据失败: {exc}"
+    return f"OK: 已清理应用数据 || package={normalized_package}; result={result}"
+
+
+@tool
+def open_app_permission_settings(package: str) -> str:
+    """打开指定 App 的系统详情页，以便继续授予或修改相机、照片等权限。"""
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return "ERROR: 未连接 Android 设备，无法打开应用权限设置"
+    try:
+        result = ctx.device.open_app_permission_settings(package)
+    except Exception as exc:
+        return f"ERROR: 打开应用权限设置失败: {exc}"
+    return f"OK: 已打开应用权限设置 || package={package.strip()}; result={result}"
+
+
+@tool
 def launch_app(
     package: str,
     activity: str = "",
