@@ -53,12 +53,16 @@
               :loading="stopping"
               @click="$emit('stop')"
               round
-              plain
             >
-              停止运行
+              {{ stopping ? '正在停止...' : '停止运行' }}
             </el-button>
-            <el-button type="primary" :loading="executing && !stopping" @click="$emit('run', inputText)" round>
-              {{ executing ? '执行中...' : '开始执行' }}
+            <el-button
+              v-else
+              type="primary"
+              @click="$emit('run', inputText); inputText = ''"
+              round
+            >
+              开始执行
             </el-button>
           </div>
         </div>

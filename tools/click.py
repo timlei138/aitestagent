@@ -768,16 +768,29 @@ def click(
 
 
 def _check_switch_state(ctx: Any, target_el: Any) -> bool | None:
-    """点击开关后重新解析 UI 树，查找目标元素的 checked 状态。"""
+    """点击开关后重新解析 UI 树，查找目标元素的 checked 状态。
+
+    优先读 Switch 子控件的原生 checked（若有），其次读目标元素自身的 checked。
+    """
     try:
         if ctx.perceiver is None:
             return None
         # 清除缓存，强制重新解析
         ctx.perceiver._cache_sig = ""
         understanding = ctx.perceiver.perceive()
-        # 按 resource_id 或 bounds 匹配目标元素
         target_rid = getattr(target_el, "resource_id", "") or ""
         target_bounds = getattr(target_el, "bounds", (0, 0, 0, 0))
+        has_child = getattr(target_el, "has_switch_child", False)
+
+        # 第一优先：目标有 Switch 子控件 → 直接读子的原生 checked
+        if has_child:
+            for el in understanding.elements:
+                if el.role == "switch" and _bounds_overlap(target_bounds, el.bounds):
+                    checked = getattr(el, "checked", None)
+                    if checked is not None:
+                        return checked
+
+        # 第二优先：按 resource_id 或 bounds 匹配目标自身
         for el in understanding.elements:
             if target_rid and getattr(el, "resource_id", "") == target_rid:
                 return getattr(el, "checked", None)
@@ -786,6 +799,19 @@ def _check_switch_state(ctx: Any, target_el: Any) -> bool | None:
         return None
     except Exception:
         return None
+
+
+def _bounds_overlap(a: tuple, b: tuple) -> bool:
+    """b 的边界是否在 a 内部（含容差）。"""
+    if len(a) < 4 or len(b) < 4:
+        return False
+    margin = 4
+    return (
+        b[0] >= a[0] - margin
+        and b[1] >= a[1] - margin
+        and b[2] <= a[2] + margin
+        and b[3] <= a[3] + margin
+    )
 
 
 def _format_click_log(query: str, el: Any, strategy: str) -> str:

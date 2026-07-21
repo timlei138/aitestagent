@@ -3,14 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import secrets
 import threading
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.types import ASGIApp, Scope, Receive, Send
+from starlette.responses import JSONResponse
 
 from api.device_routes import router as device_router
 from api.device_routes import set_runner as set_device_runner
@@ -40,6 +45,68 @@ INDEX_FILE = FRONTEND_DIST_DIR / "index.html"
 PROJECT_ROOT = app_paths.BUNDLE_DIR
 
 app = FastAPI(title="AI 自动化测试 Agent")
+
+# ── 安全：持久化 Token，服务重启后复用，避免浏览器旧 cookie 被 403 ──
+_TOKEN_FILE = app_paths.DATA_DIR / ".auth_token"
+if _TOKEN_FILE.exists():
+    AUTH_TOKEN = _TOKEN_FILE.read_text(encoding="utf-8").strip()
+else:
+    AUTH_TOKEN = secrets.token_hex(32)
+    app_paths.ensure_dirs()
+    _TOKEN_FILE.write_text(AUTH_TOKEN, encoding="utf-8")
+AUTH_COOKIE_NAME = "auth_token"
+
+# ── CORS：仅允许同源请求（浏览器跨域防护）──
+_APP_PORT = os.environ.get("APP_PORT", "8080")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[f"http://127.0.0.1:{_APP_PORT}"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Auth 中间件：验证 Cookie Token，拦截未授权请求 ──
+class _AuthMiddleware:
+    """纯 ASGI 中间件，兼容 SSE 流式响应和静态文件。"""
+
+    __slots__ = ("app",)
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+
+        # 白名单：首页（设置 Cookie）和健康检查
+        if path in ("/", "/api/health"):
+            await self.app(scope, receive, send)
+            return
+
+        # 解析 Cookie
+        cookies: dict[str, str] = {}
+        for header_name, header_value in scope.get("headers", []):
+            if header_name == b"cookie":
+                for part in header_value.decode("latin-1").split("; "):
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        cookies[k] = v
+                break
+
+        if cookies.get(AUTH_COOKIE_NAME) != AUTH_TOKEN:
+            resp = JSONResponse({"detail": "Unauthorized"}, status_code=401)
+            await resp(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_AuthMiddleware)
+
 config = TestConfig.from_yaml(app_paths.get_config_yaml_path())
 ws_manager = WebSocketManager()
 
@@ -388,6 +455,9 @@ class IdentityConfirmRequest(BaseModel):
 @app.post("/api/run")
 async def run_test(request: RunRequest):
     """一步式执行（自动解析意图 + 执行）。"""
+    logging.getLogger(__name__).info(
+        "[stop-debug] HTTP /api/run hit, msg=%r", request.message[:60]
+    )
     # 设备连接前置检查
     if _device is None:
         return {
@@ -395,6 +465,9 @@ async def run_test(request: RunRequest):
             "message": "Android 设备未连接，请检查 USB/ADB 连接后重试",
         }
     ws_manager.bind_loop(asyncio.get_running_loop())
+    logging.getLogger(__name__).info(
+        "[stop-debug] HTTP /api/run bind_loop done, -> orchestrator.start"
+    )
 
     # 解析 app_package
     app_package, app_name = _quick_resolve_app(request.message)
@@ -404,6 +477,11 @@ async def run_test(request: RunRequest):
         user_request=request.message,
         app_package=app_package,
         app_name=app_name,
+    )
+    logging.getLogger(__name__).info(
+        "[stop-debug] HTTP /api/run orchestrator.start returned, status=%s tid=%s",
+        result.get("status"),
+        result.get("thread_id"),
     )
     return {"status": result.get("status", "error"), "data": result}
 
@@ -452,9 +530,15 @@ async def stop_run(request: StopRunRequest):
 
     幂等：未知 thread_id 或已结束的 run 都会返回 noop，不抛错。
     """
+    logging.getLogger(__name__).info(
+        "[stop-debug] HTTP /api/run/stop hit, thread_id=%s", request.thread_id
+    )
     if not request.thread_id:
         return {"status": "error", "message": "缺少 thread_id"}
     ok = orchestrator.request_stop(request.thread_id, reason="http_stop")
+    logging.getLogger(__name__).info(
+        "[stop-debug] HTTP /api/run/stop -> ok=%s", ok
+    )
     return {
         "status": "ok" if ok else "noop",
         "thread_id": request.thread_id,
@@ -492,13 +576,65 @@ async def confirm_element_identities(request: IdentityConfirmRequest):
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    """WebSocket: 接收 run / human_decision 消息。"""
+    """WebSocket: 接收 run / human_decision / stop_run 消息。
+
+    关键设计：stop_run 走独立 task，永远不让 asyncio.to_thread 阻塞 receive 循环。
+    修复背景：run/human_decision 通过 asyncio.to_thread 跑同步 graph（耗时可达数分钟），
+    原实现顺序 await 整个 task，导致 stop_run 消息进 buffer 但没人读，
+    现象是「点了停止要等 run 自然结束才停」。
+    """
+    # 本地回环地址直接放行；外部连接验证 auth cookie
+    client_host = (websocket.client.host if websocket.client else "") or ""
+    if client_host not in ("127.0.0.1", "localhost", "::1"):
+        ws_cookies = websocket.cookies
+        if ws_cookies.get(AUTH_COOKIE_NAME) != AUTH_TOKEN:
+            await websocket.close(code=4001, reason="Unauthorized")
+            return
+
     ws_manager.bind_loop(asyncio.get_running_loop())
     await ws_manager.connect(websocket)
+    _ws_log = logging.getLogger(__name__)
+
+    async def _handle_stop_run_async(tid: str) -> None:
+        """独立 task 处理 stop_run：request_stop 是 O(1) 同步快路径，但包装在 task
+        里保证主 receive 循环不被任何 await 阻塞。"""
+        _ws_log.info(
+            "[stop-debug] WS stop_run [independent task] -> orchestrator.request_stop tid=%s",
+            tid,
+        )
+        try:
+            ok = orchestrator.request_stop(tid, reason="ws_stop")
+        except Exception as exc:
+            _ws_log.warning("[stop-debug] request_stop raised: %s", exc)
+            ok = False
+        _ws_log.info(
+            "[stop-debug] WS stop_run [independent task] -> request_stop returned ok=%s",
+            ok,
+        )
+        try:
+            await ws_manager.send(
+                websocket,
+                {"type": "stop_ack", "content": {"ok": ok, "thread_id": tid}},
+            )
+        except (RuntimeError, Exception) as exc:
+            _ws_log.debug("[stop-debug] stop_ack send failed: %s", exc)
+
     try:
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type", "")
+            _ws_log.info(
+                "[stop-debug] WS RECV type=%s thread_id=%s payload=%s",
+                msg_type,
+                data.get("thread_id", "-"),
+                str(data)[:200],
+            )
+
+            # ── stop_run 走独立 task，绝不阻塞 receive 循环 ──
+            if msg_type == "stop_run":
+                tid = data.get("thread_id", "")
+                asyncio.create_task(_handle_stop_run_async(tid))
+                continue
 
             if msg_type == "run":
                 user_input = data.get("message", "")
@@ -513,11 +649,17 @@ async def websocket_chat(websocket: WebSocket):
                     )
                     continue
                 app_package, app_name = _quick_resolve_app(user_input)
+                _ws_log.info("[stop-debug] WS run -> orchestrator.start (to_thread)")
                 result = await asyncio.to_thread(
                     orchestrator.start,
                     user_request=user_input,
                     app_package=app_package,
                     app_name=app_name,
+                )
+                _ws_log.info(
+                    "[stop-debug] WS run -> orchestrator.start returned, status=%s tid=%s",
+                    result.get("status"),
+                    result.get("thread_id"),
                 )
                 try:
                     await ws_manager.send(
@@ -529,6 +671,10 @@ async def websocket_chat(websocket: WebSocket):
             elif msg_type == "human_decision":
                 thread_id = data.get("thread_id", "")
                 decision = data.get("decision", "跳过")
+                _ws_log.info(
+                    "[stop-debug] WS human_decision -> orchestrator.resume tid=%s",
+                    thread_id,
+                )
                 result = await asyncio.to_thread(
                     orchestrator.resume,
                     thread_id=thread_id,
@@ -537,20 +683,6 @@ async def websocket_chat(websocket: WebSocket):
                 try:
                     await ws_manager.send(
                         websocket, {"type": "result", "content": result}
-                    )
-                except RuntimeError:
-                    pass
-
-            elif msg_type == "stop_run":
-                thread_id = data.get("thread_id", "")
-                ok = orchestrator.request_stop(thread_id, reason="ws_stop")
-                try:
-                    await ws_manager.send(
-                        websocket,
-                        {
-                            "type": "stop_ack",
-                            "content": {"ok": ok, "thread_id": thread_id},
-                        },
                     )
                 except RuntimeError:
                     pass
@@ -689,7 +821,7 @@ app.mount(
 
 @app.get("/")
 async def index():
-    return FileResponse(
+    resp = FileResponse(
         str(INDEX_FILE),
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -697,6 +829,15 @@ async def index():
             "Expires": "0",
         },
     )
+    # 设置 auth cookie，浏览器/WebView 后续请求自动携带
+    resp.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=AUTH_TOKEN,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return resp
 
 
 # ── 辅助 ──

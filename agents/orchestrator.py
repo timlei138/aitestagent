@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from datetime import datetime
 from typing import Any, AsyncIterator, Callable
 
@@ -48,6 +49,7 @@ class TestOrchestrator:
         self._resume_in_flight: set[str] = (
             set()
         )  # 防重：同一 thread_id 不能同时 resume 两次
+        self._log_file_paths: dict[str, str] = {}  # thread_id → log 文件路径
         # 用户手动停止：thread_id → threading.Event
         # 用 threading.Event 而非 asyncio.Event：start() 同步路径跑在
         # asyncio.to_thread 的工作线程上，Event.is_set() 是 O(1) 原子读。
@@ -60,10 +62,18 @@ class TestOrchestrator:
         self._event_callback = callback
 
     def _emit(self, event_type: str, payload: dict[str, Any]) -> None:
+        # DEBUG(stop 排查)：每个 emit 都打，方便看后端事件流
+        logger.info(
+            "[stop-debug] _emit type=%s tid=%s payload=%s",
+            event_type,
+            payload.get("thread_id", "-") if isinstance(payload, dict) else "-",
+            str(payload)[:200],
+        )
         if self._event_callback:
             try:
                 self._event_callback(event_type, payload)
-            except Exception:
+            except Exception as exc:
+                logger.warning("[stop-debug] _emit callback raised: %s", exc)
                 pass
 
     # ── 手动停止（用户主动中断） ──
@@ -76,12 +86,20 @@ class TestOrchestrator:
             "started_at": datetime.now().isoformat(),
             "mode": "run",
         }
+        logger.info("[stop-debug] _register_run tid=%s active_runs=%d", thread_id, len(self._active_runs))
         return ev
 
     def _cleanup_run(self, thread_id: str) -> None:
-        """run 结束后清理 stop flag。绝不抛异常。"""
+        """run 结束后清理 stop flag。绝不抛异常。
+
+        立即清 _stop_flags / _active_runs——race 修复由
+        `request_stop` 的 ctx._stop_event fallback 覆盖：
+        resume 期间 ctx 上仍持有 Event 引用，request_stop 找不到 dict
+        时会直接 set ctx._stop_event，下个 LLM 节点 stop 检查能命中。
+        """
         self._stop_flags.pop(thread_id, None)
         self._active_runs.pop(thread_id, None)
+        logger.info("[stop-debug] _cleanup_run tid=%s active_runs=%d", thread_id, len(self._active_runs))
 
     def _attach_stop_event(self, ctx, ev: threading.Event) -> None:
         """把 Event 挂到 ToolContext._stop_event，让节点快速检查。"""
@@ -96,11 +114,46 @@ class TestOrchestrator:
         """幂等：置位指定 thread 的停止标志。
 
         返回 True 表示确实置位了新信号；False 表示无活跃 run 或信号已置位。
+
+        Race 修复：dict 找不到时（delayed_cleanup 已清掉），
+        仍尝试 set ctx._stop_event — resume 期间 ctx 还持有 Event 引用，
+        下一个 LLM 节点入口检查能命中。
         """
+        logger.info(
+            "[stop-debug] request_stop entry tid=%s reason=%s flags=%s",
+            thread_id,
+            reason,
+            list(self._stop_flags.keys()),
+        )
         ev = self._stop_flags.get(thread_id)
         if ev is None:
-            logger.info(
-                "request_stop: no active run for thread %s (already done?)", thread_id
+            # dict 里没了（grace 已被 daemon 清）— 但 ctx 上可能还挂着一个 Event
+            # (resume 期间 ctx._stop_event 仍指向该 Event 的 python 引用)
+            try:
+                from tools import get_tool_context
+                ctx = get_tool_context()
+                ctx_ev = getattr(ctx, "_stop_event", None)
+            except Exception:
+                ctx_ev = None
+            if ctx_ev is not None:
+                logger.info(
+                    "[stop-debug] request_stop: dict empty but ctx has Event for tid=%s, "
+                    "set it directly",
+                    thread_id,
+                )
+                if not ctx_ev.is_set():
+                    ctx_ev.set()
+                    self._emit(
+                        "status",
+                        {"type": "stopping", "thread_id": thread_id, "reason": reason},
+                    )
+                return True
+            logger.warning(
+                "[stop-debug] request_stop: NO active flag for tid=%s! "
+                "Already cleaned up? Front-end may have sent stop too late. "
+                "Known tids: %s",
+                thread_id,
+                list(self._stop_flags.keys()),
             )
             return False
         if not ev.is_set():
@@ -109,7 +162,9 @@ class TestOrchestrator:
                 "status",
                 {"type": "stopping", "thread_id": thread_id, "reason": reason},
             )
-            logger.info("request_stop: stop flag set for thread %s", thread_id)
+            logger.info("[stop-debug] request_stop: STOP FLAG SET for tid=%s", thread_id)
+        else:
+            logger.info("[stop-debug] request_stop: flag already set, ignore. tid=%s", thread_id)
         return True
 
     # ── 同步执行 ──
@@ -122,6 +177,11 @@ class TestOrchestrator:
         thread_id: str = "",
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
+        logger.info(
+            "[stop-debug] start() entry thread_id_in=%r user_request=%r",
+            thread_id,
+            user_request[:60],
+        )
         # 设备连接前置检查
         from tools import get_tool_context
 
@@ -143,12 +203,14 @@ class TestOrchestrator:
 
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger.info("[stop-debug] start() resolved thread_id=%s", thread_id)
 
         # 注册 stop flag + 挂到 ctx（让节点 / _run_agent 子图能检查）
         _stop_ev = self._register_run(thread_id)
         self._attach_stop_event(ctx, _stop_ev)
 
         # 广播 run_started（让前端能拿到 thread_id 来停止）
+        logger.info("[stop-debug] start() emitting run_started tid=%s", thread_id)
         self._emit(
             "run_started",
             {"thread_id": thread_id, "started_at": datetime.now().isoformat()},
@@ -176,6 +238,7 @@ class TestOrchestrator:
         from config import start_run_log
 
         run_log = start_run_log(thread_id)
+        self._log_file_paths[thread_id] = run_log["langchain_file"]
 
         _stopped = False
         try:
@@ -260,6 +323,7 @@ class TestOrchestrator:
         """流式执行测试 — 通过 astream_events 实时推送每个事件。"""
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        logger.info("[stop-debug] start_stream() entry tid=%s", thread_id)
 
         # 清空上次测试的验证结果 + 注册 stop flag
         from tools import get_tool_context as _gtc
@@ -285,6 +349,7 @@ class TestOrchestrator:
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
 
+        logger.info("[stop-debug] start_stream() yielding run_started tid=%s", thread_id)
         yield {
             "type": "run_started",
             "content": {
@@ -297,6 +362,7 @@ class TestOrchestrator:
         from config import start_run_log
 
         run_log = start_run_log(thread_id)
+        self._log_file_paths[thread_id] = run_log["langchain_file"]
         try:
             async for event in self.graph.astream_events(
                 initial_state, config_ctx, version="v2"
@@ -406,6 +472,7 @@ class TestOrchestrator:
             exc_msg = str(exc)
             if "GraphInterrupt" in type(exc).__name__:
                 interrupt_info = _extract_interrupt_info(exc)
+                interrupt_info["thread_id"] = thread_id
                 itype = interrupt_info.get("type", "need_human_approval")
                 yield {"type": itype, "content": interrupt_info}
             else:
@@ -424,6 +491,7 @@ class TestOrchestrator:
 
     def resume(self, thread_id: str, decision: Any) -> dict[str, Any]:
         """中断后恢复执行。decision: str (人工确认) 或 dict (计划编辑)。"""
+        logger.info("[stop-debug] resume() entry tid=%s", thread_id)
         if thread_id in self._resume_in_flight:
             logger.warning(
                 "Resume already in flight for thread %s, ignoring duplicate", thread_id
@@ -459,9 +527,14 @@ class TestOrchestrator:
             else:
                 resume_value = "confirm"
 
-        from config import start_run_log
+        from config import start_run_log, append_run_log
 
-        run_log = start_run_log(f"{thread_id}_resume")
+        _log_path = self._log_file_paths.get(thread_id, "")
+        if _log_path:
+            run_log = append_run_log(_log_path)
+        else:
+            run_log = start_run_log(thread_id)
+            self._log_file_paths[thread_id] = run_log["langchain_file"]
         try:
             final_state = self.graph.invoke(Command(resume=resume_value), config_ctx)
             self._state_cache[thread_id] = final_state
@@ -482,6 +555,7 @@ class TestOrchestrator:
         self, thread_id: str, decision: Any
     ) -> AsyncIterator[dict[str, Any]]:
         """流式恢复执行。decision: str 或 dict。"""
+        logger.info("[stop-debug] resume_stream() entry tid=%s", thread_id)
         if thread_id in self._resume_in_flight:
             logger.warning(
                 "Resume already in flight for thread %s, ignoring duplicate", thread_id
@@ -515,9 +589,14 @@ class TestOrchestrator:
             else:
                 resume_value = "confirm"
 
-        from config import start_run_log
+        from config import start_run_log, append_run_log
 
-        run_log = start_run_log(f"{thread_id}_resume")
+        _log_path = self._log_file_paths.get(thread_id, "")
+        if _log_path:
+            run_log = append_run_log(_log_path)
+        else:
+            run_log = start_run_log(thread_id)
+            self._log_file_paths[thread_id] = run_log["langchain_file"]
         try:
             try:
                 async for event in self.graph.astream_events(
@@ -621,14 +700,22 @@ class TestOrchestrator:
         exec_status = state.get("execution_status", "")
         verdict = state.get("test_verdict", "")
         if not exec_status:
-            if is_done:
+            # 用户手动停止：reporter 写入的 execution_status 是 Command 新增 key，
+            # LangGraph 不传播，必须从 _stop_requested 兜底识别。
+            if bool(state.get("_stop_requested", False)):
+                exec_status = "cancelled"
+            elif is_done:
                 exec_status = "completed"
-            elif is_abort and "MAX_TURNS" in conclusion:
+            elif is_abort and ("MAX_TURNS" in conclusion or "MAX_TOOL_CALLS" in conclusion):
                 exec_status = "exhausted"
             elif is_abort:
                 exec_status = "completed"
         if not verdict:
-            verdict = "passed" if is_done else "inconclusive"
+            # 停止时不强制 passed（即便 DONE 也按 inconclusive 记，避免把「中途报告完成」误判为通过）
+            if bool(state.get("_stop_requested", False)):
+                verdict = "inconclusive"
+            else:
+                verdict = "passed" if is_done else "inconclusive"
 
         result = {
             "thread_id": thread_id,
@@ -652,6 +739,7 @@ class TestOrchestrator:
         logger.info("Graph exception: %s", exc_msg)
         if "GraphInterrupt" in type(exc).__name__:
             info = _extract_interrupt_info(exc)
+            info["thread_id"] = thread_id
             self._emit(info.get("type", "need_human_approval"), info)
             return {
                 "thread_id": thread_id,

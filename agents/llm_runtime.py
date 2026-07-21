@@ -297,6 +297,19 @@ def _run_agent(
                     )
                 except Exception:
                     pass
+            # 每个工具调用前检查 stop——避免被长时间工具调用阻塞
+            if _ctx is not None:
+                _ev = getattr(_ctx, "_stop_event", None)
+                if _ev is not None and _ev.is_set():
+                    logger.info("_tools_node: stop flag hit before %s, breaking", name)
+                    outputs.append(
+                        ToolMessage(
+                            content="SKIPPED: 用户手动停止",
+                            tool_call_id=tc["id"],
+                        )
+                    )
+                    loop_break_reason = "USER_STOPPED"
+                    break
             t = _tool_map.get(name)
             try:
                 output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"

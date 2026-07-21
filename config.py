@@ -262,4 +262,49 @@ def start_run_log(run_id: str) -> dict:
         sys.stdout = _orig_stdout
         lc_file.close()
 
-    return {"langchain_file": lc_path, "cleanup": cleanup}
+    return {"langchain_file": str(lc_path), "cleanup": cleanup}
+
+
+def append_run_log(file_path: str) -> dict:
+    """续写到已有的 langchain 日志文件（resume 时使用）。"""
+    import os as _os
+
+    lc_file = open(file_path, "a", encoding="utf-8-sig")
+    _orig_stdout = sys.stdout
+    _orig_encoding = getattr(_orig_stdout, "encoding", "utf-8") or "utf-8"
+
+    # 写入分隔标记，方便区分 run 和 resume 阶段
+    _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lc_file.write(f"\n{'='*60}\n")
+    lc_file.write(f"=== RESUME {_ts}\n")
+    lc_file.write(f"{'='*60}\n\n")
+    lc_file.flush()
+
+    class _Tee:
+        def write(self, s):
+            _orig_stdout.write(s)
+            if lc_file and not lc_file.closed:
+                try:
+                    lc_file.write(s)
+                except Exception:
+                    pass
+
+        def flush(self):
+            _orig_stdout.flush()
+            if lc_file and not lc_file.closed:
+                try:
+                    lc_file.flush()
+                except Exception:
+                    pass
+
+        @property
+        def encoding(self):
+            return _orig_encoding
+
+    sys.stdout = _Tee()
+
+    def cleanup():
+        sys.stdout = _orig_stdout
+        lc_file.close()
+
+    return {"cleanup": cleanup}

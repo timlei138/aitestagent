@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 import subprocess
 import sys
 import threading
@@ -89,7 +90,28 @@ logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger("app_entry")
 
 HOST = "127.0.0.1"
-PORT = 8080
+
+
+def _find_free_port(start: int = 8080, end: int = 9000) -> int:
+    """在范围内查找第一个空闲端口，全部占用时由 OS 自动分配。"""
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((HOST, port))
+                return port
+            except OSError:
+                continue
+    # 范围全部占用，让 OS 选择
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, 0))
+        return s.getsockname()[1]
+
+
+PORT = _find_free_port()
+# 设置环境变量，api/server.py 中 CORS 等需要知道实际端口
+_os.environ["APP_PORT"] = str(PORT)
+
 TITLE = "AI 自动化测试 Agent"
 WINDOW_WIDTH = 1400
 WINDOW_HEIGHT = 900

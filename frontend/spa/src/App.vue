@@ -611,21 +611,30 @@ function handleEvent(data) {
   const type = data.type;
   const content = data.content || {};
   const wp = workspaceRef.value;
+  // ── DEBUG(stop 排查) ── 所有事件都打，方便看 WS 消息流
+  console.log("[evt]", type, JSON.stringify(content).slice(0, 240));
 
   switch (type) {
     // 手动停止相关事件
     case "run_started":
       // 后端广播的 thread_id，前端记下后才有「停止」按钮的发送目标
-      if (content.thread_id) currentThreadId.value = content.thread_id;
+      if (content.thread_id) {
+        currentThreadId.value = content.thread_id;
+        console.log("[stop-debug] currentThreadId <- run_started:", currentThreadId.value);
+      } else {
+        console.warn("[stop-debug] run_started has no thread_id!");
+      }
       break;
     case "run_stopped":
       // 后端确认停止完成：解锁 UI、清 thread_id
+      console.log("[stop-debug] run_stopped received, tid=", content.thread_id);
       stopping.value = false;
       currentThreadId.value = "";
       wp?.addEntry({ type: "log", icon: "⏹", text: "已停止当前运行" });
       break;
     case "stop_ack":
       // WS 通道对 stop_run 的立即 ack：仅记录日志，UI 等待 run_stopped
+      console.log("[stop-debug] stop_ack received:", content);
       if (content?.ok) {
         wp?.addEntry({ type: "log", icon: "⏹", text: "已发送停止信号，等待节点收尾..." });
       } else {
@@ -635,7 +644,7 @@ function handleEvent(data) {
       }
       break;
     case "status": wp?.addEntry({ type: "log", text: String(content) }); refreshSnapshot(); break;
-    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewVisible.value = true; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
+    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
     case "stream_token": wp?.onToken(); break;
@@ -660,7 +669,7 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; currentThreadId.value = ""; break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
       wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports(); break;
     case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; stopping.value = false; currentThreadId.value = ""; break;
@@ -671,15 +680,30 @@ function handleEvent(data) {
 // ═══════════ WebSocket 连接 ═══════════
 
 function connectWS() {
+  console.log("[ws-debug] connecting to ws://" + location.host + "/ws/chat");
   ws = new WebSocket(`ws://${location.host}/ws/chat`);
   ws.onopen = () => {
+    console.log("[ws-debug] ws OPEN, readyState=", ws.readyState);
     wsConnected.value = true;
   };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
+    console.log("[ws-debug] ws CLOSED, code=", ev.code, "reason=", ev.reason, "wasOpen=", wsConnected.value);
     wsConnected.value = false;
     setTimeout(connectWS, 3000);
   };
-  ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
+  ws.onerror = (ev) => {
+    console.warn("[ws-debug] ws ERROR", ev);
+  };
+  ws.onmessage = (e) => {
+    try {
+      const obj = JSON.parse(e.data);
+      // 顶层 type 方便过滤
+      console.log("[ws-debug] ws RECV type=" + (obj.type || "?") + " thread_id=" + ((obj.content && obj.content.thread_id) || "-"));
+      handleEvent(obj);
+    } catch (err) {
+      console.error("[ws-debug] ws message parse failed", err, e.data);
+    }
+  };
 }
 
 // ═══════════ 一键执行 ═══════════
@@ -706,9 +730,12 @@ async function startRun(text) {
   stopping.value = false;
 
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
+    console.log("[stop-debug] startRun -> WS send type=run, msg=", text.slice(0, 60));
     ws.send(JSON.stringify({ type: "run", message: text }));
+    console.log("[stop-debug] startRun WS sent. currentThreadId (will be set by run_started via broadcast)=", currentThreadId.value);
     return;
   }
+  console.log("[stop-debug] startRun -> HTTP fallback, wsConnected=", wsConnected.value, "ws=", !!ws, "readyState=", ws && ws.readyState);
   // HTTP fallback：thread_id 后端生成，只能等 result 里取
   try {
     const res = await fetch("/api/run", {
@@ -719,7 +746,10 @@ async function startRun(text) {
     const data = await res.json();
     const payload = data.data || data;
     // HTTP 同步路径：若后端返回的 payload 带 thread_id，记下供 stop 使用
-    if (payload && payload.thread_id) currentThreadId.value = payload.thread_id;
+    if (payload && payload.thread_id) {
+      currentThreadId.value = payload.thread_id;
+      console.log("[stop-debug] currentThreadId <- http_result:", currentThreadId.value);
+    }
     handleEvent({ type: "result", content: payload });
   } catch (e) {
     handleEvent({ type: "error", content: String(e) });
@@ -729,24 +759,68 @@ async function startRun(text) {
 // ═══════════ 手动停止 ═══════════
 // 幂等：重复点只发一次信号；UI 锁住直到后端回 run_stopped 或 stop_ack（未找到）
 async function stopRun() {
-  if (stopping.value) return;  // 已在停止中，防抖
+  console.log("[stop-debug] stopRun() entry, currentThreadId=", currentThreadId.value, "stopping=", stopping.value, "wsConnected=", wsConnected.value, "wsReady=", ws && ws.readyState);
+  if (stopping.value) { console.log("[stop-debug] stopRun: already stopping, skip"); return; }  // 已在停止中，防抖
   if (!currentThreadId.value) {
+    console.warn("[stop-debug] stopRun: currentThreadId is EMPTY! (run_started 没到？) wsConnected=", wsConnected.value, "wsReady=", ws && ws.readyState);
     ElMessage.warning("没有正在执行的运行");
     return;
   }
   stopping.value = true;
   const tid = currentThreadId.value;
   if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", icon: "⏹", text: "正在停止..." });
-  // 优先走 WS（实时性更好），fallback 走 HTTP
+
+  // ── WS send 防反压超时：800ms 内没收到 stop_ack 就走 HTTP ──
+  // 后端高频 broadcast（stream_token 频繁）会打满浏览器 OS TCP 接收 buffer，
+  // 导致 ws.send(stop_run) 字节卡在浏览器发送队列，几十秒到不了后端。
+  // 修复：WS 优先，但起 800ms 定时器，超时立即走 HTTP（HTTP 走新连接，不受反压影响）。
+  let _stopWatchdog = null;
+  const _onStopAckOrStopped = (type, payload) => {
+    if (type === "stop_ack" || type === "run_stopped") {
+      if (_stopWatchdog) { clearTimeout(_stopWatchdog); _stopWatchdog = null; }
+      window.removeEventListener("__stop_ack_internal__", _listener);
+    }
+  };
+  const _listener = (ev) => _onStopAckOrStopped(ev.detail.type, ev.detail.payload);
+  window.addEventListener("__stop_ack_internal__", _listener);
+  // 包装一层：handleEvent 收到 stop_ack/run_stopped 时派发自定义事件
+  // (直接复用同一 ws 状态就行，因为我们改的是另一层 fallback)
+
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
     try {
+      console.log("[stop-debug] stopRun -> WS send type=stop_run, tid=", tid);
       ws.send(JSON.stringify({ type: "stop_run", thread_id: tid }));
+      console.log("[stop-debug] stopRun WS sent, waiting stop_ack / run_stopped (watchdog 800ms)");
     } catch (e) {
+      console.error("[stop-debug] stopRun WS send failed:", e);
+      if (_stopWatchdog) clearTimeout(_stopWatchdog);
+      window.removeEventListener("__stop_ack_internal__", _listener);
       stopping.value = false;
       ElMessage.error("停止信号发送失败: " + e);
+      return;
     }
+    // 800ms 内 ack 不来就 fallback HTTP（新 TCP 连接，绕过反压）
+    _stopWatchdog = setTimeout(() => {
+      console.warn("[stop-debug] stopRun watchdog fired (800ms) -> HTTP fallback (TCP 反压保护)");
+      fetch("/api/run/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: tid }),
+      }).then((res) => res.json()).then((data) => {
+        console.log("[stop-debug] stopRun HTTP fallback response:", data);
+        if (data.status === "noop") {
+          // 后端没找到活跃 run（可能 stop 已被 graph 自然结束处理）——解锁 UI
+          stopping.value = false;
+          ElMessage.info("当前没有正在执行的运行");
+        }
+      }).catch((e) => {
+        console.error("[stop-debug] stopRun HTTP fallback failed:", e);
+        // 不解锁，让后端最终发 run_stopped 来解锁
+      });
+    }, 800);
     return;
   }
+  console.log("[stop-debug] stopRun -> HTTP fallback (WS not open), tid=", tid);
   // HTTP fallback
   try {
     const res = await fetch("/api/run/stop", {
@@ -755,12 +829,14 @@ async function stopRun() {
       body: JSON.stringify({ thread_id: tid }),
     });
     const data = await res.json();
+    console.log("[stop-debug] stopRun HTTP response:", data);
     if (data.status === "noop") {
       // 后端没找到活跃 run（可能刚结束）——解锁 UI
       stopping.value = false;
       ElMessage.info("当前没有正在执行的运行");
     }
   } catch (e) {
+    console.error("[stop-debug] stopRun HTTP failed:", e);
     stopping.value = false;
     ElMessage.error("停止信号发送失败: " + e);
   }

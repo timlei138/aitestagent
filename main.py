@@ -27,7 +27,7 @@ def main():
 
     server_parser = sub.add_parser("server", help="启动 Web 服务")
     server_parser.add_argument("--config", default="config.yaml")
-    server_parser.add_argument("--host", default="0.0.0.0")
+    server_parser.add_argument("--host", default="127.0.0.1")
     server_parser.add_argument("--port", type=int, default=8080)
 
     args = parser.parse_args()

@@ -890,17 +890,15 @@ class SmartPerceiver:
         node_to_el: dict[ET.Element, UIElement],
         parent_map: dict[ET.Element, ET.Element],
     ) -> list[UIElement]:
-        """父子去重: clickable 父容器 + 唯一可点击 Switch 子 → 合并为父。
+        """父子增强: clickable 父容器 + 唯一可点击 Switch 子 → 互相补充。
 
         场景：WLAN Item 整行（LinearLayout clickable=true）里包装一个 Switch（clickable=true）。
-        合并后仅保留父（点击区域大、更稳定），同时保留 Switch 的 associated_label、
-        checked 状态。子 Switch 从列表中移除。
+        父获得 checked / has_switch_child 标记（向后兼容），子保留在列表中供精确点击和状态检测。
         """
         # 反向查询: el -> node
         el_to_node: dict[int, ET.Element] = {id(el): n for n, el in node_to_el.items()}
 
         # 阅历所有 clickable 容器，查看子节点中是否有唯一可点击 Switch
-        to_remove: set[int] = set()
         for parent_el in elements:
             if not parent_el.clickable:
                 continue
@@ -925,18 +923,17 @@ class SmartPerceiver:
                 elif is_clickable_desc:
                     other_clickable_children.append(descendant)
 
-            # 仅合并“唯一 Switch 子 + 无其他 clickable 后代”场景
+            # 仅合并”唯一 Switch 子 + 无其他 clickable 后代”场景
             if len(switch_children) == 1 and not other_clickable_children:
                 _, switch_el = switch_children[0]
-                # 提升语义信息到父
+                # 提升语义信息到父（向后兼容）
                 if not parent_el.associated_label and switch_el.associated_label:
                     parent_el.associated_label = switch_el.associated_label
                 if parent_el.checked is None and switch_el.checked is not None:
                     parent_el.checked = switch_el.checked
                 parent_el.has_switch_child = True
-                # 移除子 Switch
-                to_remove.add(id(switch_el))
+                # 保留子 Switch：让 LLM 能精确点击 + _check_switch_state 直接读原生 checked
+                if not switch_el.associated_label and parent_el.associated_label:
+                    switch_el.associated_label = parent_el.associated_label
 
-        if not to_remove:
-            return elements
-        return [e for e in elements if id(e) not in to_remove]
+        return elements
