@@ -883,6 +883,11 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 total_tokens=int(token_usage.get("total_tokens", 0) or 0),
                 cached_input_tokens=int(token_usage.get("cached_input_tokens", 0) or 0),
                 llm_token_calls=int(token_usage.get("llm_calls", 0) or 0),
+                goal_json=json.dumps(
+                    state.get("goal_description") or {}, ensure_ascii=False
+                ),
+                run_type=state.get("_run_type", "normal"),
+                source_run_id=state.get("_source_run_id"),
             )
         except:
             pass

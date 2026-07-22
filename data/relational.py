@@ -87,7 +87,10 @@ class SqliteBackend(RelationalBackend):
                 output_tokens INTEGER DEFAULT 0,
                 total_tokens INTEGER DEFAULT 0,
                 cached_input_tokens INTEGER DEFAULT 0,
-                llm_token_calls INTEGER DEFAULT 0
+                llm_token_calls INTEGER DEFAULT 0,
+                goal_json TEXT NOT NULL DEFAULT '{}',
+                run_type TEXT NOT NULL DEFAULT 'normal',
+                source_run_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS human_decisions (
@@ -129,6 +132,19 @@ class SqliteBackend(RelationalBackend):
                 screen_height INTEGER DEFAULT 0,
                 bounds_json TEXT DEFAULT '',
                 UNIQUE(app_package, page_signature, alias)
+            );
+
+            CREATE TABLE IF NOT EXISTS test_cases (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source_run_id TEXT,
+                user_request TEXT,
+                app_package TEXT,
+                app_name TEXT,
+                goal_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                last_run_status TEXT NOT NULL DEFAULT '',
+                last_run_at TEXT NOT NULL DEFAULT ''
             );
         """)
         self._conn.commit()
@@ -215,6 +231,10 @@ class SqliteBackend(RelationalBackend):
         total_tokens: int = 0,
         cached_input_tokens: int = 0,
         llm_token_calls: int = 0,
+        # v3: 用例管理 / 复跑
+        goal_json: str = "{}",
+        run_type: str = "normal",
+        source_run_id: str | None = None,
     ) -> None:
         """快捷方法：记录一次测试执行。"""
         self.upsert(
@@ -247,6 +267,9 @@ class SqliteBackend(RelationalBackend):
                 "total_tokens": total_tokens,
                 "cached_input_tokens": cached_input_tokens,
                 "llm_token_calls": llm_token_calls,
+                "goal_json": goal_json,
+                "run_type": run_type,
+                "source_run_id": source_run_id,
                 "created_at": datetime.now().isoformat(),
             },
             key="id",
@@ -278,7 +301,10 @@ class SqliteBackend(RelationalBackend):
             "exact_click_rate, fuzzy_click_rate, "
             "rag_query_count, rag_same_app_ratio, rag_empty_hit_rate, "
             "rag_cross_app_used_count, "
-            "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls "
+            "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls, "
+            "COALESCE(goal_json,'{}') AS goal_json, "
+            "COALESCE(run_type,'normal') AS run_type, "
+            "source_run_id "
             "FROM test_runs "
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
@@ -314,6 +340,11 @@ class SqliteBackend(RelationalBackend):
             d["total_tokens"] = int(d.get("total_tokens", 0) or 0)
             d["cached_input_tokens"] = int(d.get("cached_input_tokens", 0) or 0)
             d["llm_token_calls"] = int(d.get("llm_token_calls", 0) or 0)
+            d["goal_json"] = d.get("goal_json") or "{}"
+            d["run_type"] = d.get("run_type") or "normal"
+            # source_run_id 保持为 None 或字符串
+            if d.get("source_run_id") is None:
+                d["source_run_id"] = None
             result.append(d)
         return result
 
@@ -328,7 +359,10 @@ class SqliteBackend(RelationalBackend):
             "exact_click_rate, fuzzy_click_rate, "
             "rag_query_count, rag_same_app_ratio, rag_empty_hit_rate, "
             "rag_cross_app_used_count, "
-            "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls "
+            "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls, "
+            "COALESCE(goal_json,'{}') AS goal_json, "
+            "COALESCE(run_type,'normal') AS run_type, "
+            "source_run_id "
             "FROM test_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
@@ -358,6 +392,11 @@ class SqliteBackend(RelationalBackend):
         d["total_tokens"] = int(d.get("total_tokens", 0) or 0)
         d["cached_input_tokens"] = int(d.get("cached_input_tokens", 0) or 0)
         d["llm_token_calls"] = int(d.get("llm_token_calls", 0) or 0)
+        d["goal_json"] = d.get("goal_json") or "{}"
+        d["run_type"] = d.get("run_type") or "normal"
+        # source_run_id 保持为 None 或字符串，不强制转为空字符串
+        if d.get("source_run_id") is None:
+            d["source_run_id"] = None
         verification_results = json.loads(d.pop("verification_json", "[]") or "[]")
         if isinstance(verification_results, list):
             for item in verification_results:
@@ -560,6 +599,104 @@ class SqliteBackend(RelationalBackend):
                     "total_count": len(steps),
                 }
         return best
+
+    # ── v3: 用例管理 CRUD ──
+
+    def create_test_case(
+        self,
+        name: str,
+        user_request: str = "",
+        app_package: str = "",
+        app_name: str = "",
+        goal_json: str = "{}",
+        source_run_id: str | None = None,
+    ) -> str:
+        """创建用例。返回 case_id。"""
+        import uuid
+
+        case_id = uuid.uuid4().hex[:12]
+        now = datetime.now().isoformat()
+        self.insert(
+            "test_cases",
+            {
+                "id": case_id,
+                "name": name,
+                "source_run_id": source_run_id,
+                "user_request": user_request,
+                "app_package": app_package,
+                "app_name": app_name,
+                "goal_json": goal_json,
+                "created_at": now,
+                "last_run_status": "",
+                "last_run_at": "",
+            },
+        )
+        return case_id
+
+    def list_test_cases(self, q: str = "") -> list[dict[str, Any]]:
+        """查询用例列表，支持 ?q= 名称模糊过滤。"""
+        if q:
+            rows = self._conn.execute(
+                "SELECT * FROM test_cases WHERE name LIKE ? ORDER BY created_at DESC",
+                (f"%{q}%",),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM test_cases ORDER BY created_at DESC"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_test_case(self, case_id: str) -> dict[str, Any] | None:
+        """查询单条用例。"""
+        row = self._conn.execute(
+            "SELECT * FROM test_cases WHERE id = ?", (case_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_test_case(self, case_id: str, data: dict[str, Any]) -> bool:
+        """编辑用例计划。data 可含 name / goal_json / user_request / app_package / app_name。"""
+        allowed = {"name", "goal_json", "user_request", "app_package", "app_name"}
+        updates = {k: v for k, v in data.items() if k in allowed}
+        if not updates:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [case_id]
+        self._conn.execute(
+            f"UPDATE test_cases SET {sets} WHERE id = ?", values
+        )
+        self._conn.commit()
+        return True
+
+    def delete_test_case(self, case_id: str) -> bool:
+        """删除单条用例。"""
+        row = self._conn.execute(
+            "SELECT id FROM test_cases WHERE id = ?", (case_id,)
+        ).fetchone()
+        if not row:
+            return False
+        self._conn.execute("DELETE FROM test_cases WHERE id = ?", (case_id,))
+        self._conn.commit()
+        return True
+
+    def batch_delete_test_cases(self, ids: list[str]) -> int:
+        """批量删除用例。返回删除数量。"""
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        cursor = self._conn.execute(
+            f"DELETE FROM test_cases WHERE id IN ({placeholders})", ids
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
+    def record_case_run(self, case_id: str, status: str, at: str = "") -> None:
+        """更新用例的最后运行状态和时间。"""
+        now = at or datetime.now().isoformat()
+        self._conn.execute(
+            "UPDATE test_cases SET last_run_status = ?, last_run_at = ? WHERE id = ?",
+            (status, now, case_id),
+        )
+        self._conn.commit()
 
 
 # ── 模块级辅助函数 ──

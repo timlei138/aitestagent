@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -24,6 +25,8 @@ from api.apps_routes import router as apps_router
 from api.apps_routes import resolve_app as _resolve_app_from_yaml
 from api.knowledge_routes import router as knowledge_router
 from api.config_routes import router as config_router
+from api.test_cases_routes import router as test_cases_router
+from api.test_cases_routes import set_backends as _set_tc_backends
 from api.knowledge_routes import set_knowledge_base as _set_kb_for_routes
 from api.websocket_manager import WebSocketManager
 from config import TestConfig, resolve_perception_mode
@@ -306,6 +309,7 @@ set_device_runner(orchestrator)
 # ── 关系型数据库 ──
 _db = create_relational_db(config)
 set_relational_db(_db)
+_set_tc_backends(orchestrator, _db)
 
 # ── 事件广播 ──
 orchestrator.set_event_callback(
@@ -431,6 +435,7 @@ app.include_router(device_router)
 app.include_router(apps_router)
 app.include_router(knowledge_router)
 app.include_router(config_router)
+app.include_router(test_cases_router)
 _set_kb_for_routes(_kb)
 
 
@@ -574,6 +579,12 @@ async def confirm_element_identities(request: IdentityConfirmRequest):
     return {"status": "success", "confirmed": count}
 
 
+@app.get("/api/runs/active")
+async def get_active_runs():
+    """供前端页面刷新时恢复 executing 状态（v3 R16）。"""
+    return {"active": bool(orchestrator._active_runs)}
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     """WebSocket: 接收 run / human_decision / stop_run 消息。
@@ -686,6 +697,66 @@ async def websocket_chat(websocket: WebSocket):
                     )
                 except RuntimeError:
                     pass
+
+            # ── v3: 复跑 / 用例运行 ──
+            elif msg_type == "rerun":
+                run_id = data.get("run_id", "")
+                goal = data.get("goal") or {}
+                run = _db.get_test_run(run_id) if _db and run_id else None
+                result = await asyncio.to_thread(
+                    orchestrator.start,
+                    user_request=run.get("user_request", "") if run else "",
+                    app_package=run.get("app_package", "") if run else "",
+                    app_name=run.get("app_name", "") if run else "",
+                    goal_description=goal,
+                    reuse_plan=True,
+                    run_type="rerun",
+                    source_run_id=run_id if run else None,
+                )
+                try:
+                    await ws_manager.send(
+                        websocket, {"type": "result", "content": result}
+                    )
+                except RuntimeError:
+                    pass
+
+            elif msg_type == "run_case":
+                case_id = data.get("case_id", "")
+                case = _db.get_test_case(case_id) if _db and case_id else None
+                if not case:
+                    await ws_manager.send(
+                        websocket,
+                        {"type": "error", "content": f"用例不存在: {case_id}"},
+                    )
+                else:
+                    import json as _json
+
+                    goal = _json.loads(case.get("goal_json") or "{}")
+                    result = await asyncio.to_thread(
+                        orchestrator.start,
+                        user_request=case.get("user_request", ""),
+                        app_package=case.get("app_package", ""),
+                        app_name=case.get("app_name", ""),
+                        goal_description=goal,
+                        reuse_plan=True,
+                        run_type="rerun",
+                        source_run_id=case_id,
+                    )
+                    # 更新用例运行状态
+                    if result.get("status") != "busy":
+                        st = result.get("execution_status", "error")
+                        vd = result.get("test_verdict", "inconclusive")
+                        _db.record_case_run(
+                            case_id,
+                            f"{st}/{vd}",
+                            datetime.now().isoformat(),
+                        )
+                    try:
+                        await ws_manager.send(
+                            websocket, {"type": "result", "content": result}
+                        )
+                    except RuntimeError:
+                        pass
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)

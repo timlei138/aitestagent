@@ -15,6 +15,10 @@
           <el-icon><i class="nav-icon">📊</i></el-icon>
           <span>报告中心</span>
         </el-menu-item>
+        <el-menu-item index="cases">
+          <el-icon><i class="nav-icon">📋</i></el-icon>
+          <span>用例中心</span>
+        </el-menu-item>
         <el-menu-item index="apps">
           <el-icon><i class="nav-icon">📱</i></el-icon>
           <span>APP 管理</span>
@@ -69,7 +73,7 @@
       <el-header class="topbar">
         <el-breadcrumb separator="/">
           <el-breadcrumb-item>AI 测试平台</el-breadcrumb-item>
-          <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'apps' ? 'APP 管理' : activeMenu === 'settings' ? '设置' : '知识库' }}</el-breadcrumb-item>
+          <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'cases' ? '用例中心' : activeMenu === 'apps' ? 'APP 管理' : activeMenu === 'settings' ? '设置' : '知识库' }}</el-breadcrumb-item>
         </el-breadcrumb>
         <div class="header-tags">
           <el-tag :type="wsConnected ? 'success' : 'info'" size="small" effect="light" round>
@@ -83,46 +87,77 @@
         <WorkspacePanel ref="workspaceRef" :executing="executing" :stopping="stopping" @run="startRun" @stop="stopRun" />
       </el-main>
 
-      <!-- ═══════════ 报告中心 ═══════════ -->
+      <!-- ═══════════ 报告 ═══════════ -->
       <el-main class="main-content" v-show="activeMenu === 'reports'">
         <section class="panel">
           <div class="panel-header">
-            <h3 class="panel-title">测试报告中心</h3>
+            <h3 class="panel-title">报告中心</h3>
             <el-button size="small" @click="loadReports">刷新</el-button>
           </div>
           <el-table :data="reportTasks" empty-text="暂无报告" @row-click="openReportDetail" row-style="cursor:pointer">
             <el-table-column prop="created_at" label="执行时间" min-width="160">
               <template #default="{ row }">{{ (row.created_at || '').replace('T', ' ').substring(0, 19) }}</template>
             </el-table-column>
-            <el-table-column prop="user_request" label="测试用例" min-width="200" show-overflow-tooltip />
-            <el-table-column prop="total_steps" label="步骤数" width="80" />
-            <el-table-column prop="duration_seconds" label="耗时(s)" width="90" />
-            <el-table-column prop="llm_call_count" label="LLM调用" width="90" />
-            <el-table-column label="Token消耗" width="100">
+            <el-table-column prop="user_request" label="测试用例" min-width="180" show-overflow-tooltip />
+            <el-table-column label="类型" width="80">
               <template #default="{ row }">
-                {{ fmtTokens(row.total_tokens) }}
+                <el-tag v-if="row.run_type === 'rerun'" size="small" color="#6366F1" effect="dark">复跑</el-tag>
+                <el-tag v-else size="small" type="info" effect="plain">普通</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="执行状态" width="100">
+            <el-table-column prop="total_steps" label="步骤" width="60" />
+            <el-table-column prop="duration_seconds" label="耗时(s)" width="80" />
+            <el-table-column prop="llm_call_count" label="LLM" width="60" />
+            <el-table-column label="Token" width="85">
+              <template #default="{ row }">{{ fmtTokens(row.total_tokens) }}</template>
+            </el-table-column>
+            <el-table-column label="状态" width="90">
               <template #default="{ row }">
                 <el-tag :type="execStatusType(row.execution_status)" size="small">
                   {{ execStatusLabel(row.execution_status) }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="测试结论" width="90">
+            <el-table-column label="结论" width="80">
               <template #default="{ row }">
                 <el-tag :type="verdictType(row.test_verdict)" size="small">
                   {{ verdictLabel(row.test_verdict) }}
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="90" fixed="right">
+            <el-table-column label="操作" width="230" fixed="right">
               <template #default="{ row }">
-                <el-button size="small" text type="danger" @click.stop="deleteReport(row)">删除</el-button>
+                <div style="white-space:nowrap">
+                <el-button size="small" text type="primary"
+                  :disabled="!hasGoal(row) || executing"
+                  :title="!hasGoal(row) ? '该报告无可用计划，请重新执行以生成计划' : executing ? '请等待当前运行结束' : ''"
+                  @click.stop="rerunReport(row)">复跑</el-button>
+                <el-button v-if="isSuccess(row) && row.run_type !== 'rerun'" size="small" text type="success"
+                  :disabled="executing"
+                  @click.stop="saveAsCase(row)">保存为用例</el-button>
+                <el-button size="small" text type="danger"
+                  :disabled="executing"
+                  @click.stop="deleteReport(row)">删除</el-button>
+                </div>
               </template>
             </el-table-column>
           </el-table>
+        </section>
+      </el-main>
+
+      <!-- ═══════════ 用例中心 ═══════════ -->
+      <el-main class="main-content" v-show="activeMenu === 'cases'">
+        <section class="panel">
+          <div class="panel-header">
+            <h3 class="panel-title">用例中心</h3>
+          </div>
+          <TestCasePanel
+            ref="testCasePanelRef"
+            :reports="reportTasks"
+            :executing="executing"
+            @run-case="runCase"
+            @refresh="loadReports"
+          />
         </section>
       </el-main>
 
@@ -449,9 +484,11 @@ import ReportDetail from "./components/ReportDetail.vue";
 import KnowledgePanel from "./components/KnowledgePanel.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
 import DeviceFloat from "./components/DeviceFloat.vue";
+import TestCasePanel from "./components/TestCasePanel.vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 const activeMenu = ref("workspace");
+const testCasePanelRef = ref(null);
 const executing = ref(false);
 // 手动停止：UI 收到 stop_ack 或 run_stopped 后清回 false；重复点击时防抖
 const stopping = ref(false);
@@ -573,6 +610,54 @@ function execStatusLabel(s) { return (execStatusMap[s] || execStatusMap.error).l
 function execStatusType(s)  { return (execStatusMap[s] || execStatusMap.error).type; }
 function verdictLabel(s)    { return (verdictMap[s] || verdictMap.inconclusive).label; }
 function verdictType(s)     { return (verdictMap[s] || verdictMap.inconclusive).type; }
+
+function isSuccess(row) {
+  return row.execution_status === 'completed' && row.test_verdict === 'passed';
+}
+function hasGoal(row) {
+  if (!row) return false;
+  const gj = row.goal_json;
+  // 处理五种空值：undefined/null/""/"{}"/{}
+  if (gj === undefined || gj === null) return false;
+  if (gj === '""' || gj === '') return false;
+  try {
+    const g = typeof gj === 'string' ? JSON.parse(gj) : gj;
+    if (!g || (typeof g === 'object' && Object.keys(g).length === 0)) return false;
+    return !!(g.goal || (g.target_pages && g.target_pages.length) || (g.verification && g.verification.length));
+  } catch { return false; }
+}
+async function rerunReport(row) {
+  if (!hasGoal(row) || executing.value) return;
+  const goal = typeof row.goal_json === 'string' ? JSON.parse(row.goal_json) : row.goal_json;
+  if (!wsConnected.value || !ws || ws.readyState !== WebSocket.OPEN) {
+    ElMessage.error('请先连接 WebSocket 后再复跑');
+    return;
+  }
+  executing.value = true;
+  ws.send(JSON.stringify({ type: 'rerun', run_id: row.id, goal }));
+}
+async function saveAsCase(row) {
+  if (!isSuccess(row)) return;
+  try {
+    const res = await fetch('/api/test_cases', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ run_id: row.id, name: (row.user_request || '').substring(0, 40) }),
+    });
+    const data = await res.json();
+    if (data.status === 'ok') { ElMessage.success('已保存为用例'); loadReports(); }
+    else { ElMessage.error(data.message || '保存失败'); }
+  } catch (e) { ElMessage.error('保存失败: ' + e); }
+}
+function runCase(caseId) {
+  if (executing.value) return;
+  if (!wsConnected.value || !ws || ws.readyState !== WebSocket.OPEN) {
+    ElMessage.error('请先连接 WebSocket 后再运行用例');
+    return;
+  }
+  executing.value = true;
+  ws.send(JSON.stringify({ type: 'run_case', case_id: caseId }));
+}
+
 function hasExtraConclusion(report) {
   if (!report.conclusion) return false;
   // 只有最后一个步骤有 observation，且结论与它不同时，才需要显示结论段
@@ -624,11 +709,13 @@ function handleEvent(data) {
       } else {
         console.warn("[stop-debug] run_started has no thread_id!");
       }
+      executing.value = true;
       break;
     case "run_stopped":
       // 后端确认停止完成：解锁 UI、清 thread_id
       console.log("[stop-debug] run_stopped received, tid=", content.thread_id);
       stopping.value = false;
+      executing.value = false;
       currentThreadId.value = "";
       wp?.addEntry({ type: "log", icon: "⏹", text: "已停止当前运行" });
       break;
@@ -670,8 +757,12 @@ function handleEvent(data) {
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
       if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
+if (activeMenu.value === 'cases') loadReports();
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
-      wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports(); break;
+      wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports();
+      // 如果在用例中心，运行结束后刷新用例列表（更新 last_run_status）
+      if (activeMenu.value === 'cases') testCasePanelRef.value?.fetchCases();
+      break;
     case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; stopping.value = false; currentThreadId.value = ""; break;
     default: wp?.addEntry({ type: "log", text: "[" + type + "] " + JSON.stringify(content).substring(0, 200) });
   }
@@ -1389,6 +1480,9 @@ onMounted(() => {
   loadApps();
   loadKbList();
   fetchConfig();
+  fetch('/api/runs/active').then(r => r.json()).then(d => {
+    if (d.active) executing.value = true;
+  }).catch(() => {});
 });
 
 </script>

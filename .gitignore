@@ -225,6 +225,7 @@ storage/screenshots/
 storage/test_history.db
 storage/test_history.db-shm
 storage/test_history.db-wal
+.codebuddy/
 
 # Local sensitive config (API keys)
 config.local.yaml

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def _reset_run_scoped(ctx) -> None:
-    """重置 run 级累加器：验证结果 / M4 确定性核实 / O1 token 统计。
+    """重置 run 级累加器：验证结果 / M4 确定性核实 / O1 token 统计 / RAG 缓存。
     每次新执行前调用，避免跨 run 数据串扰。绝不抛异常。"""
     if not ctx:
         return
@@ -31,6 +31,19 @@ def _reset_run_scoped(ctx) -> None:
         if isinstance(tu, dict):
             for k in list(tu.keys()):
                 tu[k] = 0
+        # R1: RAG 缓存/计数 — 复跑跳过 planner 时这些也不会被重置，必须在此清理
+        if hasattr(ctx, "_rag_query_cache"):
+            ctx._rag_query_cache.clear()
+        if hasattr(ctx, "_run_tag"):
+            ctx._run_tag = ""
+        for _rag_attr in (
+            "_rag_query_count",
+            "_rag_same_app_count",
+            "_rag_cross_app_count",
+            "_rag_empty_hit_count",
+        ):
+            if hasattr(ctx, _rag_attr):
+                setattr(ctx, _rag_attr, 0)
     except Exception:
         pass
 
@@ -175,6 +188,10 @@ class TestOrchestrator:
         app_package: str = "",
         app_name: str = "",
         thread_id: str = "",
+        goal_description: dict | None = None,
+        reuse_plan: bool = False,
+        run_type: str = "normal",
+        source_run_id: str | None = None,
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
         logger.info(
@@ -182,11 +199,49 @@ class TestOrchestrator:
             thread_id,
             user_request[:60],
         )
+        # F7 并发保护：已有运行在进行则拒绝（先于设备检查和注册）
+        if self._active_runs:
+            self._emit(
+                "error", {"message": "已有运行在进行，请等待其结束后重试"}
+            )
+            return {
+                "thread_id": thread_id or "",
+                "status": "busy",
+                "execution_status": "busy",
+                "test_verdict": "inconclusive",
+                "verification_results": [],
+                "mode": "run",
+                "conclusion": "BUSY: 已有运行在进行，请等待其结束后重试",
+                "steps": [],
+            }
+
         # 设备连接前置检查
         from tools import get_tool_context
 
         ctx = get_tool_context()
         _reset_run_scoped(ctx)
+
+        # R20: 复跑时检查应用是否已安装（仅在 reuse_plan=True 且设备在线时）
+        if reuse_plan and app_package and getattr(ctx, "device", None) is not None:
+            try:
+                import subprocess as _sp
+
+                _r = _sp.run(
+                    ["adb", "shell", "pm", "list", "packages", app_package],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if app_package not in (_r.stdout or ""):
+                    logger.warning(
+                        "R20: 应用 %s 在设备上未安装，复跑将注入事实提示 LLM", app_package
+                    )
+                    if goal_description is None:
+                        goal_description = {}
+                    facts = goal_description.get("_device_facts", [])
+                    facts.append(f"应用 {app_package} 在当前设备上未安装/无法启动")
+                    goal_description["_device_facts"] = facts
+            except Exception as exc:
+                logger.error("R20: 应用可启动性检查失败: %s", exc)
+
         if getattr(ctx, "device", None) is None:
             msg = "Android 设备未连接，请检查 USB/ADB 连接后重试"
             self._emit("error", {"message": msg})
@@ -220,12 +275,25 @@ class TestOrchestrator:
             "user_request": user_request,
             "app_package": app_package,
             "app_name": app_name,
-            "goal_description": {},
+            "goal_description": goal_description or {},
             "step_history": [],
             "messages": [],
+            "step_times": [],
+            "started_at": datetime.now().isoformat(),
             "conclusion": "",
             "status": "",
             "_stop_requested": False,
+            "budget_violation_count": 0,
+            "llm_call_count": 0,
+            "tool_call_400_count": 0,
+            "tool_call_400_rate": 0.0,
+            "_rag_injected_once": False,
+            "_rag_last_app_package": "",
+            "_knowledge_query_hint_injected": False,
+            "_last_page_app_key": "",
+            "_last_clickable_count": 0,
+            "_run_type": run_type or "normal",
+            "_source_run_id": source_run_id,
         }
 
         config_ctx = {
@@ -319,30 +387,60 @@ class TestOrchestrator:
         app_package: str = "",
         app_name: str = "",
         thread_id: str = "",
+        goal_description: dict | None = None,
+        reuse_plan: bool = False,
+        run_type: str = "normal",
+        source_run_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """流式执行测试 — 通过 astream_events 实时推送每个事件。"""
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         logger.info("[stop-debug] start_stream() entry tid=%s", thread_id)
 
-        # 清空上次测试的验证结果 + 注册 stop flag
+        # F7 并发保护 + 设备检查
         from tools import get_tool_context as _gtc
 
         _sctx = _gtc()
         _reset_run_scoped(_sctx)
+
+        if getattr(_sctx, "device", None) is None:
+            yield {"type": "error", "content": "Android 设备未连接，请检查 USB/ADB 连接后重试"}
+            return
+        if self._active_runs:
+            yield {"type": "error", "content": "已有运行在进行，请等待其结束后重试"}
+            return
+
         _stop_ev = self._register_run(thread_id)
         self._attach_stop_event(_sctx, _stop_ev)
+
+        self._emit(
+            "run_started",
+            {"thread_id": thread_id, "started_at": datetime.now().isoformat()},
+        )
 
         initial_state: TestState = {
             "user_request": user_request,
             "app_package": app_package,
             "app_name": app_name,
-            "goal_description": {},
+            "goal_description": goal_description or {},
             "step_history": [],
             "messages": [],
+            "step_times": [],
+            "started_at": datetime.now().isoformat(),
             "conclusion": "",
             "status": "",
             "_stop_requested": False,
+            "budget_violation_count": 0,
+            "llm_call_count": 0,
+            "tool_call_400_count": 0,
+            "tool_call_400_rate": 0.0,
+            "_rag_injected_once": False,
+            "_rag_last_app_package": "",
+            "_knowledge_query_hint_injected": False,
+            "_last_page_app_key": "",
+            "_last_clickable_count": 0,
+            "_run_type": run_type or "normal",
+            "_source_run_id": source_run_id,
         }
 
         config_ctx = {

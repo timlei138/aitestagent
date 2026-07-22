@@ -133,13 +133,23 @@ def route_after_plan_review(state: TestState) -> str:
     return "agent"
 
 
+def route_start(state: TestState) -> str:
+    """复跑预置了 goal_description 时跳过 planner 与 plan_review，直达 agent。"""
+    goal = state.get("goal_description") or {}
+    if goal.get("goal") or goal.get("target_pages") or goal.get("verification"):
+        return "agent"
+    return "planner"
+
+
 def build_graph(config: TestConfig) -> StateGraph:
     g = StateGraph(TestState)
     g.add_node("planner", planner_node)
     g.add_node("plan_review", plan_review_node)
     g.add_node("agent", agent_node)
     g.add_node("reporter", reporter_node)
-    g.add_edge(START, "planner")
+    g.add_conditional_edges(
+        START, route_start, {"planner": "planner", "agent": "agent"}
+    )
     g.add_edge("planner", "plan_review")
     g.add_conditional_edges(
         "plan_review",

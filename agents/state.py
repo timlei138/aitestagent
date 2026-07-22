@@ -55,3 +55,5 @@ class TestState(TypedDict, total=False):
     # 用户手动停止标志（由 orchestrator.request_stop 置位，节点入口检查）。
     # 命中时让图收敛到 reporter 写 cancelled，不影响其他状态的正常流转。
     _stop_requested: bool
+    _run_type: str
+    _source_run_id: str
