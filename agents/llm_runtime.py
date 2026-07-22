@@ -72,6 +72,27 @@ def _take_step_screenshot(ctx, run_id: str, tool_seq: int) -> str:
 # ═══ Prompt ═══
 
 
+def _extract_status_code(output: str) -> str:
+    """Read the standard tool status without inventing success for legacy text."""
+    try:
+        from tools.results import parse_status
+
+        return parse_status(output or "") or "UNSPECIFIED"
+    except Exception:
+        return "UNSPECIFIED"
+
+
+def _parse_evidence(output: str) -> dict[str, Any]:
+    """Return tool evidence as a safe dict for durable step logging."""
+    try:
+        from tools.results import parse_evidence
+
+        parsed = parse_evidence(output or "")
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 def _build_tool_target(name: str, args: dict) -> str:
     """从工具参数中提取可读的目标描述。"""
     if not args:
@@ -311,11 +332,30 @@ def _run_agent(
                     loop_break_reason = "USER_STOPPED"
                     break
             t = _tool_map.get(name)
+            # Capture evidence on the actual invocation boundary.  The before
+            # values must be read before a launch/click can change the app.
+            page_sig_before = page_sig_once
+            try:
+                before_app = (
+                    _ctx.device.current_app() or {}
+                    if _ctx is not None and getattr(_ctx, "device", None) is not None
+                    else {}
+                )
+            except Exception:
+                before_app = {}
             try:
                 output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"
             except Exception as e:
                 output = f"ERROR: {e}"
             page_sig_after = _build_page_signature(_ctx)
+            try:
+                after_app = (
+                    _ctx.device.current_app() or {}
+                    if _ctx is not None and getattr(_ctx, "device", None) is not None
+                    else {}
+                )
+            except Exception:
+                after_app = {}
             progress_milestone = (
                 name == "assert_verification"
                 or _output_has_page_change(output, page_sig_once, page_sig_after)
@@ -434,24 +474,47 @@ def _run_agent(
                     )
             page_sig_once = page_sig_after
 
-            # 实时记录工具调用日志（过滤感知类，不去重）
-            if name not in _SKIP_EMIT:
-                entry: dict[str, Any] = {
-                    "name": name,
-                    "target": target_hint,
-                    "intent_text": (getattr(last_ai, "content", "") or "").strip()[
-                        :200
-                    ],
-                    "observation": output[:200],
-                    "screenshot_path": _screenshot_path,
-                    "tool_seq": len(_current_log),
+            # Persist the full structured event for every executed tool call,
+            # including sensing calls that are intentionally omitted from live UI
+            # emission. Result parsing deliberately falls back to UNSPECIFIED;
+            # an unstructured successful-looking string is not evidence.
+            result_evidence = _parse_evidence(output)
+            status_code = _extract_status_code(output)
+            # report_done(abort) is an accepted terminal report rather than
+            # a tool error; retain its terminal state as evidence.
+            if name == "report_done":
+                status_code = "OK"
+                result_evidence.setdefault(
+                    "terminal_status", (args.get("status", "") or "done").lower()
+                )
+            entry: dict[str, Any] = {
+                "name": name,
+                "target": target_hint,
+                "intent_text": (getattr(last_ai, "content", "") or "").strip()[:200],
+                "observation": output[:200],
+                "screenshot_path": _screenshot_path,
+                "tool_seq": len(_current_log),
+                "tool_input": dict(args or {}),
+                "status_code": status_code,
+                "result_evidence": result_evidence,
+                "page_before_signature": page_sig_before,
+                "page_after_signature": page_sig_after,
+                "page_before_activity": str(before_app.get("activity", "") or ""),
+                "page_after_activity": str(after_app.get("activity", "") or ""),
+                "page_before_package": str(before_app.get("package", "") or ""),
+                "page_after_package": str(after_app.get("package", "") or ""),
+            }
+            if name == "click":
+                entry["match_mode"] = _resolve_click_match_mode(name, args, output)
+                entry["fallback_used"] = _resolve_click_fallback(output)
+                entry["resolved_target"] = {
+                    "label": result_evidence.get("resolved_label", ""),
+                    "role": result_evidence.get("resolved_role", ""),
+                    "rid": result_evidence.get("resolved_rid", ""),
+                    "class_name": result_evidence.get("resolved_class", ""),
+                    "path": result_evidence.get("resolved_path", ""),
                 }
-                # 结构化输出字段：click 工具携带 match_mode / fallback_used
-                if name == "click":
-                    entry["match_mode"] = _resolve_click_match_mode(name, args, output)
-                    entry["fallback_used"] = _resolve_click_fallback(output)
-                    entry["tool_input"] = dict(args or {})
-                _current_log.append(entry)
+            _current_log.append(entry)
 
             # report_done: 结构化终止信号，立即终止子图
             if name == "report_done":

@@ -26,7 +26,11 @@ from api.apps_routes import resolve_app as _resolve_app_from_yaml
 from api.knowledge_routes import router as knowledge_router
 from api.config_routes import router as config_router
 from api.test_cases_routes import router as test_cases_router
-from api.test_cases_routes import set_backends as _set_tc_backends
+from api.test_cases_routes import (
+    set_backends as _set_tc_backends,
+    _resolve_run_entry,
+    resolve_report_rerun_entry,
+)
 from api.knowledge_routes import set_knowledge_base as _set_kb_for_routes
 from api.websocket_manager import WebSocketManager
 from config import TestConfig, resolve_perception_mode
@@ -701,22 +705,29 @@ async def websocket_chat(websocket: WebSocket):
             # ── v3: 复跑 / 用例运行 ──
             elif msg_type == "rerun":
                 run_id = data.get("run_id", "")
-                goal = data.get("goal") or {}
                 run = _db.get_test_run(run_id) if _db and run_id else None
+                if not run:
+                    await ws_manager.send(websocket, {"type": "error", "content": f"报告不存在: {run_id}"})
+                    continue
+                try:
+                    entry = resolve_report_rerun_entry(run)
+                except ValueError as exc:
+                    await ws_manager.send(websocket, {"type": "error", "content": f"报告计划数据损坏: {exc}"})
+                    continue
                 result = await asyncio.to_thread(
                     orchestrator.start,
-                    user_request=run.get("user_request", "") if run else "",
-                    app_package=run.get("app_package", "") if run else "",
-                    app_name=run.get("app_name", "") if run else "",
-                    goal_description=goal,
+                    user_request=run.get("user_request", ""),
+                    app_package=run.get("app_package", ""),
+                    app_name=run.get("app_name", ""),
+                    goal_description=entry["goal"],
                     reuse_plan=True,
                     run_type="rerun",
-                    source_run_id=run_id if run else None,
+                    source_run_id=entry["source_run_id"],
+                    source_case_id=None,
+                    execution_plan_revision=entry["execution_plan_revision"],
                 )
                 try:
-                    await ws_manager.send(
-                        websocket, {"type": "result", "content": result}
-                    )
+                    await ws_manager.send(websocket, {"type": "result", "content": result})
                 except RuntimeError:
                     pass
 
@@ -724,39 +735,33 @@ async def websocket_chat(websocket: WebSocket):
                 case_id = data.get("case_id", "")
                 case = _db.get_test_case(case_id) if _db and case_id else None
                 if not case:
-                    await ws_manager.send(
-                        websocket,
-                        {"type": "error", "content": f"用例不存在: {case_id}"},
-                    )
-                else:
-                    import json as _json
-
-                    goal = _json.loads(case.get("goal_json") or "{}")
-                    result = await asyncio.to_thread(
-                        orchestrator.start,
-                        user_request=case.get("user_request", ""),
-                        app_package=case.get("app_package", ""),
-                        app_name=case.get("app_name", ""),
-                        goal_description=goal,
-                        reuse_plan=True,
-                        run_type="rerun",
-                        source_run_id=case_id,
-                    )
-                    # 更新用例运行状态
-                    if result.get("status") != "busy":
-                        st = result.get("execution_status", "error")
-                        vd = result.get("test_verdict", "inconclusive")
-                        _db.record_case_run(
-                            case_id,
-                            f"{st}/{vd}",
-                            datetime.now().isoformat(),
-                        )
-                    try:
-                        await ws_manager.send(
-                            websocket, {"type": "result", "content": result}
-                        )
-                    except RuntimeError:
-                        pass
+                    await ws_manager.send(websocket, {"type": "error", "content": f"用例不存在: {case_id}"})
+                    continue
+                try:
+                    entry = _resolve_run_entry(case)
+                except ValueError as exc:
+                    await ws_manager.send(websocket, {"type": "error", "content": f"用例计划数据损坏: {exc}"})
+                    continue
+                result = await asyncio.to_thread(
+                    orchestrator.start,
+                    user_request=case.get("user_request", ""),
+                    app_package=case.get("app_package", ""),
+                    app_name=case.get("app_name", ""),
+                    goal_description=entry["goal"],
+                    reuse_plan=True,
+                    run_type="rerun",
+                    source_run_id=entry["source_run_id"],
+                    source_case_id=entry["source_case_id"],
+                    execution_plan_revision=entry["execution_plan_revision"],
+                )
+                if result.get("status") != "busy":
+                    st = result.get("execution_status", "error")
+                    vd = result.get("test_verdict", "inconclusive")
+                    _db.record_case_run(case_id, f"{st}/{vd}", datetime.now().isoformat())
+                try:
+                    await ws_manager.send(websocket, {"type": "result", "content": result})
+                except RuntimeError:
+                    pass
 
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
@@ -773,7 +778,7 @@ async def list_reports(limit: int = 30):
             items = db.list_test_runs(limit)
             return {"status": "success", "items": items}
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("Failed to list test reports")
     return {"status": "success", "items": []}
 
 

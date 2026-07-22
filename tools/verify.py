@@ -195,10 +195,15 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
     # 延迟 import：避免加载期循环依赖；同时让测试对 tools.get_tool_context 的
     # monkeypatch 生效（局部名遮蔽模块级 import）。
     from tools import _run_multimodal_from_context, get_tool_context
+    from tools.results import ERROR, OK, make_result
 
     normalized_result = str(result or "").strip().lower()
     if normalized_result not in ("passed", "failed", "unknown"):
-        return "ERROR: assert_verification result 必须为 passed、failed 或 unknown"
+        return make_result(
+            ERROR,
+            "assert_verification result 必须为 passed、failed 或 unknown",
+            evidence={"reported_result": normalized_result},
+        )
 
     ctx = get_tool_context()
     if ctx:
@@ -219,10 +224,15 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
                     ctx._duplicate_assert_count = (
                         int(ctx._duplicate_assert_count or 0) + 1
                     )
-                    return (
-                        "DUPLICATE_IGNORED: "
-                        + verification_key
-                        + f" already passed at step={index + 1}"
+                    return make_result(
+                        OK,
+                        f"重复记录已忽略: {verification_key} already passed at step={index + 1}",
+                        evidence={
+                            "verification_key": verification_key,
+                            "reported_result": normalized_result,
+                            "review_required": False,
+                            "duplicate_ignored": True,
+                        },
                     )
         if not (detail or "").strip():
             retries = int(
@@ -230,7 +240,16 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
             )
             if retries < 2:
                 ctx._verification_detail_retries[verification_key] = retries + 1
-                return f"ERROR: detail is required for assert_verification (attempt {retries + 1}/2)"
+                return make_result(
+                    ERROR,
+                    "detail is required for assert_verification "
+                    f"(attempt {retries + 1}/2)",
+                    evidence={
+                        "verification_key": verification_key,
+                        "reported_result": normalized_result,
+                        "review_required": normalized_result == "unknown",
+                    },
+                )
             detail = (
                 "需要人工复核：未提供可核实证据说明"
                 if normalized == "unknown"
@@ -349,7 +368,16 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
             }
         )
     suffix = "（需要人工复核）" if normalized_result == "unknown" else ""
-    return f"记录完成: {condition} → {normalized_result}{suffix}"
+    return make_result(
+        OK,
+        f"记录完成: {condition} → {normalized_result}{suffix}",
+        evidence={
+            "verification_key": verification_key,
+            "reported_result": normalized_result,
+            "review_required": normalized_result == "unknown",
+            "detail_len": len(detail or ""),
+        },
+    )
 
 
 @tool
@@ -360,7 +388,24 @@ def report_done(status: str, summary: str = "") -> str:
         status: "done" 表示所有验证条件已完成，"abort" 表示无法继续执行
         summary: 简要描述验证结果或无法继续的原因
     """
-    return f"REPORTED: {status} | {summary}"
+    from tools.results import ERROR, OK, make_result
+
+    status_norm = (status or "").strip().lower()
+    if status_norm not in {"done", "abort"}:
+        return make_result(
+            ERROR,
+            "report_done status 必须为 done 或 abort",
+            evidence={"terminal_status": status_norm},
+        )
+    # abort is an intentional terminal report, not a tool-execution failure.
+    return make_result(
+        OK,
+        f"已报告: {status_norm}",
+        evidence={
+            "terminal_status": status_norm,
+            "summary_len": len(summary or ""),
+        },
+    )
 
 
 @tool

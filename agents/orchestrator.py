@@ -48,6 +48,7 @@ def _reset_run_scoped(ctx) -> None:
         pass
 
 
+
 class TestOrchestrator:
     """测试编排器 — 对外唯一入口。
 
@@ -192,6 +193,8 @@ class TestOrchestrator:
         reuse_plan: bool = False,
         run_type: str = "normal",
         source_run_id: str | None = None,
+        source_case_id: str | None = None,
+        execution_plan_revision: int = 0,
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
         logger.info(
@@ -294,6 +297,8 @@ class TestOrchestrator:
             "_last_clickable_count": 0,
             "_run_type": run_type or "normal",
             "_source_run_id": source_run_id,
+            "_source_case_id": source_case_id,
+            "_execution_plan_revision": int(execution_plan_revision or 0),
         }
 
         config_ctx = {
@@ -391,6 +396,8 @@ class TestOrchestrator:
         reuse_plan: bool = False,
         run_type: str = "normal",
         source_run_id: str | None = None,
+        source_case_id: str | None = None,
+        execution_plan_revision: int = 0,
     ) -> AsyncIterator[dict[str, Any]]:
         """流式执行测试 — 通过 astream_events 实时推送每个事件。"""
         if not thread_id:
@@ -441,6 +448,8 @@ class TestOrchestrator:
             "_last_clickable_count": 0,
             "_run_type": run_type or "normal",
             "_source_run_id": source_run_id,
+            "_source_case_id": source_case_id,
+            "_execution_plan_revision": int(execution_plan_revision or 0),
         }
 
         config_ctx = {
@@ -915,6 +924,19 @@ def _build_display_steps(history: list, tool_calls_log: list) -> list[dict]:
                 "raw_observation": t.get("observation", ""),
                 "screenshot_path": t.get("screenshot_path", ""),
                 "anomaly": None,
+                "tool_input": dict(t.get("tool_input") or {}),
+                "tool_seq": t.get("tool_seq", idx),
+                "status_code": t.get("status_code", "UNSPECIFIED"),
+                "result_evidence": dict(t.get("result_evidence") or {}),
+                "page_before_signature": t.get("page_before_signature", ""),
+                "page_after_signature": t.get("page_after_signature", ""),
+                "page_before_activity": t.get("page_before_activity", ""),
+                "page_after_activity": t.get("page_after_activity", ""),
+                "page_before_package": t.get("page_before_package", ""),
+                "page_after_package": t.get("page_after_package", ""),
+                "match_mode": t.get("match_mode", ""),
+                "fallback_used": bool(t.get("fallback_used", False)),
+                "resolved_target": dict(t.get("resolved_target") or {}),
             }
         )
     # 追加原始 step_history 中的 Agent 结论步骤

@@ -251,6 +251,44 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     )
 
 
+def _render_replay_evidence_block(goal_desc: dict[str, Any]) -> str:
+    """Render only validated v4 effective evidence (or legacy flat v3 evidence)."""
+    if not isinstance(goal_desc, dict):
+        return ""
+    plan = goal_desc.get("execution_plan")
+    if not isinstance(plan, dict):
+        return ""
+    if plan.get("schema_version") == 4:
+        effective = plan.get("effective")
+        if not isinstance(effective, dict) or effective.get("schema_version") != 4:
+            return ""
+    else:
+        effective = plan if isinstance(plan.get("key_actions"), list) else None
+    if not isinstance(effective, dict):
+        return ""
+    lines = [
+        "## REPLAY_EVIDENCE_BLOCK (historical facts, not a forced script)",
+        "Use current perception as the authority. Reuse this evidence only when its per-action precondition fits; adapt, recover, or skip when the page drifted.",
+        "preferred_locator is a stable locator. observed_index is historical context only: never combine observed_index with preferred_locator in the same click call.",
+    ]
+    entry = effective.get("entry")
+    if isinstance(entry, dict) and isinstance(entry.get("launch_app_args"), dict):
+        args = entry["launch_app_args"]
+        lines.append(f"Entry reference: launch_app(package={args.get('package', '')!r}, activity={args.get('activity', '')!r}).")
+    for index, action in enumerate(effective.get("key_actions") or [], 1):
+        if not isinstance(action, dict):
+            continue
+        pre = action.get("precondition") or {}
+        pre_text = str(pre.get("expected_activity", "") or "")
+        if action.get("tool") == "click":
+            locator = action.get("preferred_locator") or {}
+            observed = action.get("observed_index")
+            lines.append(f"{index}. click reference locator={locator!r}; observed_index={observed!r}; precondition_activity={pre_text!r}.")
+        else:
+            lines.append(f"{index}. {action.get('tool', 'action')} reference; precondition_activity={pre_text!r}.")
+    return "\n".join(lines)
+
+
 def agent_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     llm = _llm_cfg(cfg)
@@ -399,6 +437,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     msgs = list(state.get("messages", []))
     if not msgs:
         msgs = [SystemMessage(content=AGENT_SYSTEM)]
+        replay_block = _render_replay_evidence_block(state.get("goal_description", {}))
+        if replay_block:
+            msgs.append(SystemMessage(content=replay_block))
     used_tool_calls_before = len(state.get("_tool_calls_log", []) or [])
     remaining_tool_budget = budget["max_tool_calls_total"] - used_tool_calls_before
     finalization_hint_injected = bool(state.get("_finalization_hint_injected", False))
@@ -888,9 +929,14 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 ),
                 run_type=state.get("_run_type", "normal"),
                 source_run_id=state.get("_source_run_id"),
+                source_case_id=state.get("_source_case_id"),
+                execution_plan_revision=int(state.get("_execution_plan_revision", 0) or 0),
             )
-        except:
-            pass
+        except Exception:
+            logger.exception(
+                "Failed to persist test run %s",
+                config.get("configurable", {}).get("thread_id", ""),
+            )
 
     # 统计统一基于 dd（实际展示步骤）
     pc = sum(1 for s in dd if s.get("status") in ("success", "continue"))

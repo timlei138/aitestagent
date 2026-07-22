@@ -56,4 +56,6 @@ class TestState(TypedDict, total=False):
     # 命中时让图收敛到 reporter 写 cancelled，不影响其他状态的正常流转。
     _stop_requested: bool
     _run_type: str
-    _source_run_id: str
+    _source_run_id: str | None
+    _source_case_id: str | None
+    _execution_plan_revision: int

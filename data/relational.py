@@ -90,7 +90,9 @@ class SqliteBackend(RelationalBackend):
                 llm_token_calls INTEGER DEFAULT 0,
                 goal_json TEXT NOT NULL DEFAULT '{}',
                 run_type TEXT NOT NULL DEFAULT 'normal',
-                source_run_id TEXT
+                source_run_id TEXT,
+                source_case_id TEXT,
+                execution_plan_revision INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS human_decisions (
@@ -235,6 +237,8 @@ class SqliteBackend(RelationalBackend):
         goal_json: str = "{}",
         run_type: str = "normal",
         source_run_id: str | None = None,
+        source_case_id: str | None = None,
+        execution_plan_revision: int = 0,
     ) -> None:
         """快捷方法：记录一次测试执行。"""
         self.upsert(
@@ -270,6 +274,8 @@ class SqliteBackend(RelationalBackend):
                 "goal_json": goal_json,
                 "run_type": run_type,
                 "source_run_id": source_run_id,
+                "source_case_id": source_case_id,
+                "execution_plan_revision": int(execution_plan_revision or 0),
                 "created_at": datetime.now().isoformat(),
             },
             key="id",
@@ -304,7 +310,8 @@ class SqliteBackend(RelationalBackend):
             "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls, "
             "COALESCE(goal_json,'{}') AS goal_json, "
             "COALESCE(run_type,'normal') AS run_type, "
-            "source_run_id "
+            "source_run_id, source_case_id, "
+            "COALESCE(execution_plan_revision,0) AS execution_plan_revision "
             "FROM test_runs "
             "ORDER BY created_at DESC LIMIT ?",
             (limit,),
@@ -342,9 +349,10 @@ class SqliteBackend(RelationalBackend):
             d["llm_token_calls"] = int(d.get("llm_token_calls", 0) or 0)
             d["goal_json"] = d.get("goal_json") or "{}"
             d["run_type"] = d.get("run_type") or "normal"
-            # source_run_id 保持为 None 或字符串
-            if d.get("source_run_id") is None:
-                d["source_run_id"] = None
+            # Typed lineage fields are durable run metadata.
+            d["source_run_id"] = d.get("source_run_id") or None
+            d["source_case_id"] = d.get("source_case_id") or None
+            d["execution_plan_revision"] = int(d.get("execution_plan_revision", 0) or 0)
             result.append(d)
         return result
 
@@ -362,7 +370,8 @@ class SqliteBackend(RelationalBackend):
             "input_tokens, output_tokens, total_tokens, cached_input_tokens, llm_token_calls, "
             "COALESCE(goal_json,'{}') AS goal_json, "
             "COALESCE(run_type,'normal') AS run_type, "
-            "source_run_id "
+            "source_run_id, source_case_id, "
+            "COALESCE(execution_plan_revision,0) AS execution_plan_revision "
             "FROM test_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
@@ -394,9 +403,9 @@ class SqliteBackend(RelationalBackend):
         d["llm_token_calls"] = int(d.get("llm_token_calls", 0) or 0)
         d["goal_json"] = d.get("goal_json") or "{}"
         d["run_type"] = d.get("run_type") or "normal"
-        # source_run_id 保持为 None 或字符串，不强制转为空字符串
-        if d.get("source_run_id") is None:
-            d["source_run_id"] = None
+        d["source_run_id"] = d.get("source_run_id") or None
+        d["source_case_id"] = d.get("source_case_id") or None
+        d["execution_plan_revision"] = int(d.get("execution_plan_revision", 0) or 0)
         verification_results = json.loads(d.pop("verification_json", "[]") or "[]")
         if isinstance(verification_results, list):
             for item in verification_results:
@@ -654,18 +663,100 @@ class SqliteBackend(RelationalBackend):
         return dict(row) if row else None
 
     def update_test_case(self, case_id: str, data: dict[str, Any]) -> bool:
-        """编辑用例计划。data 可含 name / goal_json / user_request / app_package / app_name。"""
-        allowed = {"name", "goal_json", "user_request", "app_package", "app_name"}
+        """Edit legacy case metadata; v4 evidence is PATCH-only."""
+        existing = self.get_test_case(case_id)
+        if not existing:
+            return False
+        try:
+            goal = json.loads(existing.get("goal_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            goal = {}
+        if isinstance(goal.get("execution_plan"), dict) and goal["execution_plan"].get("schema_version") == 4:
+            if "goal_json" in data:
+                return False
+        allowed = {"name", "user_request", "app_package", "app_name"}
+        if not isinstance(goal.get("execution_plan"), dict) or goal["execution_plan"].get("schema_version") != 4:
+            allowed.add("goal_json")
         updates = {k: v for k, v in data.items() if k in allowed}
         if not updates:
             return False
         sets = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [case_id]
-        self._conn.execute(
-            f"UPDATE test_cases SET {sets} WHERE id = ?", values
-        )
+        cursor = self._conn.execute(f"UPDATE test_cases SET {sets} WHERE id = ?", values)
         self._conn.commit()
-        return True
+        return cursor.rowcount > 0
+
+    def update_case_override_if_revision(
+        self,
+        case_id: str,
+        expected_revision: int,
+        patch: list[dict[str, Any]],
+        changed_paths: list[str],
+        edited_by: str,
+    ) -> tuple[bool, str, dict[str, Any] | None]:
+        """Atomically replace a v4 case's complete override patch with CAS."""
+        # Kept in the backend so read/derive/write are one SQLite transaction.
+        from api.test_cases_routes import derive_effective_plan, validate_v4_execution_plan
+
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT goal_json FROM test_cases WHERE id = ?", (case_id,)).fetchone()
+            if not row:
+                self._conn.rollback()
+                return False, "not_found", None
+            try:
+                goal = json.loads(row["goal_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                self._conn.rollback()
+                return False, "invalid_goal", None
+            plan = goal.get("execution_plan") if isinstance(goal, dict) else None
+            if not isinstance(plan, dict) or plan.get("schema_version") != 4:
+                self._conn.rollback()
+                return False, "not_v4", None
+            base = plan.get("base_evidence")
+            override = plan.get("override")
+            effective = plan.get("effective")
+            if not isinstance(base, dict) or not isinstance(override, dict) or not isinstance(effective, dict):
+                self._conn.rollback()
+                return False, "invalid_plan", None
+            current_revision = effective.get("effective_revision")
+            if not isinstance(current_revision, int) or current_revision != expected_revision:
+                self._conn.rollback()
+                return False, "revision_conflict", None
+            next_revision = current_revision + 1
+            next_effective = derive_effective_plan(base, patch, effective_revision=next_revision)
+            next_override = {
+                "revision": int(override.get("revision", 0) or 0) + 1,
+                "patch": patch,
+                "changed_paths": changed_paths,
+                "evidence_stale": True,
+                "edited_at": datetime.now().isoformat(),
+                "edited_by": edited_by,
+            }
+            goal["execution_plan"] = {
+                "schema_version": 4,
+                "base_evidence": base,
+                "override": next_override,
+                "effective": next_effective,
+            }
+            validate_v4_execution_plan(goal)
+            encoded = json.dumps(goal, ensure_ascii=False)
+            cursor = self._conn.execute(
+                "UPDATE test_cases SET goal_json = ? WHERE id = ? AND goal_json = ?",
+                (encoded, case_id, row["goal_json"]),
+            )
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                return False, "revision_conflict", None
+            self._conn.commit()
+            updated = self.get_test_case(case_id)
+            return True, "ok", updated
+        except ValueError as exc:
+            self._conn.rollback()
+            return False, f"invalid_patch:{exc}", None
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def delete_test_case(self, case_id: str) -> bool:
         """删除单条用例。"""

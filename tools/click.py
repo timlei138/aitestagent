@@ -638,26 +638,58 @@ def click(
             "strategy": strategy,
         }
 
-    def _with_snapshot(base_result: str, clicked_el: Any) -> str:
-        """为成功的点击结果追加操作后页面状态和可核实的权限弹窗事实。"""
+    def _make_click_success(
+        message: str,
+        resolved: dict[str, str],
+        *,
+        match_mode: str,
+        fallback_used: bool,
+        clicked_el: Any | None,
+    ) -> str:
+        """Return every successful click through the shared result contract.
+
+        The message retains the legacy click log and post-click page facts for people,
+        while the evidence block contains only stable, directly parseable facts.
+        """
         from tools.perceive_tools import _permission_popup_buttons
 
         _save_click_identity(ctx, label, clicked_el, understanding)
+        parts = [message]
         snap = _post_click_snapshot(ctx, _pre_title, label)
-        parts = [base_result]
         if snap:
             parts.append(snap)
+
+        evidence: dict[str, Any] = {
+            "match_mode": match_mode,
+            "fallback_used": fallback_used,
+            "resolved_label": resolved.get("label", ""),
+            "resolved_role": resolved.get("role", ""),
+            "resolved_rid": resolved.get("rid", ""),
+            "resolved_class": resolved.get("class_name", ""),
+            "resolved_path": resolved.get("path", ""),
+        }
         permission_info = _permission_popup_buttons(ctx)
         if permission_info:
             activity, controls = permission_info
-            buttons = "|".join(text for text, _ in controls)
-            return (
-                " | ".join(parts)
-                + " || permission_dialog=true"
-                + f"; permission_activity={activity}"
-                + f"; permission_buttons={buttons}"
+            evidence.update(
+                {
+                    "permission_dialog": True,
+                    "permission_activity": activity,
+                    "permission_buttons": "|".join(text for text, _ in controls),
+                }
             )
-        return " | ".join(parts)
+        return make_result("OK", " | ".join(parts), evidence)
+
+    def _resolved_from_element(element: Any | None) -> dict[str, str]:
+        if element is None:
+            return {"label": label}
+        return {
+            "label": getattr(element, "label", "") or label,
+            "role": getattr(element, "role", "") or "",
+            "rid": getattr(element, "resource_id", "") or "",
+            "class_name": getattr(element, "class_name", "") or "",
+            "path": getattr(element, "context_path", "") or "",
+        }
 
     if best_el is not None:
         promoted = _promote_to_clickable_parent(best_el, understanding)
@@ -668,14 +700,13 @@ def click(
         if not ok and "AMBIGUOUS:" in (result or ""):
             return result  # 歧义直接透传给 LLM，不走 fallback
         if ok:
-            strategy = re.search(r"strategy=([A-Za-z0-9_-]+)", result or "")
+            strategy_match = re.search(r"strategy=([A-Za-z0-9_-]+)", result or "")
+            match_mode = strategy_match.group(1) if strategy_match else "element"
             _record_page_transition(
                 ctx,
                 _pre_page,
                 label,
-                click_context=_build_click_context(
-                    strategy.group(1) if strategy else "", best_el
-                ),
+                click_context=_build_click_context(match_mode, best_el),
             )
             if exact_mode:
                 _maybe_promote_exact_rule(
@@ -684,8 +715,13 @@ def click(
                     pre_page=_pre_page,
                     matched_el=best_el,
                 )
-                return _with_snapshot(result, best_el)
-            return _with_snapshot(result, best_el)
+            return _make_click_success(
+                result,
+                _resolved_from_element(best_el),
+                match_mode=match_mode,
+                fallback_used=False,
+                clicked_el=best_el,
+            )
         # 不在工具内自动猜测次优候选；直接透传给 LLM 做下一步精确决策
         return result or make_result(
             ERROR, f"未能点击目标元素: {label}，请用 index/class/rid 精确定位"
@@ -693,30 +729,38 @@ def click(
 
     # 兆底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):
-        _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(
             ctx,
             _pre_page,
             label,
             click_context=_build_click_context("text-fallback", None),
         )
-        return _with_snapshot(f"已点击: {label} (strategy=text-fallback)", None)
+        return _make_click_success(
+            f"已点击: {label} (strategy=text-fallback)",
+            {"label": label},
+            match_mode="text-fallback",
+            fallback_used=True,
+            clicked_el=None,
+        )
     # 历史身份兜底
     if not known_ids:
         known_ids = _query_known_identities(label)
     for known in known_ids:
-        rid = known.get("resource_id", "")
-        if rid and ctx.device.click_resource_id(rid):
-            _save_click_identity(ctx, label, None, understanding)
+        known_rid = known.get("resource_id", "")
+        if known_rid and ctx.device.click_resource_id(known_rid):
             _record_page_transition(
                 ctx,
                 _pre_page,
                 label,
                 click_context=_build_click_context("known-rid-fallback", None),
             )
-            return _with_snapshot(
-                f"已点击历史资源: {label} rid={rid} (strategy=known-rid-fallback)",
-                None,
+            return _make_click_success(
+                f"已点击历史资源: {label} rid={known_rid} "
+                "(strategy=known-rid-fallback)",
+                {"label": label, "rid": known_rid},
+                match_mode="known-rid-fallback",
+                fallback_used=True,
+                clicked_el=None,
             )
     # 百分比 bounds 兜底
     for known in known_ids:
@@ -741,29 +785,35 @@ def click(
                 and bounds[3] <= screen_h
             ):
                 ctx.device.click_bounds(bounds)
-                _save_click_identity(ctx, label, None, understanding)
-                _clicked = True
                 _record_page_transition(
                     ctx,
                     _pre_page,
                     label,
                     click_context=_build_click_context("pct-bounds-fallback", None),
                 )
-                return _with_snapshot(
+                return _make_click_success(
                     f"已点击历史坐标: {label} "
                     f"bounds=({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) "
-                    f"(strategy=pct-bounds-fallback)",
-                    None,
+                    "(strategy=pct-bounds-fallback)",
+                    {"label": label, "rid": known.get("resource_id", "")},
+                    match_mode="pct-bounds-fallback",
+                    fallback_used=True,
+                    clicked_el=None,
                 )
     if ctx.device.click_resource_id(label):
-        _save_click_identity(ctx, label, None, understanding)
         _record_page_transition(
             ctx,
             _pre_page,
             label,
             click_context=_build_click_context("rid-fallback", None),
         )
-        return _with_snapshot(f"已点击资源: {label} (strategy=rid-fallback)", None)
+        return _make_click_success(
+            f"已点击资源: {label} (strategy=rid-fallback)",
+            {"label": label, "rid": label},
+            match_mode="rid-fallback",
+            fallback_used=True,
+            clicked_el=None,
+        )
     return make_result(NOT_FOUND, f"未找到可点击元素: {label}")
 
 

@@ -644,7 +644,11 @@ async function saveAsCase(row) {
       body: JSON.stringify({ run_id: row.id, name: (row.user_request || '').substring(0, 40) }),
     });
     const data = await res.json();
-    if (data.status === 'ok') { ElMessage.success('已保存为用例'); loadReports(); }
+    if (data.status === 'ok') {
+      ElMessage.success('已保存为用例');
+      await testCasePanelRef.value?.fetchCases();
+      loadReports();
+    }
     else { ElMessage.error(data.message || '保存失败'); }
   } catch (e) { ElMessage.error('保存失败: ' + e); }
 }

@@ -237,28 +237,129 @@ def open_app_permission_settings(package: str) -> str:
     return f"OK: 已打开应用权限设置 || package={package.strip()}; result={result}"
 
 
+def _settle_after_action(
+    ctx, max_wait_ms: int = 1500, poll_ms: int = 100
+) -> None:
+    """Poll general foreground state until it remains stable after an action.
+
+    This intentionally does not encode application-specific knowledge.  Perception is
+    optional: a device without a perceiver still settles on stable package/activity.
+    """
+    deadline = time.monotonic() + max(0, max_wait_ms) / 1000.0
+    last_signature = ""
+    stable_count = 0
+    while time.monotonic() < deadline and stable_count < 2:
+        try:
+            try:
+                app = ctx.device.current_app(refresh=True) or {}
+            except TypeError:
+                # Lightweight test doubles and legacy controllers may not support refresh.
+                app = ctx.device.current_app() or {}
+            signature = f"{app.get('package', '')}/{app.get('activity', '')}"
+            if ctx.perceiver is not None:
+                try:
+                    understanding = ctx.perceiver.perceive()
+                    signature += f"/{getattr(understanding, 'page_title', '')}"
+                except Exception:
+                    pass
+        except Exception:
+            signature = ""
+
+        if signature and signature == last_signature:
+            stable_count += 1
+        else:
+            last_signature = signature
+            stable_count = 0
+        if stable_count < 2:
+            time.sleep(max(0, poll_ms) / 1000.0)
+
+
 @tool
 def launch_app(
     package: str,
     activity: str = "",
 ) -> str:
-    """启动指定包名的 App。"""
+    """启动指定包名的 App 并返回已核实的到达证据。"""
     # 延迟 import 避免加载期循环依赖（click 相关 helper 仍在 tools/__init__.py）
     from tools import _capture_page_id, _record_page_transition
+    from tools.results import ERROR, OK, make_result
 
+    requested_package = (package or "").strip()
+    target_activity = (activity or "").strip()
     ctx = get_tool_context()
     if ctx.device is None:
-        return "ERROR: 未连接 Android 设备，无法启动应用"
+        return make_result(
+            ERROR,
+            "未连接 Android 设备，无法启动应用",
+            evidence={
+                "requested_package": requested_package,
+                "requested_activity": target_activity,
+            },
+        )
+
     _pre_page = _capture_page_id(ctx)
-    target_activity = (activity or "").strip()
-    if target_activity:
-        ctx.device.app_start(package, activity=target_activity)
-    else:
-        ctx.device.app_start(package)
-    # 记录页面跳转
-    _record_page_transition(ctx, _pre_page, f"launch_app({package})")
-    return (
-        f"已启动: {package}/{target_activity}"
+    try:
+        if target_activity:
+            ctx.device.app_start(requested_package, activity=target_activity)
+        else:
+            ctx.device.app_start(requested_package)
+    except Exception as exc:
+        return make_result(
+            ERROR,
+            f"启动失败: {exc}",
+            evidence={
+                "requested_package": requested_package,
+                "requested_activity": target_activity,
+            },
+        )
+
+    _settle_after_action(ctx)
+    try:
+        try:
+            observed = ctx.device.current_app(refresh=True) or {}
+        except TypeError:
+            observed = ctx.device.current_app() or {}
+        observed_package = (observed.get("package", "") or "").strip()
+        observed_activity = (observed.get("activity", "") or "").strip()
+    except Exception:
+        observed_package = ""
+        observed_activity = ""
+
+    def _normalize_activity(value: str) -> str:
+        return (value or "").split(".")[-1].strip()
+
+    package_matched = bool(observed_package) and observed_package == requested_package
+    activity_matched = (
+        (
+            _normalize_activity(observed_activity)
+            == _normalize_activity(target_activity)
+            or target_activity in observed_activity
+        )
         if target_activity
-        else f"已启动: {package}"
+        else bool(observed_activity)
+    )
+    arrival_confirmed = package_matched and activity_matched
+    _record_page_transition(ctx, _pre_page, f"launch_app({requested_package})")
+
+    evidence = {
+        "requested_package": requested_package,
+        "requested_activity": target_activity,
+        "observed_package": observed_package,
+        "observed_activity": observed_activity,
+        "package_matched": package_matched,
+        "activity_matched": activity_matched,
+        "arrival_confirmed": arrival_confirmed,
+    }
+    if arrival_confirmed:
+        message = (
+            f"已启动: {requested_package}/{target_activity}"
+            if target_activity
+            else f"已启动: {requested_package}"
+        )
+        return make_result(OK, message, evidence)
+    return make_result(
+        ERROR,
+        "启动后未到达预期 Activity "
+        f"(package_matched={package_matched}, activity_matched={activity_matched})",
+        evidence,
     )
