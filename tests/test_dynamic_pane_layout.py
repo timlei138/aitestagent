@@ -73,3 +73,23 @@ def test_heuristic_understand_excludes_elements_completely_outside_viewport():
         "当前课程格",
         "底部露出",
     ]
+
+
+def test_course_grid_columns_are_not_misclassified_as_left_navigation():
+    perceiver = SmartPerceiver(device=None)
+    elements = [
+        _element("返回", (36, 95, 166, 239)),
+        _element("我的课程表", (166, 128, 436, 206)),
+        _element("第1周", (459, 143, 576, 190)),
+        _element("", (232, 396, 697, 666)),
+        _element("", (697, 396, 1162, 666)),
+        _element("", (1162, 396, 1627, 666)),
+        _element("", (1627, 396, 2092, 666)),
+        _element("", (2092, 396, 2557, 666)),
+        _element("", (232, 666, 697, 936)),
+        _element("", (1162, 666, 1627, 936)),
+    ]
+
+    regions = perceiver._detect_pane_regions(elements, width=2560, height=1600)
+
+    assert regions == []

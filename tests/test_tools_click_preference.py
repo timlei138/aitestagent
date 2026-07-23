@@ -172,11 +172,7 @@ def test_click_no_longer_auto_fallbacks_to_next_candidate(monkeypatch):
     ctx = ToolContext(device=device, perceiver=perceiver)
     # 该用例验证“回退在同一次 click 内完成”，故不注入 prefs，让首击先命中容器。
     tools_module.set_tool_context(ctx)
-    monkeypatch.setattr(
-        tools_module,
-        "check_dangerous",
-        lambda _label: SimpleNamespace(allowed=True, reason=""),
-    )
+    # check_dangerous safety拦截已移除，无需 mock
 
     out = tools_module.click.invoke({"label": "应用列表", "alternatives": ""})
     assert "fallback=next_candidate" not in out
@@ -230,11 +226,7 @@ def test_click_returns_ambiguous_when_unique_rid_semantics_mismatch(monkeypatch)
 
     device = _Device()
     tools_module.set_tool_context(ToolContext(device=device, perceiver=_Perceiver()))
-    monkeypatch.setattr(
-        tools_module,
-        "check_dangerous",
-        lambda _label: SimpleNamespace(allowed=True, reason=""),
-    )
+    # check_dangerous safety拦截已移除，无需 mock
     out = tools_module.click.invoke(
         {"label": "AC", "rid": "com.zui.calculator:id/op_fact"}
     )
@@ -299,11 +291,7 @@ def test_click_exact_mode_reports_ambiguous_matches(monkeypatch):
             )
 
     tools_module.set_tool_context(ToolContext(device=_Device(), perceiver=_Perceiver()))
-    monkeypatch.setattr(
-        tools_module,
-        "check_dangerous",
-        lambda _label: SimpleNamespace(allowed=True, reason=""),
-    )
+    # check_dangerous safety拦截已移除，无需 mock
     out = tools_module.click.invoke({"label": "应用列表", "class_name": "textview"})
     assert "候选匹配" in out
 
@@ -354,11 +342,7 @@ def test_click_exact_mode_with_index_clicks_direct_target(monkeypatch):
 
     d = _Device()
     tools_module.set_tool_context(ToolContext(device=d, perceiver=_Perceiver()))
-    monkeypatch.setattr(
-        tools_module,
-        "check_dangerous",
-        lambda _label: SimpleNamespace(allowed=True, reason=""),
-    )
+    # check_dangerous safety拦截已移除，无需 mock
     out = tools_module.click.invoke({"label": "应用列表", "index": 1})
     assert "fallback=next_candidate" not in out
     assert d.rid_click_count == 1
@@ -486,13 +470,9 @@ def test_click_index_selects_unlabeled_clickable_by_bounds(monkeypatch):
 
     device = _Device()
     tools_module.set_tool_context(ToolContext(device=device, perceiver=_Perceiver()))
-    monkeypatch.setattr(
-        tools_module,
-        "check_dangerous",
-        lambda _label: SimpleNamespace(allowed=True, reason=""),
-    )
+    # check_dangerous safety拦截已移除，无需 mock
 
-    out = tools_module.click.invoke({"label": "第一节课程格", "index": 1})
+    out = tools_module.click.invoke({"index": 1})
 
     assert "已点击" in out
     assert device.clicked_bounds == [(620, 120, 820, 240)]

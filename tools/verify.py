@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import re
 from datetime import datetime
@@ -168,7 +169,12 @@ def _normalize_verification_text(value: Any) -> str:
     return re.sub(r"\s+", "", text)
 
 
-def _resolve_verification_key(ctx: ToolContext, condition: str) -> str:
+def _resolve_verification_key(
+    ctx: ToolContext, condition: str, verification_key: str = ""
+) -> str:
+    explicit = str(verification_key or "").strip()
+    if explicit:
+        return explicit
     raw = str(condition or "").strip()
     normalized = _normalize_verification_text(raw)
     key_map = getattr(ctx, "_verification_key_map", {}) or {}
@@ -184,12 +190,236 @@ def _resolve_verification_key(ctx: ToolContext, condition: str) -> str:
     return f"dyn_{len(getattr(ctx, '_verifications', [])) + 1}"
 
 
+def _verification_match_terms(value: Any) -> set[str]:
+    """Extract conservative, auditable terms for lexical UI association."""
+    text = str(value or "").strip()
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text).lower()
+    terms = set(re.findall(r"[a-z][a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", text))
+    for chunk in re.findall(r"[\u4e00-\u9fff]{3,}", text):
+        for size in (2, 3, 4):
+            if len(chunk) >= size:
+                terms.update(chunk[i : i + size] for i in range(len(chunk) - size + 1))
+    ignored = {
+        "包含",
+        "显示",
+        "当前",
+        "页面",
+        "具体",
+        "可以",
+        "进行",
+        "需要",
+        "无法",
+        "点击",
+        "确认",
+        "核实",
+        "存在",
+        "弹窗",
+    }
+    return {term for term in terms if term not in ignored}
+
+
+def _element_fact_text(element: Any) -> str:
+    return " ".join(
+        str(value or "")
+        for value in (
+            getattr(element, "label", ""),
+            getattr(element, "associated_label", ""),
+            getattr(element, "resource_id", ""),
+            getattr(element, "class_name", ""),
+            getattr(element, "context_path", ""),
+        )
+    )
+
+
+def _score_verification_element(
+    element: Any, *, canonical: str, detail: str, focus: str
+) -> tuple[int, list[str]]:
+    fact_text = _element_fact_text(element)
+    fact_norm = _normalize_verification_text(fact_text)
+    if not fact_norm:
+        return 0, []
+    fact_terms = _verification_match_terms(fact_text)
+    sources = (
+        ("detail_focus", focus, 120),
+        ("detail", detail, 70),
+        ("item", canonical, 45),
+    )
+    score = 0
+    basis: list[str] = []
+    label = str(getattr(element, "label", "") or "").strip()
+    label_norm = _normalize_verification_text(label)
+    for source_name, source_text, weight in sources:
+        source_norm = _normalize_verification_text(source_text)
+        if not source_norm:
+            continue
+        if (
+            label_norm
+            and len(label_norm) >= 2
+            and (label_norm in source_norm or source_norm in label_norm)
+        ):
+            score += weight + 40
+            basis.append(f"{source_name}↔label:{label[:24]}")
+            continue
+        overlap = sorted(
+            fact_terms & _verification_match_terms(source_text),
+            key=lambda value: (-len(value), value),
+        )
+        if overlap:
+            term = overlap[0]
+            score += weight + min(len(term), 8)
+            basis.append(f"{source_name}↔element:{term}")
+    return score, basis[:3]
+
+
+def _collect_related_interactive_facts(
+    ctx: ToolContext,
+    *,
+    verification_key: str,
+    condition: str,
+    detail: str,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Return current-page UI facts related by lexical evidence to an unknown claim.
+
+    Element existence/clickability/index are deterministic current-page facts. The
+    relation is explicitly reported as lexical match_basis and is not treated as
+    proof that a candidate satisfies the verification claim.
+    """
+    perceiver = getattr(ctx, "perceiver", None)
+    if perceiver is None:
+        return []
+    try:
+        understanding = perceiver.perceive()
+    except Exception:
+        return []
+    elements = list(getattr(understanding, "elements", []) or [])
+    clickables = [
+        element for element in elements if getattr(element, "clickable", False)
+    ]
+    canonical = str(
+        (getattr(ctx, "_verification_items_by_key", {}) or {}).get(
+            verification_key, condition
+        )
+        or condition
+    )
+    detail_text = str(detail or "")
+    focus_parts = re.split(r"但|但是|然而|不过|仍需|需要|无法|未能|缺少", detail_text)
+    focus = focus_parts[-1].strip() if len(focus_parts) > 1 else detail_text
+
+    scored: dict[int, tuple[int, Any, list[str]]] = {}
+    for index, element in enumerate(clickables):
+        if not getattr(element, "enabled", True) or not getattr(
+            element, "safe_to_click", True
+        ):
+            continue
+        score, basis = _score_verification_element(
+            element, canonical=canonical, detail=detail_text, focus=focus
+        )
+        if score > 0:
+            scored[index] = (score, element, basis)
+
+    # If a matching child is not clickable, promote the smallest safe clickable
+    # container whose bounds contain it. This preserves the real click index.
+    for child in elements:
+        if getattr(child, "clickable", False):
+            continue
+        child_score, child_basis = _score_verification_element(
+            child, canonical=canonical, detail=detail_text, focus=focus
+        )
+        if child_score <= 0:
+            continue
+        child_bounds = tuple(getattr(child, "bounds", (0, 0, 0, 0)) or (0, 0, 0, 0))
+        if len(child_bounds) != 4:
+            continue
+        containers: list[tuple[int, int, Any]] = []
+        for index, candidate in enumerate(clickables):
+            if not getattr(candidate, "enabled", True) or not getattr(
+                candidate, "safe_to_click", True
+            ):
+                continue
+            bounds = tuple(getattr(candidate, "bounds", (0, 0, 0, 0)) or (0, 0, 0, 0))
+            if len(bounds) != 4 or not (
+                bounds[0] <= child_bounds[0]
+                and bounds[1] <= child_bounds[1]
+                and bounds[2] >= child_bounds[2]
+                and bounds[3] >= child_bounds[3]
+            ):
+                continue
+            candidate_path = str(getattr(candidate, "context_path", "") or "")
+            child_path = str(getattr(child, "context_path", "") or "")
+            if (
+                candidate_path
+                and child_path
+                and not (
+                    child_path.startswith(candidate_path)
+                    or candidate_path in child_path
+                )
+            ):
+                continue
+            area = max(0, bounds[2] - bounds[0]) * max(0, bounds[3] - bounds[1])
+            containers.append((area, index, candidate))
+        if containers:
+            _, index, parent = min(containers, key=lambda item: item[0])
+            promoted_basis = [
+                f"child:{str(getattr(child, 'label', '') or '?')[:24]}"
+            ] + child_basis
+            previous = scored.get(index)
+            if previous is None or child_score > previous[0]:
+                scored[index] = (child_score, parent, promoted_basis[:3])
+
+    facts: list[dict[str, Any]] = []
+    for index, (score, element, basis) in sorted(
+        scored.items(), key=lambda item: (-item[1][0], item[0])
+    )[: max(0, limit)]:
+        facts.append(
+            {
+                "index": index,
+                "label": str(getattr(element, "label", "") or ""),
+                "rid": str(getattr(element, "resource_id", "") or ""),
+                "class_name": str(getattr(element, "class_name", "") or ""),
+                "path": str(getattr(element, "context_path", "") or ""),
+                "bounds": list(getattr(element, "bounds", ()) or ()),
+                "region": str(getattr(element, "region", "") or ""),
+                "match_basis": basis,
+            }
+        )
+    if not facts:
+        return []
+
+    page_identity = "|".join(
+        (
+            str(getattr(understanding, "activity", "") or ""),
+            str(getattr(understanding, "page_title", "") or ""),
+            json.dumps(
+                facts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
+    )
+    signature = hashlib.sha1(
+        f"{verification_key}|{page_identity}".encode("utf-8")
+    ).hexdigest()
+    seen = getattr(ctx, "_verification_interactive_facts_seen", None)
+    if seen is None:
+        seen = set()
+        ctx._verification_interactive_facts_seen = seen
+    if signature in seen:
+        return []
+    seen.add(signature)
+    return facts
+
+
 @tool
-def assert_verification(condition: str, result: str, detail: str = "") -> str:
+def assert_verification(
+    condition: str,
+    result: str,
+    detail: str = "",
+    verification_key: str = "",
+) -> str:
     """逐条报告验证条件的结果。
 
-    condition 对应 goal.verification 中的验证项；result 只能为 ``passed``、
-    ``failed`` 或 ``unknown``。``unknown`` 表示当前架构缺少可核实证据，
+    condition 对应 goal.verification 中的验证项；可选 ``verification_key`` 传入
+    Agent 上下文提供的 ``vN``，将同义描述稳定归入该验证项。result 只能为
+    ``passed``、``failed`` 或 ``unknown``。``unknown`` 表示当前架构缺少可核实证据，
     需要人工复核，不能被当作功能失败或模型猜测通过。所有结果均需 detail。
     截图策略：每个验证点都实时截图，保证验证清单中每条记录对应独立证据。"""
     # 延迟 import：避免加载期循环依赖；同时让测试对 tools.get_tool_context 的
@@ -206,6 +436,7 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
         )
 
     ctx = get_tool_context()
+    related_interactive_facts: list[dict[str, Any]] = []
     if ctx:
         if not hasattr(ctx, "_verifications"):
             ctx._verifications = []
@@ -213,7 +444,7 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
             ctx._verification_detail_retries = {}
         if not hasattr(ctx, "_duplicate_assert_count"):
             ctx._duplicate_assert_count = 0
-        verification_key = _resolve_verification_key(ctx, condition)
+        verification_key = _resolve_verification_key(ctx, condition, verification_key)
         normalized = normalized_result
         if normalized == "passed":
             for index, existing in enumerate(ctx._verifications):
@@ -226,7 +457,7 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
                     )
                     return make_result(
                         OK,
-                        f"重复记录已忽略: {verification_key} already passed at step={index + 1}",
+                        f"DUPLICATE_IGNORED: {verification_key} already passed at step={index + 1}",
                         evidence={
                             "verification_key": verification_key,
                             "reported_result": normalized_result,
@@ -257,6 +488,13 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
             )
         else:
             ctx._verification_detail_retries.pop(verification_key, None)
+        if normalized == "unknown":
+            related_interactive_facts = _collect_related_interactive_facts(
+                ctx,
+                verification_key=verification_key,
+                condition=condition,
+                detail=detail,
+            )
         shot_path = ""  # 相对路径（供前端 /storage 挂载解析）
         shot_abs_path = ""  # 绝对路径（供本地文件操作）
 
@@ -368,16 +606,38 @@ def assert_verification(condition: str, result: str, detail: str = "") -> str:
             }
         )
     suffix = "（需要人工复核）" if normalized_result == "unknown" else ""
-    return make_result(
-        OK,
-        f"记录完成: {condition} → {normalized_result}{suffix}",
-        evidence={
-            "verification_key": verification_key,
-            "reported_result": normalized_result,
-            "review_required": normalized_result == "unknown",
-            "detail_len": len(detail or ""),
-        },
-    )
+    message = f"记录完成: {condition} → {normalized_result}{suffix}"
+    evidence: dict[str, Any] = {
+        "verification_key": verification_key,
+        "reported_result": normalized_result,
+        "review_required": normalized_result == "unknown",
+        "detail_len": len(detail or ""),
+    }
+    if related_interactive_facts:
+        fact_lines = [
+            "[当前页面可交互事实] "
+            f"发现 {len(related_interactive_facts)} 个与未核实文本存在字面关联的候选："
+        ]
+        for fact in related_interactive_facts:
+            label = fact.get("label") or "<无文本>"
+            rid = fact.get("rid") or ""
+            basis = ",".join(fact.get("match_basis") or [])
+            fact_lines.append(
+                f"- [{fact.get('index')}] {label!r} rid={rid or '?'} "
+                f"bounds={fact.get('bounds')} match_basis={basis or '?'}"
+            )
+        message += "\n" + "\n".join(fact_lines)
+        evidence.update(
+            {
+                "related_interactive_count": len(related_interactive_facts),
+                "related_interactives": json.dumps(
+                    related_interactive_facts,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            }
+        )
+    return make_result(OK, message, evidence=evidence)
 
 
 @tool

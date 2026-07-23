@@ -18,13 +18,16 @@ logger = logging.getLogger(__name__)
 
 
 def _reset_run_scoped(ctx) -> None:
-    """重置 run 级累加器：验证结果 / M4 确定性核实 / O1 token 统计 / RAG 缓存。
-    每次新执行前调用，避免跨 run 数据串扰。绝不抛异常。"""
+    """重置 run 级累加器：验证结果 / 可交互事实去重 / M4 确定性核实 /
+    O1 token 统计 / RAG 缓存。每次新执行前调用，避免跨 run 数据串扰。绝不抛异常。"""
     if not ctx:
         return
     try:
         if isinstance(getattr(ctx, "_verifications", None), list):
             ctx._verifications.clear()
+        interactive_seen = getattr(ctx, "_verification_interactive_facts_seen", None)
+        if isinstance(interactive_seen, set):
+            interactive_seen.clear()
         if isinstance(getattr(ctx, "_deterministic_checks", None), list):
             ctx._deterministic_checks.clear()
         tu = getattr(ctx, "_token_usage", None)

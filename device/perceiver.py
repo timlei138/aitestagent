@@ -574,19 +574,27 @@ class SmartPerceiver:
                 continue
             left_items = [item for item in candidates if item.bounds[2] <= split_x]
             right_items = [item for item in candidates if item.bounds[0] >= split_x]
-            left_actionable = [
+            # left_navigation 必须有独立的、带语义标签且纵向分布的入口。
+            # 仅凭无文本的可点击网格单元不能把课程表/看板的一部分误判成导航栏。
+            left_navigation_items = [
                 item
                 for item in left_items
-                if item.clickable and item.bounds[3] - item.bounds[1] >= 32
+                if item.clickable
+                and (item.label or "").strip()
+                and item.bounds[3] - item.bounds[1] >= 32
             ]
             if (
-                len(left_actionable) < 3
+                len(left_navigation_items) < 3
                 or len(right_items) < 3
-                or coverage(left_actionable) < height * 0.18
+                or coverage(left_navigation_items) < height * 0.18
                 or coverage(right_items) < height * 0.18
             ):
                 continue
-            score = gap + min(len(left_actionable), 8) * 12 + min(len(right_items), 8) * 6
+            score = (
+                gap
+                + min(len(left_navigation_items), 8) * 12
+                + min(len(right_items), 8) * 6
+            )
             if best is None or score > best[0]:
                 best = (score, split_x, left_items, right_items)
 

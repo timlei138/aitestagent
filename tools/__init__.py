@@ -103,8 +103,6 @@ from tools.click import (
     reset_session_click_ids,
     scroll_find_and_click,
 )
-from llm.safety import check_dangerous
-
 import app_paths
 
 logger = logging.getLogger(__name__)

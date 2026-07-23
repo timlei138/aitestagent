@@ -510,6 +510,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     ]
     hist_str = "\n".join(hist_lines) if hist_lines else "(none)"
     key_lookup, key_to_item = _build_verification_key_maps(goal)
+    verification_key_guide = "\n".join(
+        f"- {key}: {item}" for key, item in key_to_item.items()
+    )
     if ctx:
         ctx._verification_key_map = key_lookup
         ctx._verification_items_by_key = key_to_item
@@ -640,6 +643,12 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             + page_info
             + "\n\nHistory:\n"
             + hist_str
+            + (
+                "\n\nVerification keys（上报时必须传 verification_key，condition 可写当前证据描述）：\n"
+                + verification_key_guide
+                if verification_key_guide
+                else ""
+            )
             + (
                 "\n\nKnowledge Policy:\n默认不预置场景知识。若不确定下一步，"
                 "优先调用 query_app_knowledge(query, app_package) 获取当前场景知识。"

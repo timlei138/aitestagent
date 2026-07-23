@@ -48,6 +48,10 @@ class ToolContext:
     # M4：确定性断言结果记录（{"text","kind","result": "pass"/"fail"}），
     # assert_verification 反查最近一条与验证项匹配的确定性核实作为 ground truth。
     _deterministic_checks: list = field(default_factory=list, repr=False)
+    # unknown 验证返回过的当前页相关可交互事实签名，避免同页重复提示。
+    _verification_interactive_facts_seen: set[str] = field(
+        default_factory=set, repr=False
+    )
     # O1：单次运行 token 消耗累计（纯观测）。每次 LLM 调用累加 usage_metadata。
     _token_usage: dict = field(
         default_factory=lambda: {

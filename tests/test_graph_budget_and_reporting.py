@@ -275,3 +275,149 @@ def test_should_not_force_query_when_rag_already_available():
         graph._should_force_query_app_knowledge(state, include_rag=True, rag_summary="## 人工知识")  # type: ignore[attr-defined]
         is False
     )
+
+
+def test_assert_verification_explicit_key_keeps_paraphrased_evidence_on_goal_item(monkeypatch):
+    fake_ctx = SimpleNamespace(
+        _verifications=[],
+        _verification_key_map={"点击取消或弹框外空白处弹框关闭": "v5"},
+        verification_auto_vision=False,
+        device=None,
+        _last_screenshot_path="",
+    )
+    monkeypatch.setattr(tools_module, "get_tool_context", lambda: fake_ctx)
+
+    out = tools_module.assert_verification.invoke(
+        {
+            "condition": "已通过关闭按钮返回课程表页面",
+            "result": "passed",
+            "detail": "当前 Activity 已返回课程表",
+            "verification_key": "v5",
+        }
+    )
+
+    assert "verification_key=v5" in out
+    assert fake_ctx._verifications[0]["key"] == "v5"
+
+
+def _verification_element(
+    *,
+    label="",
+    rid="",
+    bounds=(0, 0, 100, 100),
+    clickable=False,
+    enabled=True,
+    safe_to_click=True,
+    path="",
+):
+    return SimpleNamespace(
+        label=label,
+        associated_label="",
+        resource_id=rid,
+        class_name="android.widget.LinearLayout",
+        context_path=path,
+        bounds=bounds,
+        region="main_content",
+        clickable=clickable,
+        enabled=enabled,
+        safe_to_click=safe_to_click,
+    )
+
+
+def test_unknown_verification_returns_related_current_page_interactive_facts_once(
+    monkeypatch,
+):
+    disabled = _verification_element(
+        label="课程背景色",
+        rid="disabledColor",
+        clickable=True,
+        enabled=False,
+    )
+    color_row = _verification_element(
+        label="课程背景色",
+        rid="com.zui.calendar:id/llCourseColor",
+        bounds=(560, 1023, 2000, 1173),
+        clickable=True,
+        path="content > curriculum_scroll_view > llCourseColor",
+    )
+    understanding = SimpleNamespace(
+        activity="com.zui.calendar.EditCourseActivity",
+        page_title="新建课程",
+        elements=[disabled, color_row],
+    )
+    fake_ctx = SimpleNamespace(
+        _verifications=[],
+        _verification_key_map={},
+        _verification_items_by_key={
+            "v4": "弹出编辑弹窗，包含课程背景色(10种)"
+        },
+        verification_auto_vision=False,
+        device=None,
+        perceiver=SimpleNamespace(perceive=lambda: understanding),
+        _last_screenshot_path="",
+    )
+    monkeypatch.setattr(tools_module, "get_tool_context", lambda: fake_ctx)
+    detail = "字段存在，但背景色具体颜色数量需展开后确认"
+    args = {
+        "condition": "编辑课程字段",
+        "result": "unknown",
+        "detail": detail,
+        "verification_key": "v4",
+    }
+
+    first = tools_module.assert_verification.invoke(args)
+    second = tools_module.assert_verification.invoke(args)
+
+    assert "[当前页面可交互事实]" in first
+    assert "[1] '课程背景色'" in first
+    assert "llCourseColor" in first
+    assert "disabledColor" not in first
+    assert "related_interactive_count=1" in first
+    assert "[当前页面可交互事实]" not in second
+    assert fake_ctx._verifications[0]["detail"] == detail
+
+
+def test_unknown_verification_promotes_matching_child_to_clickable_parent(monkeypatch):
+    parent = _verification_element(
+        label="",
+        rid="com.example:id/colorRow",
+        bounds=(100, 100, 500, 300),
+        clickable=True,
+        path="content > colorRow",
+    )
+    child = _verification_element(
+        label="背景色指示器",
+        rid="com.example:id/viewColorIndicator",
+        bounds=(420, 160, 460, 200),
+        clickable=False,
+        path="content > colorRow",
+    )
+    understanding = SimpleNamespace(
+        activity="com.example.EditActivity",
+        page_title="编辑",
+        elements=[parent, child],
+    )
+    fake_ctx = SimpleNamespace(
+        _verifications=[],
+        _verification_key_map={},
+        _verification_items_by_key={"v0": "背景色有10种"},
+        verification_auto_vision=False,
+        device=None,
+        perceiver=SimpleNamespace(perceive=lambda: understanding),
+        _last_screenshot_path="",
+    )
+    monkeypatch.setattr(tools_module, "get_tool_context", lambda: fake_ctx)
+
+    out = tools_module.assert_verification.invoke(
+        {
+            "condition": "背景色数量",
+            "result": "unknown",
+            "detail": "背景色指示器存在，但选项数量无法确认",
+            "verification_key": "v0",
+        }
+    )
+
+    assert "[0] '<无文本>'" in out
+    assert "colorRow" in out
+    assert "child:背景色指示器" in out
+    assert "viewColorIndicator" not in out.split("related_interactives=", 1)[0]

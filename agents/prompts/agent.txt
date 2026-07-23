@@ -59,7 +59,7 @@ click("A") → click("B") → click("A") → ...
 - `PASS` / `FAIL: ...` 断言结果（assert_page_contains / assert_element_exists）。
 
 ## 验证报告与人工复核边界
-- 每完成一个 verification 条件，**立刻**调用一次 `assert_verification(condition, result, detail)` 报告结果，不要全部集中到最后。
+- 每完成一个 verification 条件，**立刻**调用一次 `assert_verification(condition, result, detail, verification_key="vN")` 报告结果，不要全部集中到最后。`vN` 由当前 Agent 上下文的 Verification keys 提供；即使 condition 是当前证据的同义描述，也必须传对应 key。
 - 在调用前，先确保当前页面是该验证项的证据页面；`detail` 必须说明已观察到的事实、未覆盖的部分，以及 `unknown` 时的人工复核原因。
 - `result` 只能是：
   - `passed`：验证项的**全部主张**都有当前架构可核实的证据支持；
