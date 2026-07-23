@@ -149,21 +149,20 @@ except Exception:
 
 
 @tool
-def get_screen_info(mode: str = "full") -> str:
+def get_screen_info(mode: str = "full", offset: int = 0, limit: int = 50) -> str:
     """获取当前页面的结构化语义信息。
 
     mode 参数：
-    - "full"（默认）: 返回全部元素（导航项 + 所有可交互元素），适合规划和分析
-    - "clickable": 仅返回可点击的元素，适合执行 click 前快速查找目标
+    - "full"（默认）: 返回主要路径和元素概览，适合规划和分析。
+    - "clickable": 分页返回可点击元素及其全局 [n]；可用 offset/limit 查看后续项。
     """
     ctx = get_tool_context()
     if ctx.perceiver is None:
         return "Perceiver not available - no Android device connected"
     understanding = ctx.perceiver.perceive()
+    # 契约：所有真实可点击元素均有全局 index，且与 click(index=n) 一致。
     indexed_clickables = [
-        e
-        for e in understanding.elements
-        if getattr(e, "clickable", False) and (e.label or "")
+        e for e in understanding.elements if getattr(e, "clickable", False)
     ]
     clickable_index_map = {id(e): i for i, e in enumerate(indexed_clickables)}
     # 页面身份: activity + 标题
@@ -173,29 +172,39 @@ def get_screen_info(mode: str = "full") -> str:
     lines = [
         f"page={page_id}",
         understanding.summary,
-        (
-            "layout=two_pane（结构分区标签，不保证左右方位）"
-            if understanding.layout == "two_pane"
-            else f"layout={understanding.layout}"
-        ),
+        f"layout={understanding.layout}",
     ]
+    _append_panel_summary(lines, understanding, indexed_clickables)
 
     if mode == "clickable":
-        # 仅可点击元素（按 role 优先级排序）
-        clickable = [e for e in understanding.elements if e.clickable]
-        # 去重：按 label 去重，保留第一个
+        # 对有文本项按 label 去重；无文本项必须逐一保留，bounds/class/path
+        # 是它们的唯一性事实，不能合并或丢弃。
         seen_labels: set[str] = set()
-        unique: list[Any] = []
-        for e in clickable:
-            key = (e.label or "").strip()
-            if key and key not in seen_labels:
+        display_items: list[Any] = []
+        for element in indexed_clickables:
+            key = (element.label or "").strip()
+            if key:
+                if key in seen_labels:
+                    continue
                 seen_labels.add(key)
-                unique.append(e)
-        lines.append(f"clickable_elements={len(unique)}")
-        for item in unique[:50]:
+            display_items.append(element)
+        page_offset = max(0, int(offset))
+        page_limit = min(max(1, int(limit)), 100)
+        page_items = display_items[page_offset : page_offset + page_limit]
+        end = page_offset + len(page_items)
+        lines.append(
+            f"clickable_total={len(indexed_clickables)} "
+            f"display_items={len(display_items)} showing={page_offset}-{max(page_offset, end - 1)}"
+        )
+        for item in page_items:
             lines.append(_format_element_line(item, clickable_index_map.get(id(item))))
+        if end < len(display_items):
+            lines.append(
+                f"...（还有 {len(display_items) - end} 项；"
+                f"使用 get_screen_info(mode='clickable', offset={end}) 查看后续全局 [n]）"
+            )
     else:
-        # 全量：导航项 + 所有元素
+        # 全量概览：导航项 + 所有元素。大型页面请改用 clickable 分页查看 index。
         lines.append(f"primary_paths={len(understanding.primary_paths)}")
         for item in understanding.primary_paths[:40]:
             lines.append(_format_element_line(item, clickable_index_map.get(id(item))))
@@ -204,6 +213,70 @@ def get_screen_info(mode: str = "full") -> str:
             lines.append(_format_element_line(item, clickable_index_map.get(id(item))))
 
     return "\n".join(lines)
+
+
+def _append_panel_summary(
+    lines: list[str], understanding: Any, indexed_clickables: list[Any]
+) -> None:
+    """Expose pane facts using the same all-clickable index contract as click()."""
+    if getattr(understanding, "layout", "") != "two_pane":
+        return
+    regions = getattr(understanding, "regions", []) or []
+    if not regions:
+        return
+    lines.append("panels（动态边界；[n] 为全局真实可点击序号）：")
+    for panel in regions:
+        name = str(panel.get("name", "main_content"))
+        bounds = panel.get("bounds", [])
+        panel_elements = [
+            element
+            for element in (getattr(understanding, "elements", []) or [])
+            if getattr(element, "region", "main_content") == name
+        ]
+        panel_clickables = [
+            element for element in panel_elements if getattr(element, "clickable", False)
+        ]
+        panel_indexes = [
+            index
+            for index, element in enumerate(indexed_clickables)
+            if getattr(element, "region", "main_content") == name
+        ]
+        labeled_count = sum(
+            bool((getattr(element, "label", "") or "").strip())
+            for element in panel_clickables
+        )
+        unlabeled = [
+            element
+            for element in panel_clickables
+            if not (getattr(element, "label", "") or "").strip()
+        ]
+        index_text = ",".join(map(str, panel_indexes[:12])) or "无"
+        if len(panel_indexes) > 12:
+            index_text += f",...(+{len(panel_indexes) - 12})"
+        lines.append(
+            f"- {name} bounds={bounds} elements={len(panel_elements)} "
+            f"clickable_total={len(panel_clickables)} "
+            f"labeled_clickable={labeled_count} global_indexes={index_text}"
+        )
+        if name == "right_content" and unlabeled:
+            example = unlabeled[0]
+            example_index = indexed_clickables.index(example)
+            example_class = (
+                (getattr(example, "class_name", "") or "").split(".")[-1] or "?"
+            )
+            example_path = getattr(example, "context_path", "") or "?"
+            lines.append(
+                f"  ! 右侧存在 {len(unlabeled)} 个无文本可点击元素；"
+                "使用其全局 [n]，不要改用左侧导航的 [n]。"
+            )
+            lines.append(
+                f"    示例：[{example_index}] <无文本> class={example_class} "
+                f"bounds={getattr(example, 'bounds', ())} path={example_path}"
+            )
+        elif name == "right_content" and panel_elements and not panel_clickables:
+            lines.append(
+                "  ! 右侧内容区没有真实可点击元素；不要改用左侧导航的 [n]。"
+            )
 
 
 def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
@@ -225,8 +298,9 @@ def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
     if ctx_path:
         extra += f" path='{ctx_path}'"
     idx_prefix = f"[{clickable_index}] " if clickable_index is not None else ""
+    label = (getattr(item, "label", "") or "").strip() or "<无文本>"
     return (
-        f'- {idx_prefix}[{item.region}/{item.role}] "{item.label}"{extra}'
+        f'- {idx_prefix}[{item.region}/{item.role}] "{label}"{extra}'
         f" bounds={item.bounds}{clickable_mark}"
     )
 

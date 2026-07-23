@@ -161,16 +161,31 @@ def scroll_panel(panel: str = "left_navigation", direction: str = "down") -> str
     screen_w = understanding.width or 1080
     screen_h = understanding.height or 1920
 
+    panel_region: dict | None = None
     if understanding.layout == "two_pane":
-        if panel == "left_navigation":
-            x_center = int(screen_w * 0.22)
-        else:
-            x_center = int(screen_w * 0.72)
+        for region in getattr(understanding, "regions", []) or []:
+            if region.get("name") == panel:
+                panel_region = region
+                break
+    if panel_region:
+        left, _top, right, _bottom = panel_region.get(
+            "bounds", [0, 0, screen_w, screen_h]
+        )
+        x_center = (int(left) + int(right)) // 2
     else:
         x_center = screen_w // 2
 
-    # 滚动前记录当前可见元素（检测是否已到末尾）
-    pre_labels = {e.label for e in understanding.elements if e.label and e.clickable}
+    def visible_labels(page) -> set[str]:
+        return {
+            element.label
+            for element in page.elements
+            if element.label
+            and element.clickable
+            and (panel_region is None or element.region == panel)
+        }
+
+    # 滚动前记录当前面板的可见元素（检测是否已到末尾）
+    pre_labels = visible_labels(understanding)
 
     # 方向语义：down=往下翻(露出下方内容)→手指从下往上划
     #           up=往上翻(露出上方内容)→手指从上往下划
@@ -191,7 +206,7 @@ def scroll_panel(panel: str = "left_navigation", direction: str = "down") -> str
     time.sleep(0.5)  # 等 UI 刷新
     try:
         post = ctx.perceiver.perceive()
-        post_labels = {e.label for e in post.elements if e.label and e.clickable}
+        post_labels = visible_labels(post)
         new_count = len(post_labels - pre_labels)
         if new_count == 0:
             return f"已滚动{panel}: {direction}（已到末尾，无新元素）"

@@ -438,39 +438,21 @@ class SmartPerceiver:
         width: int,
         height: int,
     ) -> PageUnderstanding:
-        # 用更严格的 left 判定（必须完全在左 45% 内 + 高度合理）来识别 two_pane
-        left_clickables = [
-            e
-            for e in elements
-            if e.clickable
-            and e.bounds[2] <= width * 0.45
-            and (e.bounds[3] - e.bounds[1]) >= 32
-        ]
-        right_elements = [
-            e
-            for e in elements
-            if e.bounds[0] >= width * 0.35
-            and (e.bounds[2] - e.bounds[0]) > 0
-            and (e.bounds[3] - e.bounds[1]) > 0
-        ]
-        has_two_pane = len(left_clickables) >= 3 and len(right_elements) >= 3
-
-        layout = "two_pane" if has_two_pane else "single_pane"
-        regions = []
-        if has_two_pane:
-            regions = [
-                {
-                    "name": "left_navigation",
-                    "role": "navigation",
-                    "bounds": [0, 0, int(width * 0.45), height],
-                },
-                {
-                    "name": "right_content",
-                    "role": "content",
-                    "bounds": [int(width * 0.35), 0, width, height],
-                },
+        # page_info 代表当前屏幕可见内容；只保留与屏幕可视区域有交集的元素。
+        # 需要滚动的内容应在滚动后重新 perceive，而不是一次性列进当前视野。
+        if width > 0 and height > 0:
+            elements = [
+                e
+                for e in elements
+                if e.bounds[0] < width
+                and e.bounds[2] > 0
+                and e.bounds[1] < height
+                and e.bounds[3] > 0
             ]
-        else:
+        regions = self._detect_pane_regions(elements, width, height)
+        has_two_pane = len(regions) == 2
+        layout = "two_pane" if has_two_pane else "single_pane"
+        if not regions:
             regions = [
                 {
                     "name": "main_content",
@@ -482,7 +464,7 @@ class SmartPerceiver:
         risky: list[UIElement] = []
         primary: list[UIElement] = []
         for e in elements:
-            self._classify_element(e, width, height, has_two_pane)
+            self._classify_element(e, width, height, regions)
             if not e.safe_to_click:
                 risky.append(e)
             if (
@@ -508,12 +490,24 @@ class SmartPerceiver:
         title_part = f"「{page_title}」" if page_title else ""
         act_short = activity.split(".")[-1] if activity else ""
         breadcrumb = f"{title_part}" if title_part else act_short
+        pane_summary = ""
+        if has_two_pane:
+            split_x = regions[0]["bounds"][2]
+            pane_summary = f"动态双栏分隔 x={split_x}/{width}"
         return PageUnderstanding(
             layout=layout,
             summary=(
-                f"{breadcrumb} — {layout} 页面（结构分区标签，不保证左右方位），识别到 {len(primary)} 个主要路径入口"
-                if breadcrumb
-                else f"{layout} 页面（结构分区标签，不保证左右方位），识别到 {len(primary)} 个主要路径入口"
+                f"{breadcrumb} — {pane_summary}，识别到 {len(primary)} 个主要路径入口"
+                if has_two_pane and breadcrumb
+                else (
+                    f"{pane_summary}，识别到 {len(primary)} 个主要路径入口"
+                    if has_two_pane
+                    else (
+                        f"{breadcrumb} — {layout} 页面，识别到 {len(primary)} 个主要路径入口"
+                        if breadcrumb
+                        else f"{layout} 页面，识别到 {len(primary)} 个主要路径入口"
+                    )
+                )
             ),
             package=package,
             activity=activity,
@@ -526,15 +520,105 @@ class SmartPerceiver:
             risky_actions=risky,
         )
 
+    @staticmethod
+    def _detect_pane_regions(
+        elements: list[UIElement], width: int, height: int
+    ) -> list[dict[str, Any]]:
+        """Infer two disjoint panes from the current UI geometry.
+
+        A split is accepted only when both sides have independent vertical UI
+        evidence. Wide shared chrome is ignored, so the result never depends on
+        a fixed left/right percentage or produces overlapping bounds.
+        """
+        if width <= 0 or height <= 0:
+            return []
+        candidates: list[UIElement] = []
+        for element in elements:
+            left, top, right, bottom = element.bounds
+            element_width = right - left
+            element_height = bottom - top
+            if element_width <= 0 or element_height <= 0:
+                continue
+            # Toolbar/root containers often span the screen and are shared
+            # chrome, not evidence of either pane.
+            if element_width >= width * 0.72:
+                continue
+            candidates.append(element)
+        if len(candidates) < 6:
+            return []
+
+        centers = sorted(
+            {
+                int((element.bounds[0] + element.bounds[2]) / 2)
+                for element in candidates
+            }
+        )
+        if len(centers) < 2:
+            return []
+
+        def coverage(items: list[UIElement]) -> int:
+            if not items:
+                return 0
+            return max(item.bounds[3] for item in items) - min(
+                item.bounds[1] for item in items
+            )
+
+        min_gap = max(48, int(width * 0.08))
+        best: tuple[int, int, list[UIElement], list[UIElement]] | None = None
+        for left_center, right_center in zip(centers, centers[1:]):
+            gap = right_center - left_center
+            split_x = (left_center + right_center) // 2
+            # 当前双栏语义是“左侧窄导航 + 右侧内容”。限制分隔线不超过
+            # 45% 宽度，避免右侧多列的内部间隙被误判为主分隔线。
+            if gap < min_gap or split_x <= width * 0.15 or split_x > width * 0.45:
+                continue
+            left_items = [item for item in candidates if item.bounds[2] <= split_x]
+            right_items = [item for item in candidates if item.bounds[0] >= split_x]
+            left_actionable = [
+                item
+                for item in left_items
+                if item.clickable and item.bounds[3] - item.bounds[1] >= 32
+            ]
+            if (
+                len(left_actionable) < 3
+                or len(right_items) < 3
+                or coverage(left_actionable) < height * 0.18
+                or coverage(right_items) < height * 0.18
+            ):
+                continue
+            score = gap + min(len(left_actionable), 8) * 12 + min(len(right_items), 8) * 6
+            if best is None or score > best[0]:
+                best = (score, split_x, left_items, right_items)
+
+        if best is None:
+            return []
+        _, split_x, _, _ = best
+        return [
+            {
+                "name": "left_navigation",
+                "role": "navigation",
+                "bounds": [0, 0, split_x, height],
+            },
+            {
+                "name": "right_content",
+                "role": "content",
+                "bounds": [split_x, 0, width, height],
+            },
+        ]
+
     def _classify_element(
-        self, e: UIElement, width: int, height: int, has_two_pane: bool
+        self,
+        e: UIElement,
+        width: int,
+        height: int,
+        regions: list[dict[str, Any]],
     ) -> None:
         """为 UIElement 赋 role / region / priority。
 
-        关键修复（v2）:
-        - 左侧导航判定增加硬约束：必须 right <= width*0.45 AND left < width*0.30
-        - 区分 settings_entry（右侧二级页入口）vs list_entry（普通列表项）
-        - 引入 switch_row（包裹 Switch 的 clickable 容器，优先级最高）
+        关键规则：
+        - 面板边界由当前页面的 UI 元素簇动态推导，左右区域互斥。
+        - 只有完全落在左侧面板内的元素才会成为 navigation_item。
+        - 横跨分隔线的共享控件归入 main_content，避免被误作导航或内容。
         """
         label = e.label.lower()
         if any(
@@ -558,14 +642,13 @@ class SmartPerceiver:
             e.safe_to_click = False
         left, top, right, bottom = e.bounds
         class_name = e.class_name.lower()
-        in_left_pane = (
-            has_two_pane
-            and right <= width * 0.45
-            and left < width * 0.30  # 硬约束：起点必须在左 30% 内
-        )
-        in_right_pane = has_two_pane and left >= width * 0.35
+        pane_by_name = {str(region.get("name", "")): region for region in regions}
+        left_pane = pane_by_name.get("left_navigation")
+        right_pane = pane_by_name.get("right_content")
+        in_left_pane = bool(left_pane and right <= left_pane["bounds"][2])
+        in_right_pane = bool(right_pane and left >= right_pane["bounds"][0])
 
-        # 区域归属（不论是否可点击都标注，便于检索）
+        # 区域归属必须互斥；跨越动态分隔线的共享元素不属于任何 pane。
         if in_left_pane:
             e.region = "left_navigation"
         elif in_right_pane:

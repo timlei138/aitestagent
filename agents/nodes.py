@@ -137,9 +137,40 @@ def _stop_or_continue(state: TestState, ctx) -> Command | None:
     )
 
 
-# R4: 注入给 LLM 的 page_info 可点击元素上限（原为 ~25，导致目标常被截断在视野外）。
-# 保持原始顺序以与 click() 的 index 解析一致；超限补提示而非静默截断。
+# 注入给 LLM 的 page_info 带文本元素上限。真实全局 index 不受展示顺序影响。
 _AGENT_PAGE_INFO_MAX_ELEMENTS = 60
+# 额外展示少量无文本代表项，避免课程网格刷屏；混合页面最多输出 60 + 8 项。
+_AGENT_PAGE_INFO_UNLABELED_REPRESENTATIVE_LIMIT = 8
+
+
+def _select_page_info_clickables(
+    clickable_elements: list[Any], max_items: int = _AGENT_PAGE_INFO_MAX_ELEMENTS
+) -> list[tuple[int, Any]]:
+    """Prioritize labeled navigation anchors without changing global click indexes.
+
+    The returned tuples retain indexes from the canonical all-clickable sequence.
+    When a page mixes text controls and a large unlabeled grid, reserve a small
+    tail for representative grid cells instead of letting raw UI order crowd out
+    textual controls that guide immediate agent decisions.
+    """
+    indexed = list(enumerate(clickable_elements))
+    if max_items <= 0 or len(indexed) <= max_items:
+        return indexed[:max_items]
+    labeled = [
+        item for item in indexed if (getattr(item[1], "label", "") or "").strip()
+    ]
+    unlabeled = [
+        item for item in indexed if not (getattr(item[1], "label", "") or "").strip()
+    ]
+    if not labeled or not unlabeled:
+        return indexed[:max_items]
+    # 带文本导航/操作锚点最多展示 max_items 个；另追加固定数量的无文本
+    # 代表项。两者的全局 index 均来自 canonical 原始序列，不受展示重排影响。
+    unlabeled_limit = min(
+        _AGENT_PAGE_INFO_UNLABELED_REPRESENTATIVE_LIMIT,
+        len(unlabeled),
+    )
+    return labeled[:max_items] + unlabeled[:unlabeled_limit]
 
 
 def _load_prompt(name: str) -> str:
@@ -351,39 +382,99 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 else ""
             )
             current_app_key = f"{pkg}:{act}"
-            n_clickable = sum(1 for e in u.elements if e.clickable and e.label)
+            # 契约：全局 [n] 与 click(index=n) 覆盖所有真实可点击元素，
+            # 无文本课程格等元素不能因 label 为空而从候选池消失。
+            clickable_elements = [e for e in u.elements if e.clickable]
+            n_clickable = len(clickable_elements)
+            n_labeled_clickable = sum(
+                bool((e.label or "").strip()) for e in clickable_elements
+            )
             lines = [
                 "page=" + pid,
-                (
-                    "layout=two_pane（结构分区标签，不保证左右方位）"
-                    if u.layout == "two_pane"
-                    else "layout=" + u.layout
-                ),
-                "clickable=" + str(n_clickable),
+                "layout=" + u.layout,
+                "clickable_total=" + str(n_clickable),
+                "labeled_clickable=" + str(n_labeled_clickable),
             ]
-            # R4: 上限从 25 提到 _AGENT_PAGE_INFO_MAX_ELEMENTS（按元素个数而非行数计），
-            # 让目标控件更可能出现在视野内；超限不静默 break，而是补一条提示，
-            # 引导 LLM 用 get_screen_info 看全量或用 rid/path 精确定位。
-            # 注意：保持原始元素顺序，使 [index] 与 click() 的 _exact_clickable_candidates
-            # 解析顺序严格一致（不重排，避免 index 漂移）。
-            click_idx = 0
-            for e in u.elements:
-                if e.clickable and e.label:
-                    if click_idx >= _AGENT_PAGE_INFO_MAX_ELEMENTS:
-                        break
-                    role = e.role or ""
-                    rid = (e.resource_id or "").split("/")[-1] if e.resource_id else ""
-                    extra = ""
-                    if role:
-                        extra += " [" + role + "]"
-                    if rid:
-                        extra += " rid=" + rid
-                    lines.append(f"  - [{click_idx}] " + e.label + extra)
-                    click_idx += 1
-            if n_clickable > click_idx:
+            if u.layout == "two_pane":
                 lines.append(
-                    f"  ...（另有 {n_clickable - click_idx} 个可点击元素未列出；"
-                    "用 get_screen_info 查看全部，或直接用 rid/path_contains 精确定位）"
+                    "panels（动态边界；[n] 始终是全局可点击序号，不是面板内序号）："
+                )
+                for panel in getattr(u, "regions", []) or []:
+                    name = str(panel.get("name", "main_content"))
+                    bounds = panel.get("bounds", [])
+                    panel_elements = [
+                        element for element in u.elements if element.region == name
+                    ]
+                    panel_clickables = [
+                        element for element in panel_elements if element.clickable
+                    ]
+                    panel_indexes = [
+                        index
+                        for index, element in enumerate(clickable_elements)
+                        if element.region == name
+                    ]
+                    labeled_count = sum(
+                        bool((element.label or "").strip())
+                        for element in panel_clickables
+                    )
+                    unlabeled = [
+                        element
+                        for element in panel_clickables
+                        if not (element.label or "").strip()
+                    ]
+                    index_text = ",".join(map(str, panel_indexes[:12])) or "无"
+                    if len(panel_indexes) > 12:
+                        index_text += f",...(+{len(panel_indexes) - 12})"
+                    lines.append(
+                        f"- {name} bounds={bounds} elements={len(panel_elements)} "
+                        f"clickable_total={len(panel_clickables)} "
+                        f"labeled_clickable={labeled_count} "
+                        f"global_indexes={index_text}"
+                    )
+                    if name == "right_content" and unlabeled:
+                        example = unlabeled[0]
+                        example_index = clickable_elements.index(example)
+                        example_class = (
+                            (example.class_name or "").split(".")[-1] or "?"
+                        )
+                        example_path = example.context_path or "?"
+                        lines.append(
+                            f"  ! 右侧存在 {len(unlabeled)} 个无文本可点击元素；"
+                            f"使用全局 [n]，不要使用左侧导航的 [n] 代替。"
+                        )
+                        lines.append(
+                            f"    示例：[{example_index}] <无文本> class={example_class} "
+                            f"bounds={example.bounds} path={example_path}"
+                        )
+                    elif (
+                        name == "right_content"
+                        and panel_elements
+                        and not panel_clickables
+                    ):
+                        lines.append(
+                            "  ! 右侧内容区没有真实可点击元素；不要使用左侧导航的 [n] 代替。"
+                        )
+            # 仅 page_info 的展示顺序优先保留带文本导航锚点；每项仍携带
+            # canonical all-clickable 序列中的真实全局 [n]，不改变 click(index=n)。
+            page_info_items = _select_page_info_clickables(clickable_elements)
+            for global_index, e in page_info_items:
+                role = e.role or ""
+                rid = (e.resource_id or "").split("/")[-1] if e.resource_id else ""
+                region = e.region or "main_content"
+                label_text = (e.label or "").strip() or "<无文本>"
+                extra = " [" + region + "/" + (role or "unknown") + "]"
+                if rid:
+                    extra += " rid=" + rid
+                if not (e.label or "").strip():
+                    class_name = (e.class_name or "").split(".")[-1] or "?"
+                    extra += f" class={class_name} bounds={e.bounds}"
+                    if e.context_path:
+                        extra += " path=" + e.context_path
+                lines.append(f"  - [{global_index}] " + label_text + extra)
+            if n_clickable > len(page_info_items):
+                lines.append(
+                    f"  ...（另有 {n_clickable - len(page_info_items)} 个真实可点击元素未列出；"
+                    "用 get_screen_info(mode='clickable', offset=...) 分页查看全局 [n]）"
                 )
             page_info = "\n".join(lines)
             logger.info(

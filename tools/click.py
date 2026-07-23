@@ -278,10 +278,10 @@ def _exact_clickable_candidates(
 ) -> tuple[list[Any], str]:
     if understanding is None:
         return [], "ERROR: 页面信息不可用，无法执行精确点击"
+    # 契约：全局 index 覆盖所有真实可点击元素；无文本元素同样可通过
+    # index 精确命中，不能因缺少 label 而从候选池消失。
     clickables = [
-        e
-        for e in (understanding.elements or [])
-        if e.clickable and (e.label or "").strip()
+        e for e in (understanding.elements or []) if getattr(e, "clickable", False)
     ]
     rid_filter = (rid or "").strip()
     cls_filter = _normalize_text(class_name).split(".")[-1]

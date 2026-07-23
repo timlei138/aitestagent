@@ -380,3 +380,119 @@ def test_extract_curated_rule_label_for_conflict_match():
     assert (
         tools_module._extract_curated_rule_label("普通人工规则：先等待页面稳定") == ""
     )
+
+
+def test_get_screen_info_indexes_and_pages_unlabeled_clickables():
+    class _Device:
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.TimetableActivity",
+            }
+
+        def snapshot(self):
+            return SimpleNamespace(width=1200, height=800)
+
+    class _Perceiver:
+        def perceive(self):
+            left = _el(label="第1周", bounds=(20, 120, 220, 180))
+            left.region = "left_navigation"
+            first_cell = _el(
+                label="",
+                cls="android.widget.FrameLayout",
+                path="content > recyclerView > list_entry",
+                bounds=(620, 120, 820, 240),
+            )
+            first_cell.region = "right_content"
+            second_cell = _el(
+                label="",
+                cls="android.widget.FrameLayout",
+                path="content > recyclerView > list_entry",
+                bounds=(830, 120, 1030, 240),
+            )
+            second_cell.region = "right_content"
+            return SimpleNamespace(
+                activity="com.zui.calendar.TimetableActivity",
+                page_title="课程表",
+                layout="two_pane",
+                summary="summary",
+                regions=[
+                    {
+                        "name": "left_navigation",
+                        "bounds": [0, 0, 500, 800],
+                    },
+                    {
+                        "name": "right_content",
+                        "bounds": [500, 0, 1200, 800],
+                    },
+                ],
+                primary_paths=[left, first_cell, second_cell],
+                elements=[left, first_cell, second_cell],
+            )
+
+    tools_module.set_tool_context(ToolContext(device=_Device(), perceiver=_Perceiver()))
+
+    overview = tools_module.get_screen_info.invoke({"mode": "full"})
+    assert "clickable_total=2 labeled_clickable=0 global_indexes=1,2" in overview
+    assert "右侧存在 2 个无文本可点击元素" in overview
+    assert '[1] [right_content/list_entry] "<无文本>"' in overview
+
+    page = tools_module.get_screen_info.invoke(
+        {"mode": "clickable", "offset": 1, "limit": 1}
+    )
+    assert "clickable_total=3" in page
+    assert "showing=1-1" in page
+    assert '[1] [right_content/list_entry] "<无文本>"' in page
+    assert "offset=2" in page
+
+
+def test_click_index_selects_unlabeled_clickable_by_bounds(monkeypatch):
+    class _Device:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.TimetableActivity",
+            }
+
+        def click_text(self, _text: str):
+            return False
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+        def snapshot(self):
+            return SimpleNamespace(width=1200, height=800)
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.TimetableActivity",
+                page_title="课程表",
+                primary_paths=[],
+                elements=[
+                    _el(label="第1周", bounds=(20, 120, 220, 180)),
+                    _el(
+                        label="",
+                        cls="android.widget.FrameLayout",
+                        path="content > recyclerView > list_entry",
+                        bounds=(620, 120, 820, 240),
+                    ),
+                ],
+            )
+
+    device = _Device()
+    tools_module.set_tool_context(ToolContext(device=device, perceiver=_Perceiver()))
+    monkeypatch.setattr(
+        tools_module,
+        "check_dangerous",
+        lambda _label: SimpleNamespace(allowed=True, reason=""),
+    )
+
+    out = tools_module.click.invoke({"label": "第一节课程格", "index": 1})
+
+    assert "已点击" in out
+    assert device.clicked_bounds == [(620, 120, 820, 240)]
