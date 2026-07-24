@@ -12,17 +12,30 @@ def test_calc_budget_values():
     budget = graph._calc_budget(  # type: ignore[attr-defined]
         {"target_pages": ["p1", "p2", "p3"], "verification": ["v1", "v2"]}
     )
-    assert budget["max_tool_calls_total"] == 59
-    assert budget["max_agent_iterations"] == 7
-    assert budget["max_turns_per_iteration"] == 50
+    # 当前预算公式（agents/budget.py::_calc_budget）：
+    #   max_tool_calls_total = 24 + pages*12 + verifs*10
+    #   max_agent_iterations = min(max(2 + pages + verifs, 8), 24)
+    #   max_turns_per_iteration = min(max(max_tool_calls_total, 10), 64)
+    # 3 页 2 验证 → 24+36+20=80，max(7,8)=8，min(80,64)=64。
+    assert budget["max_tool_calls_total"] == 80
+    assert budget["max_agent_iterations"] == 8
+    assert budget["max_turns_per_iteration"] == 64
 
 
 def test_determine_execution_status_uses_dynamic_iteration_budget():
+    # 验证“执行状态依据目标动态算出的迭代预算”判定为 exhausted。
+    # 用当前预算公式算出阈值，避免与 _calc_budget 脱节（公式重构后
+    # max_agent_iterations 多了 8 的下限，固定 6 条历史会误判为 error）。
+    goal = {"target_pages": ["p1"], "verification": ["v1"]}
+    budget = graph._calc_budget_from_state(  # type: ignore[attr-defined]
+        {"goal_description": goal}
+    )
+    threshold = budget["max_agent_iterations"]
     state = {
         "status": "continue",
         "conclusion": "",
-        "goal_description": {"target_pages": ["p1"], "verification": ["v1"]},
-        "step_history": [{"index": i} for i in range(6)],
+        "goal_description": goal,
+        "step_history": [{"index": i} for i in range(threshold)],
     }
     assert graph._determine_execution_status(state) == "exhausted"  # type: ignore[attr-defined]
 
@@ -49,6 +62,10 @@ def test_reporter_keeps_verification_results_for_exhausted(monkeypatch):
         ]
     )
     monkeypatch.setattr(nodes, "get_tool_context", lambda: fake_ctx)
+    # reporter_node 经 _collect_verification_results 调用的是
+    # verification.py 内 `from tools import get_tool_context`（局部导入），
+    # 仅 patch nodes 上的引用覆盖不到，必须同时 patch tools 模块。
+    monkeypatch.setattr(tools_module, "get_tool_context", lambda: fake_ctx)
     state = {
         "status": "fail",
         "conclusion": "ABORT: MAX_TURNS_EXHAUSTED",
@@ -60,8 +77,10 @@ def test_reporter_keeps_verification_results_for_exhausted(monkeypatch):
     cmd = graph.reporter_node(
         state, {"configurable": {"test_config": AppTestConfig(write_run_trace=False)}}
     )
-    assert cmd.update["execution_status"] == "exhausted"
-    assert cmd.update["test_verdict"] == "inconclusive"
+    # 修复A：验证项全部 passed 且因 MAX_TURNS 收尾（exhausted）时，
+    # 归正为 completed / passed，避免把成功误判；验证结果仍须保留。
+    assert cmd.update["execution_status"] == "completed"
+    assert cmd.update["test_verdict"] == "passed"
     assert len(cmd.update["verification_results"]) == 1
     assert cmd.update["verification_results"][0]["item"] == "验证1"
 
@@ -196,6 +215,8 @@ def test_reporter_persists_metrics(monkeypatch):
 
     fake_ctx = SimpleNamespace(_verifications=[{"key": "v0", "item": "验证1", "result": "passed"}])
     monkeypatch.setattr(nodes, "get_tool_context", lambda: fake_ctx)
+    # 同上：reporter_node 内部 _collect_verification_results 走 tools.get_tool_context
+    monkeypatch.setattr(tools_module, "get_tool_context", lambda: fake_ctx)
     monkeypatch.setattr(graph, "_relational_db", FakeDB())
     state = {
         "status": "success",

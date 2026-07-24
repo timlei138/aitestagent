@@ -353,7 +353,10 @@ def launch_app(
         if target_activity
         else bool(observed_activity)
     )
-    arrival_confirmed = package_matched and activity_matched
+    # D: 到达契约——activity 是屏的真实身份（确定性事实），package 为次级软信号，
+    # 不单独硬卡。activity 不匹配才判定未到达；package 字符串不等但 activity 对
+    # 仍视为到达（避免把「打开了别的 Activity/包名别名」误判为失败）。
+    arrival_confirmed = activity_matched if target_activity else package_matched
     _record_page_transition(ctx, _pre_page, f"launch_app({requested_package})")
 
     evidence = {

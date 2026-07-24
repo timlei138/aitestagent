@@ -449,6 +449,53 @@ class KnowledgeBase:
     def count(self) -> int:
         return self.backend.count()
 
+    def query_element_semantic(self, app_package: str, rid_tail: str) -> str:
+        """按 resource-id 叶子名查该控件的历史语义（经验推断，非当前界面所见）。
+
+        从 experience 中找匹配 rid_tail 的记录，返回其学到的语义
+        （优先 action_semantic，其次归一化后的 to_page，最后 content 的 to_page 段）。
+        用于给「无屏上标签但有 resource-id」的图标补充一个 *推断* 提示，
+        让 LLM 能按 index 识别它，但绝不当作当前界面真实标签。无命中返回空串。
+        """
+        if not rid_tail:
+            return ""
+        try:
+            rows = self.backend.get_by_metadata(
+                {"knowledge_type": "experience", "rid_tail": rid_tail},
+                limit=50,
+            )
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        # 同 rid 可能跨 App 出现（不同 App 复用同名 id），优先当前 App
+        same_app = [
+            r
+            for r in rows
+            if (r.get("metadata", {}) or {}).get("app_package", "") == app_package
+        ]
+        candidates = same_app if same_app else rows
+
+        def _rank(r: dict) -> tuple[float, str]:
+            m = r.get("metadata", {}) or {}
+            return (
+                float(m.get("quality_score", 0.0) or 0.0),
+                str(m.get("last_verified_at", "")),
+            )
+
+        candidates.sort(key=_rank, reverse=True)
+        best = candidates[0].get("metadata", {}) or {}
+        semantic = str(best.get("action_semantic", "") or "").strip()
+        if semantic:
+            return semantic
+        to_page = str(best.get("to_page_norm", "") or "").strip()
+        if to_page:
+            return to_page
+        content = str(candidates[0].get("content", "") or "")
+        if "→" in content:
+            return content.rsplit("→", 1)[-1].strip()
+        return ""
+
     @classmethod
     def _normalize_page_id(cls, value: str) -> str:
         s = str(value or "").strip()

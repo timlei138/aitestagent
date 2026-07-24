@@ -431,6 +431,25 @@ def click(
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
 
+    # §0 click 工具契约：必须有明确的定位依据。空 label 且未给 index/rid/
+    # class_name/path_contains/alternatives，等同于“盲点”——进入 text/known-rid/
+    # bounds 兜底只在屏幕上碰运气（浪费 1-2 步），且 LLM 不会因 WARNING 里的
+    # actual_label 而纠错（信息够、但无需为模糊付出代价）。故直接拒绝，逼 LLM
+    # 改用 click(label="新课程") 或 click(index=4) 这类带依据的定位。
+    _has_locator = (
+        index >= 0
+        or bool((rid or "").strip())
+        or bool((class_name or "").strip())
+        or bool((path_contains or "").strip())
+    )
+    if not (label or "").strip() and not _has_locator:
+        _alt = [a.strip() for a in (alternatives or "").split(",") if a.strip()]
+        if not _alt:
+            return make_result(
+                ERROR,
+                "label 不能为空；请使用 page_info 中的 [n] index 或元素文本作为 label",
+            )
+
     # 记录点击前页面标题（用于操作后状态对比）
     _pre_page = _capture_page_id(ctx)
     _pre_title = _pre_page  # 保存给 _post_click_snapshot 用
@@ -665,6 +684,21 @@ def click(
             "resolved_class": resolved.get("class_name", ""),
             "resolved_path": resolved.get("path", ""),
         }
+        # A2: 开关点击后回写确定性勾选态（不让 LLM 靠截图猜）。
+        if clicked_el is not None and getattr(clicked_el, "role", "") in (
+            "switch",
+            "switch_row",
+        ):
+            _m = re.search(r"开关状态:\s*([开启关闭]+)", message or "")
+            if _m:
+                evidence["checked"] = _m.group(1) == "开启"
+        # C: 模糊匹配（搜索词≠实际标签的语义命中）是独立事实，透传供指标统计。
+        if clicked_el is not None:
+            _el_label = (getattr(clicked_el, "label", "") or "").strip().lower()
+            _q = (label or "").strip().lower()
+            evidence["fuzzy_match"] = bool(_el_label) and _q != _el_label and (
+                _q not in _el_label or len(_q) < len(_el_label) * 0.5
+            )
         permission_info = _permission_popup_buttons(ctx)
         if permission_info:
             activity, controls = permission_info

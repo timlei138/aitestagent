@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from typing import Any, Callable
@@ -49,17 +50,25 @@ class UIElement:
     context_path: str = ""  # 上下文路径，例如 'right_content > WLAN > toggle_switch'
     is_container: bool = False  # 是否为结构性容器（LinearLayout/ViewGroup 等）
     has_switch_child: bool = False  # 是否包裹 Switch 类子控件（合并标记）
+    suppress_label: bool = False  # 同页面出现重复 label 时置 True，强制不给 label（不可信就不给）
+    rag_hint: str = ""  # 经验推断语义（按 rid 查知识库所得，非当前界面真实所见，仅供参考）
 
     @property
     def label(self) -> str:
-        return (
-            self.text or self.content_desc or self.associated_label or self.resource_id
-        )
+        # 只使用真实可见语义：自身 text / content-desc / 关联标签。
+        # 不再回退到 resource-id（如 com.zui.calendar:id/action_add_all_event），
+        # 那是开发者命名而非用户可见语义，喂给前端/LLM 会误导（如把按钮错标成「更多选项」）。
+        # 当三者都缺失、或该 label 在本页面被判定为「不可信（重复）」时，返回空字符串——
+        # 宁可不给，也不要给一个必然错误/不存在的 content-desc。
+        if self.suppress_label:
+            return ""
+        return self.text or self.content_desc or self.associated_label
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["bounds"] = list(self.bounds)
         data["label"] = self.label
+        data["rag_hint"] = self.rag_hint
         return data
 
 
@@ -110,9 +119,15 @@ class SmartPerceiver:
         settle_stable_count: int = 2,
         settle_poll_interval: float = 0.3,
         screenshot_async: bool = True,
+        knowledge_base: Any | None = None,
+        get_app_package: Callable[[], str] | None = None,
     ):
         self.device = device
         self._vision_call = vision_call
+        # 经验推断富集：knowledge_base 可为实例或惰性 callable（避免构造顺序问题）；
+        # get_app_package 返回当前 App 包名。两者均按需、非强制。
+        self._kb = knowledge_base
+        self._get_app_package = get_app_package
         self._screenshot_sink = screenshot_sink
         # R5: cache-miss 截图写盘放到后台线程，移出感知关键路径（降单步延迟/缩小 R1 竞态窗口）
         self._screenshot_async = screenshot_async
@@ -161,6 +176,61 @@ class SmartPerceiver:
                 last_hash = h
         return xml
 
+    def attach_knowledge(
+        self,
+        knowledge_base: Any | None,
+        get_app_package: Callable[[], str] | None = None,
+    ) -> None:
+        """延后挂载知识库（避免与 KB/device 的构造顺序耦合）。
+
+        knowledge_base 可为 KnowledgeBase 实例，或返回实例的惰性 callable。
+        """
+        self._kb = knowledge_base
+        if get_app_package is not None:
+            self._get_app_package = get_app_package
+
+    def _resolve_kb(self) -> Any | None:
+        kb = self._kb
+        if callable(kb):
+            try:
+                kb = kb()
+            except Exception:
+                kb = None
+        return kb
+
+    def _enrich_rag_hints(self, elements: list[UIElement]) -> None:
+        """经验推断补充：对「无屏上标签但有 resource-id」的控件，按 rid 叶子名查知识库，
+
+        给出「经验推断」语义（如 action_add_all_event → 添加事件）。
+
+        关键约束：这是 *推断*，不是当前界面真实所见，绝不写入 label
+        （label 仍严格等于屏上真实语义，为空即「没有就不给」）。只填 rag_hint，
+        供 LLM 按 index 识别，不参与自动点击匹配。知识库缺数据或查询失败时
+        rag_hint 为空，行为与现在完全一致。
+        """
+        kb = self._resolve_kb()
+        if kb is None or not callable(self._get_app_package):
+            return
+        try:
+            package = self._get_app_package() or ""
+        except Exception:
+            return
+        if not package:
+            return
+        for el in elements:
+            if el.label or not el.resource_id:
+                continue
+            rid_tail = el.resource_id.split("/")[-1]
+            if not rid_tail:
+                continue
+            try:
+                hint = kb.query_element_semantic(package, rid_tail)
+            except Exception:
+                hint = ""
+            if hint:
+                el.rag_hint = hint
+                self.logger.debug("rag 提示 | rid=%s → '%s'", el.resource_id, hint)
+
     def perceive(self, force_vision: bool = False) -> PageUnderstanding:
         # 短时缓存：相同页面+相同mode + 3秒内直接返回
         # R1: 采样前先等页面稳定，避免拿到过渡态快照
@@ -175,6 +245,9 @@ class SmartPerceiver:
             self.logger.debug("Perceive cache hit sig=%s", sig[:8])
             return self._cache_result
         elements = self.parse_elements(xml)
+        # 经验推断补充：无屏上标签但有 rid 的控件，按 rid 查知识库填充 rag_hint
+        # （不污染 label，仅供 LLM 参考）。知识库缺数据时无副作用。
+        self._enrich_rag_hints(elements)
         page_title = self._extract_page_title(xml)
         snapshot = self.device.snapshot()
         # ── 截图存盘：perceive cache miss 时顺带存磁盘，供 assert_verification 复用（零额外截图调用）
@@ -343,7 +416,10 @@ class SmartPerceiver:
                 class_name=class_name,
                 package=node.get("package", "") or "",
                 bounds=bounds,
-                clickable=clickable,
+                # A1: 开关类控件强制可点。Android XML 中 Switch/CompoundButton
+                # 常标 clickable=false，导致 Agent 看不到它是可点目标、也点不准。
+                # 强制可点 + 使用其自身精确 bounds，让 Agent 能直接 click 命中开关。
+                clickable=clickable or is_switch_like,
                 enabled=node.get("enabled", "true") == "true",
                 selected=node.get("selected", "false") == "true",
                 checked=self._parse_checked(node.get("checked")),
@@ -366,6 +442,36 @@ class SmartPerceiver:
         elements = self._merge_parent_with_switch_child(
             elements, node_to_el, parent_map
         )
+
+        # 第 3 阶段：label 消歧 — 同一页面出现多个「相同 label」时（典型是 App 把同一个
+        # content-desc 串到多个兄弟图标上，如 action bar 多个按钮都标成「更多选项」），
+        # 盲目信任 content-desc 会把它们标成一模一样，前端/LLM 无法区分、极易点错。
+        # 处理：对重复的 label 追加 resource-id 叶子名做消歧（保留真实语义 + 保证唯一）。
+        # 仅对非空 label 分组；重复组内每个元素追加 (rid-leaf) 或退化为 (#序号)。
+        label_groups: dict[str, list[UIElement]] = defaultdict(list)
+        for el in elements:
+            # 结构性容器（layout/viewgroup）的 label 多是从子节点「借」来的文本，
+            # 不代表它自身语义，不能参与「重复 label」判定——否则会把子控件
+            # 的真实 label 误判为重复而抑制掉。
+            if el.is_container:
+                continue
+            raw = el.text or el.content_desc or el.associated_label
+            if raw:
+                label_groups[raw].append(el)
+        for raw, group in label_groups.items():
+            if len(group) <= 1:
+                continue
+            # 同一 label 出现在多个控件上 → 它无法唯一标识某个控件，不可信。
+            # 按「没有就不给」原则抑制（不给）这些 label，而不是凭空合成
+            # (resource-id) 后缀——那等于给控件安上它本没有的 content-desc。
+            self.logger.info(
+                "发现重复 label='%s' x%d，按「不可信就不给」抑制这些 label",
+                raw,
+                len(group),
+            )
+            for el in group:
+                el.suppress_label = True
+
         return elements
 
     def _extract_page_title(self, xml: str) -> str:
@@ -870,8 +976,16 @@ class SmartPerceiver:
             if not label:
                 continue
 
-            # 排除 Switch 类自身
             cls = (child.get("class", "") or "").lower()
+            # 只认「文本标签」类节点（TextView/EditText）。ImageView/ImageButton 等
+            # 是独立可点控件（如溢出菜单），绝不能被当成「本控件的文字标签」借走它
+            # 自己的 content-desc——否则会把「更多选项」错挂到兄弟图标上，制造出不存在的 label。
+            if "textview" not in cls and "edittext" not in cls:
+                continue
+            # 可点击的兄弟节点是独立控件，不是本控件的标签
+            if child.get("clickable", "false") == "true":
+                continue
+            # 排除 Switch 类自身
             if any(
                 kw in cls
                 for kw in ("switch", "togglebutton", "checkbox", "radiobutton")

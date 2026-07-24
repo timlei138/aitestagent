@@ -761,16 +761,21 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         um = [SystemMessage(content=AGENT_SYSTEM)]
     um.append(AIMessage(content=result))
 
-    # ═══ 关键操作后自动注入当前页面状态（基于工具类型，非硬编码关键词）═══
+    # ═══ 操作后回呈确定性结果事实（契约：动作的事实原样回呈，不限于开关）═══
     if not done and not abort and ctx and ctx.perceiver:
-        # Phase 1.5: 检测最近的 tool_calls 是否包含 click 或 scroll_find_and_click
         last_ai_msgs = [m for m in msgs[-4:] if isinstance(m, AIMessage)]
         had_action = False
         for m in last_ai_msgs:
             for tc in getattr(m, "tool_calls", None) or []:
-                if tc.get("name") in ("click", "scroll_find_and_click"):
+                if tc.get("name") not in (
+                    "get_screen_info",
+                    "check_page_health",
+                    "query_app_knowledge",
+                ):
                     had_action = True
                     break
+            if had_action:
+                break
         if had_action:
             try:
                 u2 = ctx.perceiver.perceive()
@@ -782,9 +787,27 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 post_check = (
                     f"\n\n[操作后页面状态]\n当前页面: {time_snapshot}\n"
                     f"验证条件: {verify_hint}\n"
+                )
+                # 回呈最近一次动作的确定性结果事实（开关勾选态、权限弹窗等），
+                # 让 LLM 总能看到「我刚做的事，程序核实的结果」，把精力留给下一步判断。
+                if tool_calls_log:
+                    _ev = tool_calls_log[-1].get("result_evidence") or {}
+                    _facts = []
+                    if "checked" in _ev:
+                        _state_cn = "开启" if _ev["checked"] else "关闭"
+                        _facts.append(f"开关勾选态={_state_cn}")
+                    if _ev.get("permission_dialog"):
+                        _facts.append(
+                            f"出现权限弹窗(按钮: {_ev.get('permission_buttons', '')})"
+                        )
+                    if _ev.get("fallback_used"):
+                        _facts.append(f"匹配模式={_ev.get('match_mode', '')}(回退)")
+                    if _facts:
+                        post_check += "操作结果: " + "；".join(_facts) + "\n"
+                post_check += (
                     '如果页面状态已满足验证条件，请立即调用 report_done(status="done") 报告结果。'
                 )
-                post_check, violated = _clip_to_token_budget(post_check, 120)
+                post_check, violated = _clip_to_token_budget(post_check, 160)
                 if violated:
                     budget_violation_count += 1
                 um.append(HumanMessage(content=post_check))
@@ -968,7 +991,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         if s.get("name") == "click" and s.get("match_mode") == "exact"
     )
     fuzzy_count = sum(
-        1 for s in _tool_log if s.get("name") == "click" and s.get("fallback_used")
+        1 for s in _tool_log if s.get("name") == "click" and s.get("fuzzy_match")
     )
     ambiguous_count = sum(
         1

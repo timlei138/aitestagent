@@ -38,12 +38,16 @@
         <!-- 元素属性浮窗（显示全部属性） -->
         <div v-if="hoveredElement" class="element-tooltip"
              :style="{ left: tooltipX + 'px', top: tooltipY + 'px' }">
-          <!-- 标题：label -->
-          <div class="et-row et-label">{{ hoveredElement.label || '(无标签)' }}</div>
+          <!-- 标题：label（无屏上标签时回退显示经验推断，并标注『经验』） -->
+          <div class="et-row et-label">
+            {{ hoveredElement.label || (hoveredElement.rag_hint ? '经验: ' + hoveredElement.rag_hint : '(无标签)') }}
+          </div>
           <!-- 文本内容 -->
           <div class="et-row" v-if="hoveredElement.text"><span class="et-k">text</span><span class="et-v">{{ hoveredElement.text }}</span></div>
           <div class="et-row" v-if="hoveredElement.content_desc"><span class="et-k">content_desc</span><span class="et-v">{{ hoveredElement.content_desc }}</span></div>
           <div class="et-row" v-if="hoveredElement.associated_label"><span class="et-k">assoc_label</span><span class="et-v">{{ hoveredElement.associated_label }}</span></div>
+          <!-- 经验推断语义（来自知识库，非当前界面真实文本） -->
+          <div class="et-row" v-if="hoveredElement.rag_hint"><span class="et-k">经验推断</span><span class="et-v et-rag">{{ hoveredElement.rag_hint }}<span class="et-rag-note">（非屏上文本）</span></span></div>
           <!-- 身份标识 -->
           <div class="et-row"><span class="et-k">resource_id</span><span class="et-v">{{ hoveredElement.resource_id || '-' }}</span></div>
           <div class="et-row"><span class="et-k">class_name</span><span class="et-v">{{ hoveredElement.class_name || '-' }}</span></div>
@@ -213,19 +217,27 @@ function drawElementOverlay() {
     const role = el.role || 'default';
     const colors = ROLE_COLORS[role] || ROLE_COLORS.default;
 
-    ctx.strokeStyle = colors.stroke;
-    ctx.fillStyle = colors.fill;
+    // 经验推断标记：无屏上真实标签、但知识库给出 rag_hint 的元素
+    const realLabel = (el.label || el.text || el.content_desc || '').trim();
+    const isInferred = !realLabel && !!(el.rag_hint || '').trim();
+    // 推断元素用琥珀色明显区分，表明「非当前界面真实所见」
+    const boxColors = isInferred
+      ? { stroke: '#f59e0b', fill: 'rgba(245,158,11,0.12)' }
+      : colors;
+
+    ctx.strokeStyle = boxColors.stroke;
+    ctx.fillStyle = boxColors.fill;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     ctx.roundRect(l, t, r - l, b - t, 4);
     ctx.fill();
     ctx.stroke();
 
-    // Label
-    const label = (el.label || el.text || el.content_desc || '').substring(0, 12);
+    // Label（优先真实屏上标签；无则回退到经验推断，并以琥珀色斜体区分）
+    const label = (realLabel || el.rag_hint || '').substring(0, 12);
     if (label && (el.clickable || role === 'switch')) {
-      ctx.fillStyle = colors.stroke;
-      ctx.font = '11px sans-serif';
+      ctx.fillStyle = isInferred ? '#f59e0b' : colors.stroke;
+      ctx.font = isInferred ? 'italic 11px sans-serif' : '11px sans-serif';
       const textW = ctx.measureText(label).width + 6;
       ctx.fillRect(l, Math.max(0, t - 18), textW, 16);
       ctx.fillStyle = '#fff';
@@ -490,6 +502,8 @@ defineExpose({ toggle, isVisible: visible });
   font-family: 'JetBrains Mono', 'Consolas', monospace;
   font-size: 11px;
 }
+.et-rag { color: #d97706 !important; font-weight: 600; }
+.et-rag-note { color: var(--text-muted); font-size: 10px; font-weight: 400; }
 .et-badge {
   display: inline-block;
   padding: 0 6px; border-radius: 4px;

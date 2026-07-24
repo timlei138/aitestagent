@@ -34,6 +34,15 @@ def _reset_run_scoped(ctx) -> None:
         if isinstance(tu, dict):
             for k in list(tu.keys()):
                 tu[k] = 0
+        # B: 循环/空转守卫（run 级持久，跨 _run_agent 调用累计）。每次新执行前
+        # 重置，避免跨 run 数据串扰。
+        ctx._loop_guard = {
+            "_no_progress_count": 0,
+            "_no_progress_warned": False,
+            "_recent_call_sigs": [],
+            "_recent_action_groups": [],
+            "_cooldown_map": {},
+        }
         # R1: RAG 缓存/计数 — 复跑跳过 planner 时这些也不会被重置，必须在此清理
         if hasattr(ctx, "_rag_query_cache"):
             ctx._rag_query_cache.clear()

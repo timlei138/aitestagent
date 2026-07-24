@@ -122,14 +122,12 @@ from langgraph.graph.message import add_messages
 
 
 class _SubState(_TD):
+    # 循环/空转守卫(_no_progress_count/_no_progress_warned/_recent_call_sigs/
+    # _recent_action_groups/_cooldown_map) 已迁移到 ctx._loop_guard，跨 _run_agent
+    # 调用持久累计；此处仅保留单 subgraph 内的本地状态。
     messages: Annotated[list, add_messages]
     _turn_count: int
-    _recent_call_sigs: list[str]
-    _recent_action_groups: list[str]
     _loop_break_reason: str
-    _no_progress_count: int
-    _no_progress_warned: bool
-    _cooldown_map: dict[str, int]
     _tool_calls_log: list
     _run_id: str
 
@@ -137,6 +135,9 @@ class _SubState(_TD):
 _LOOP_BREAK_CONSECUTIVE = 3
 _NO_PROGRESS_LIMIT = 8
 _FINALIZATION_REMAINING_TOOL_BUDGET = 5
+# launch_app 守卫：目标 App 已在前台（package 已匹配）却仍 launch 属冗余重开，
+# 累计同 package 超过该阈值则下次直接 COOLDOWN_SKIP，逼 LLM 转向 assert/report_done。
+_LAUNCH_REDUNDANT_LIMIT = 3
 _NO_PROGRESS_ACTIONS = {
     "click",
     "scroll_find_and_click",
@@ -211,6 +212,28 @@ def _run_agent(
         _ctx = None
     if _ctx and _ws_emit_callback:
         _ctx._ws_emit = _ws_emit_callback
+    # B: 循环/空转守卫（run 级持久）。放在 ctx 上跨 _run_agent 调用累计，
+    # 否则每次外层迭代重建 _SubState 会让 no_progress 计数归零，导致长空转逃过熔断。
+    if _ctx is not None:
+        _guard = getattr(_ctx, "_loop_guard", None)
+        if not isinstance(_guard, dict):
+            _guard = {
+                "_no_progress_count": 0,
+                "_no_progress_warned": False,
+                "_recent_call_sigs": [],
+                "_recent_action_groups": [],
+                "_cooldown_map": {},
+                "_launch_count_by_pkg": {},
+            }
+            _ctx._loop_guard = _guard
+    else:
+        _guard = {
+            "_no_progress_count": 0,
+            "_no_progress_warned": False,
+            "_recent_call_sigs": [],
+            "_recent_action_groups": [],
+            "_cooldown_map": {},
+        }
     llm_call_count = 0
     tool_call_400_count = 0
 
@@ -278,12 +301,13 @@ def _run_agent(
                 }
         last_ai = next(m for m in reversed(s["messages"]) if isinstance(m, AIMessage))
         outputs = []
-        recent = list(s.get("_recent_call_sigs", []))
-        recent_action_groups = list(s.get("_recent_action_groups", []))
+        # 循环/空转守卫直接读写 ctx._loop_guard（跨 _run_agent 调用持久）
+        recent = list(_guard.get("_recent_call_sigs", []))
+        recent_action_groups = list(_guard.get("_recent_action_groups", []))
         loop_break_reason = s.get("_loop_break_reason", "")
-        no_progress_count = int(s.get("_no_progress_count", 0) or 0)
-        no_progress_warned = bool(s.get("_no_progress_warned", False))
-        cooldown_map = dict(s.get("_cooldown_map", {}) or {})
+        no_progress_count = int(_guard.get("_no_progress_count", 0) or 0)
+        no_progress_warned = bool(_guard.get("_no_progress_warned", False))
+        cooldown_map = dict(_guard.get("_cooldown_map", {}) or {})
         _current_log = list(s.get("_tool_calls_log", []))
         page_sig_once = _build_page_signature(_ctx)
         for tc in last_ai.tool_calls or []:
@@ -291,6 +315,32 @@ def _run_agent(
             args = tc.get("args", {}) or {}
             target_hint = _build_tool_target(name, args)
             cooldown_group = _cooldown_group(name, args, target_hint)
+            # launch_app 守卫（pre-check）：目标 App 已在前台却仍 launch 属冗余重开。
+            # 若同 package 的冗余重开已累计达阈值，直接 COOLDOWN_SKIP 拒绝，
+            # 逼 LLM 转向 assert_verification / report_done，而不是反复"重开试试"。
+            if (
+                name == "launch_app"
+                and _ctx is not None
+                and getattr(_ctx, "device", None) is not None
+            ):
+                _req_pkg = (args.get("package") or "").strip()
+                _lc = _guard.setdefault("_launch_count_by_pkg", {})
+                # 修复：不再要求"launch 前 App 已在前台"才计为冗余。只要对
+                # 同一 package 的 launch 调用累计达阈值，即视为病态反复重开
+                # （无论中间是否被切走），直接 COOLDOWN_SKIP 拦截，逼 LLM
+                # 转向 assert_verification / report_done。
+                if _req_pkg and int(_lc.get(_req_pkg, 0) or 0) >= _LAUNCH_REDUNDANT_LIMIT:
+                    outputs.append(
+                        ToolMessage(
+                            content=(
+                                f"COOLDOWN_SKIP: launch_app({_req_pkg}) 已多次重开同一应用，"
+                                "请勿重复启动；若无法继续请调用 "
+                                "report_done(status='abort')"
+                            ),
+                            tool_call_id=tc["id"],
+                        )
+                    )
+                    continue
             if cooldown_group and int(cooldown_map.get(cooldown_group, 0) or 0) > 0:
                 cooldown_map[cooldown_group] = int(cooldown_map[cooldown_group]) - 1
                 if cooldown_map[cooldown_group] <= 0:
@@ -360,6 +410,15 @@ def _run_agent(
                 name == "assert_verification"
                 or _output_has_page_change(output, page_sig_once, page_sig_after)
             )
+            # launch_app 守卫（post-update）：冗余重开（App 已在前台）累计计数；
+            # 真实启动（package 变化）则重置。冗余重开不重置 no_progress，让熔断器能 arming。
+            if name == "launch_app":
+                _req_pkg = (args.get("package") or "").strip()
+                _lc = _guard.setdefault("_launch_count_by_pkg", {})
+                # 修复：对该 requested_package 的 launch 调用累计 +1（不再要求
+                # before_pkg == req_pkg），使反复重开同一包能被阈值拦截。
+                if _req_pkg:
+                    _lc[_req_pkg] = int(_lc.get(_req_pkg, 0) or 0) + 1
             # 设备断开快速终止：工具执行后立即检测，避免继续执行无意义操作
             try:
                 _live_ctx = get_tool_context()
@@ -403,32 +462,35 @@ def _run_agent(
             )
 
             # 最小断路器：连续无进展动作判定为空转（assert 或页面变化均算进展）。
+            # 计数持久于 ctx._loop_guard，跨 _run_agent 调用累计，避免长空转逃过熔断。
+            # 契约：达到 _NO_PROGRESS_LIMIT 发一次警告（不重置），达到 2× 阈值则硬 ABORT。
             if progress_milestone:
                 no_progress_count = 0
                 no_progress_warned = False
             else:
                 if name in _NO_PROGRESS_ACTIONS:
                     no_progress_count += 1
-                    if no_progress_count >= _NO_PROGRESS_LIMIT:
-                        if not no_progress_warned:
-                            no_progress_warned = True
-                            no_progress_count = 0
-                            outputs.append(
-                                SystemMessage(
-                                    content=(
-                                        "NO_PROGRESS_WARNING: 连续动作未提交验证结果。"
-                                        "请立即调用 assert_verification(condition, result)"
-                                        " 上报当前可验证项；无法确认时上报 failed。"
-                                    )
+                    if (
+                        no_progress_count == _NO_PROGRESS_LIMIT
+                        and not no_progress_warned
+                    ):
+                        no_progress_warned = True
+                        outputs.append(
+                            SystemMessage(
+                                content=(
+                                    "NO_PROGRESS_WARNING: 连续动作未提交验证结果。"
+                                    "请立即调用 assert_verification(condition, result)"
+                                    " 上报当前可验证项；无法确认时上报 failed。"
                                 )
                             )
-                        else:
-                            loop_break_reason = (
-                                "NO_PROGRESS: no assert_verification "
-                                f"for {_NO_PROGRESS_LIMIT} action tool calls"
-                            )
-                            logger.warning(loop_break_reason)
-                            break
+                        )
+                    elif no_progress_count >= 2 * _NO_PROGRESS_LIMIT:
+                        loop_break_reason = (
+                            "NO_PROGRESS: no assert_verification "
+                            f"for {2 * _NO_PROGRESS_LIMIT} consecutive action tool calls"
+                        )
+                        logger.warning(loop_break_reason)
+                        break
 
             # 内层循环断路器：连续 N 次相同 tool+args+page_signature 立即终止。
             if name not in (
@@ -507,6 +569,9 @@ def _run_agent(
             if name == "click":
                 entry["match_mode"] = _resolve_click_match_mode(name, args, output)
                 entry["fallback_used"] = _resolve_click_fallback(output)
+                # C: 模糊匹配（搜索词≠实际标签的语义命中）是独立事实，
+                # 透传 fuzzy_match 供 fuzzy_click_rate 门禁统计（非 fallback）。
+                entry["fuzzy_match"] = bool(result_evidence.get("fuzzy_match", False))
                 entry["resolved_target"] = {
                     "label": result_evidence.get("resolved_label", ""),
                     "role": result_evidence.get("resolved_role", ""),
@@ -525,14 +590,15 @@ def _run_agent(
                 )
                 break
 
+        # 写回 run 级守卫（跨 _run_agent 调用持久）
+        _guard["_recent_call_sigs"] = recent
+        _guard["_recent_action_groups"] = recent_action_groups
+        _guard["_cooldown_map"] = cooldown_map
+        _guard["_no_progress_count"] = no_progress_count
+        _guard["_no_progress_warned"] = no_progress_warned
         return {
             "messages": outputs,
-            "_recent_call_sigs": recent,
             "_loop_break_reason": loop_break_reason,
-            "_recent_action_groups": recent_action_groups,
-            "_cooldown_map": cooldown_map,
-            "_no_progress_count": no_progress_count,
-            "_no_progress_warned": no_progress_warned,
             "_tool_calls_log": _current_log,
         }
 
@@ -558,12 +624,7 @@ def _run_agent(
         {
             "messages": list(messages),
             "_turn_count": 0,
-            "_recent_call_sigs": [],
-            "_recent_action_groups": [],
             "_loop_break_reason": "",
-            "_cooldown_map": {},
-            "_no_progress_count": 0,
-            "_no_progress_warned": False,
             "_tool_calls_log": [],
             "_run_id": run_id,
         }

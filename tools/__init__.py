@@ -295,6 +295,9 @@ def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
         extra += f" switch_state={state}"
     if ctx_path:
         extra += f" path='{ctx_path}'"
+    rag_hint = getattr(item, "rag_hint", "") or ""
+    if rag_hint and rag_hint != item.label:
+        extra += f" (经验推断:{rag_hint})"
     idx_prefix = f"[{clickable_index}] " if clickable_index is not None else ""
     label = (getattr(item, "label", "") or "").strip() or "<无文本>"
     return (

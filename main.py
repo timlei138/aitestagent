@@ -93,6 +93,10 @@ def _init_tool_context(config: TestConfig) -> None:
             auto_switch=auto_switch,
         )
         kb = KnowledgeBase(create_vector_store(config))
+        # 经验推断挂载：按 rid 查知识库给无标签图标补 rag_hint（不污染 label）
+        perceiver.attach_knowledge(
+            kb, lambda: device.current_app().get("package", "")
+        )
         ctx = ToolContext(
             device=device,
             perceiver=perceiver,

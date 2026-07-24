@@ -476,3 +476,48 @@ def test_click_index_selects_unlabeled_clickable_by_bounds(monkeypatch):
 
     assert "已点击" in out
     assert device.clicked_bounds == [(620, 120, 820, 240)]
+
+
+def test_click_rejects_empty_label_without_locator():
+    # §0 契约：空 label 且无任何定位依据（index/rid/class/path/alternatives）
+    # 时直接 ERROR，禁止进入兜底“盲点”浪费步数。
+    class _Device:
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.MainActivity",
+            }
+
+    tools_module.set_tool_context(ToolContext(device=_Device(), perceiver=None))
+
+    out = tools_module.click.invoke({})  # 全默认：label="" index=-1 ...
+    assert "label 不能为空" in out
+    assert "已点击" not in out
+
+    # 给了 index 即使 label 为空也应放行（走精确定位，不触发盲点守卫）
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.MainActivity",
+                page_title="",
+                primary_paths=[],
+                elements=[_el(label="新课程", bounds=(20, 120, 220, 180))],
+            )
+
+    class _Device2:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.MainActivity",
+            }
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+    tools_module.set_tool_context(ToolContext(device=_Device2(), perceiver=_Perceiver()))
+    out_idx = tools_module.click.invoke({"index": 0})
+    assert "label 不能为空" not in out_idx

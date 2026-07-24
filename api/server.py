@@ -256,6 +256,13 @@ def _get_relational_db():
 def _rebuild_tool_context() -> None:
     """重新构建 ToolContext 并更新全局引用。"""
     global _ctx
+    # 经验推断挂载：惰性引用 _kb / _device，避免构造顺序耦合；
+    # perceive 运行时二者均已就绪。无设备/知识库时自动不生效。
+    if _perceiver is not None:
+        _perceiver.attach_knowledge(
+            lambda: _kb,
+            lambda: _device.current_app().get("package", "") if _device else "",
+        )
     _ctx = ToolContext(
         device=_device,
         perceiver=_perceiver,
