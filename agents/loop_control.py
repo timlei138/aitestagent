@@ -53,11 +53,6 @@ def _cooldown_group(name: str, args: dict, target: str = "") -> str:
                 str(target or ""),
             ]
         )
-        if any(k in txt for k in ("应用列表", "所有应用")):
-            return "app_entry_retry"
-        # "应用"需要精确边界，避免误命中"应用商店"等复合词
-        if re.search(r"(^|[^\u4e00-\u9fff])应用([^\u4e00-\u9fff]|$)", txt):
-            return "app_entry_retry"
     return ""
 
 

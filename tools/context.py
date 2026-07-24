@@ -45,6 +45,10 @@ class ToolContext:
     _rag_cross_app_count: int = 0
     _rag_empty_hit_count: int = 0
     _run_tag: str = ""  # 当前 run 标识，用于缓存键隔离
+    # Reactive Permission Intent：声明式权限测试意图，跨 click() 调用持久。
+    # 格式：{"permission": "camera", "action": "deny", "set_time": <monotonic>}
+    # 空 dict = 未设置；TTL 120s 自动过期（click.py 内部检查）。
+    _permission_intent: dict = field(default_factory=dict, repr=False)
     # M4：确定性断言结果记录（{"text","kind","result": "pass"/"fail"}），
     # assert_verification 反查最近一条与验证项匹配的确定性核实作为 ground truth。
     _deterministic_checks: list = field(default_factory=list, repr=False)

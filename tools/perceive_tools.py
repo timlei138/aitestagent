@@ -176,6 +176,51 @@ def _permission_evidence(
     }
 
 
+# 确定性规则：精确匹配，不做语义判断
+# 元组顺序 = 优先级（下标越小越优先，最小权限优先）
+_GRANT_BUTTONS = ("仅在使用中允许", "仅本次使用时允许", "始终允许", "允许", "Allow")
+_DENY_BUTTONS = ("拒绝", "不允许", "Deny", "Don't allow")
+# 注意：以下按钮故意不在任何一侧：
+# - "前往设置" / "Go to settings" → settings_required，单独处理
+# - "只允许访问所选照片" / "允许访问所有照片" → 媒体范围决策，归 LLM
+
+
+def _match_permission_button(
+    controls: list[tuple[str, tuple[int, int, int, int]]],
+    hint: str,
+) -> tuple[str, tuple[int, int, int, int]] | None:
+    """在所有命中项中选 _GRANT/_DENY_BUTTONS 下标最小的（最小权限优先）。
+
+    返回 (text, bounds) 或 None（匹配不到时）。
+    """
+    table = _DENY_BUTTONS if hint == "deny" else _GRANT_BUTTONS
+    best, best_idx = None, None
+    for text, bounds in controls:
+        t = text.strip()
+        if t in table:
+            idx = table.index(t)
+            if best_idx is None or idx < best_idx:
+                best, best_idx = (t, bounds), idx
+    return best
+
+
+def _detect_permission_popup(
+    ctx: Any, timeout: float = 2.0
+) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]] | None:
+    """有界轮询检测权限弹窗（非单次）。
+
+    覆盖弹窗 100~300ms 渲染延迟，每 200ms 检测一次，最多等 timeout 秒。
+    供 click(permission_hint) 和 wait_for_permission_dialog 复用。
+    """
+    deadline = time.monotonic() + max(0.0, min(float(timeout), 8.0))
+    while time.monotonic() < deadline:
+        info = _permission_popup_buttons(ctx)
+        if info:
+            return info
+        time.sleep(0.2)
+    return None
+
+
 @tool
 def detect_popup() -> str:
     """检测当前弹窗；权限弹窗只返回当前事实，不会自动处理。"""
@@ -216,19 +261,14 @@ def wait_for_permission_dialog(timeout: float = 3.0) -> str:
     ctx = get_tool_context()
     if ctx.device is None:
         return make_result(ERROR, "未连接 Android 设备")
-    deadline = time.monotonic() + max(0.0, min(float(timeout), 8.0))
-    while True:
-        info = _permission_popup_buttons(ctx)
-        if info:
-            activity, controls = info
-            return make_result(
-                OK,
-                "权限弹窗已出现，请根据测试意图显式选择按钮",
-                _permission_evidence(activity, controls),
-            )
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.2)
+    info = _detect_permission_popup(ctx, timeout=timeout)
+    if info:
+        activity, controls = info
+        return make_result(
+            OK,
+            "权限弹窗已出现，请根据测试意图显式选择按钮",
+            _permission_evidence(activity, controls),
+        )
     return make_result(NOT_FOUND, "权限弹窗未在等待时间内出现")
 
 
@@ -255,13 +295,48 @@ def respond_to_permission_dialog(button: str, timeout: float = 3.0) -> str:
                     return make_result(OK, "已按显式请求响应系统权限弹窗", evidence)
             return make_result(
                 NOT_FOUND,
-                f"当前权限弹窗不存在指定按钮: {requested}",
+                f"当前权限弹窗不存在指定按钮: {requested}；"
+                f"若弹窗已超时消失，可改用 set_runtime_permission(package, permissions, action) 经 adb 直接授权",
                 evidence,
             )
         if time.monotonic() >= deadline:
             break
         time.sleep(0.2)
-    return make_result(NOT_FOUND, "权限弹窗未在等待时间内出现")
+    return make_result(
+        NOT_FOUND,
+        "权限弹窗未在等待时间内出现（可能已超时 10s 自动消失）；"
+        "请勿空转重试，改用 set_runtime_permission(package, permissions='camera,location', action='grant') 经 adb pm grant 直接授予，"
+        "或 set_runtime_permission(include_common=true) 批量授予常用权限兜底",
+    )
+
+
+@tool
+def set_permission_intent(permission: str = "", action: str = "") -> str:
+    """声明本轮权限测试意图。设置后，后续每次 click() 自动监听
+    匹配的权限弹窗并按 action 响应，无需在 click 中传 permission_hint。
+
+    permission: 可选权限类型（camera/location/storage 等），仅作日志标记
+    action: "grant" 或 "deny"
+    传空值清除意图。
+    """
+    ctx = get_tool_context()
+    if not permission and not action:
+        ctx._permission_intent = {}
+        return make_result(OK, "权限测试意图已清除")
+    if action not in ("grant", "deny"):
+        return make_result(ERROR, "action 必须是 grant 或 deny")
+    ctx._permission_intent = {
+        "permission": permission.lower().strip(),
+        "action": action.strip(),
+        "set_time": time.monotonic(),
+    }
+    return make_result(
+        OK,
+        f"已设置权限测试意图: permission={permission}, action={action}。"
+        f"后续 click() 将自动监听权限弹窗并按 {action} 响应。"
+        f"测试完当前分支后调用 set_permission_intent() 清除。",
+        {"permission": permission, "action": action},
+    )
 
 
 @tool
@@ -283,6 +358,118 @@ def dismiss_popup() -> str:
             time.sleep(0.3)
             return make_result(OK, f"已关闭普通弹窗: {text}", {"button": text})
     return make_result(NOT_FOUND, "未找到可关闭的普通弹窗按钮")
+
+
+# 常用危险权限别名集合：弹窗已消失/想提前授权时一键兜底
+_COMMON_PERMISSIONS = (
+    "camera",
+    "location",
+    "storage",
+    "calendar",
+    "contacts",
+    "microphone",
+    "phone",
+    "notifications",
+    "photos",
+    "videos",
+    "audio",
+)
+
+# 组合权限别名 → 展开为多个独立权限（工具层处理，不侵入控制器）
+# storage 同时需要 READ + WRITE，calendar/contacts 同理；避免只授读不授写导致功能异常
+_PERMISSION_EXPAND_MAP: dict[str, list[str]] = {
+    "storage": ["read_storage", "write_storage"],
+    "calendar": ["read_calendar", "write_calendar"],
+    "contacts": ["read_contacts", "write_contacts"],
+}
+
+
+@tool
+def set_runtime_permission(
+    package: str,
+    permissions: str = "",
+    action: str = "grant",
+    include_common: bool = False,
+) -> str:
+    """当系统权限弹窗已超时消失（约 10s 自动消失）或需绕过弹窗时，经 adb `pm grant`/`pm revoke` 直接授予或撤销运行时权限。
+
+    package: 目标 App 包名，如 com.zui.calendar。
+    permissions: 权限名或别名，多个用逗号分隔。支持别名：
+        camera, location/fine_location, coarse_location, storage/read_storage,
+        write_storage, calendar/read_calendar, write_calendar, contacts,
+        microphone, phone, sms, notifications, body_sensors, bluetooth；
+        以及媒体权限（Android 13+「选择照片/视频」类弹窗）：
+        photos/images/select_photos(READ_MEDIA_IMAGES)、
+        videos/video/select_videos(READ_MEDIA_VIDEO)、
+        audio/music/media_audio(READ_MEDIA_AUDIO)、
+        visual_selected/selected_media/partial_media(READ_MEDIA_VISUAL_USER_SELECTED，Android 14 部分媒体访问)；
+        也可直接给完整权限名（android.permission.XXX）。
+    action: "grant" 授予；"deny" 或 "revoke" 撤销（等价于在弹窗点「拒绝」）。
+    include_common: True 时忽略 permissions，直接授予一组常用危险权限
+        （camera/location/storage/calendar/contacts/microphone/phone/notifications/photos/videos/audio），
+        用于「弹窗已消失、想让功能可用」的快速兜底。storage/calendar/contacts 会自动展开为读写双授。
+
+    典型用法：
+    - respond_to_permission_dialog 返回 NOT_FOUND「权限弹窗未在等待时间内出现」→
+      弹窗已超时消失，本工具经 adb 直接授权，避免空转重试。
+    - 想提前授权以规避弹窗竞态：set_runtime_permission(package, include_common=true)。
+    - 撤销（验证拒绝路径）：set_runtime_permission(package, permissions='camera', action='deny')。
+
+    pm grant 不支持的特殊权限（如悬浮窗/系统设置）会自动回退 cmd appops。
+    返回结构化结果；部分权限失败时状态为 AMBIGUOUS/NOT_FOUND 并列出明细。
+
+    ⚠️ 回调问题：`pm grant` 是在系统层修改权限状态，不会触发 App 的
+    `onRequestPermissionsResult` 回调。如果 App 在回调里写了后续逻辑
+    （如打开相机、跳转页面），这些逻辑不会被执行。解决方案：授权后
+    导航回触发点并重新点击触发操作，App 再次调 `requestPermissions()`
+    时 Android 发现权限已 GRANTED，会直接触发回调，App 正常流程才跑通。
+    """
+    ctx = get_tool_context()
+    if ctx.device is None:
+        return make_result(ERROR, "未连接 Android 设备")
+
+    action = (action or "grant").strip().lower()
+    if action in ("deny", "revoke"):
+        grant = False
+    elif action == "grant":
+        grant = True
+    else:
+        return make_result(ERROR, f"不支持的 action: {action}（用 grant / deny）")
+
+    if include_common:
+        perms = list(_COMMON_PERMISSIONS)
+    else:
+        perms = [p.strip() for p in (permissions or "").split(",") if p.strip()]
+    if not perms:
+        return make_result(
+            ERROR,
+            "permissions 为空且 include_common=False，请提供至少一个权限名/别名",
+        )
+
+    results: list[str] = []
+    ok = 0
+    total = 0
+    for raw in perms:
+        # 展开组合权限别名（storage → read_storage + write_storage 等）
+        sub_perms = _PERMISSION_EXPAND_MAP.get(raw.lower(), [raw])
+        for sub in sub_perms:
+            total += 1
+            try:
+                msg = (
+                    ctx.device.grant_permission(package, sub)
+                    if grant
+                    else ctx.device.revoke_permission(package, sub)
+                )
+                results.append(f"{sub}: OK ({msg})")
+                ok += 1
+            except Exception as exc:  # 单条失败不影响其他权限
+                results.append(f"{sub}: FAIL ({exc})")
+    status = OK if ok == total else (NOT_FOUND if ok == 0 else AMBIGUOUS)
+    return make_result(
+        status,
+        f"已处理 {ok}/{total} 个权限（action={action}）",
+        {"package": package, "action": action, "details": " || ".join(results)},
+    )
 
 
 @tool

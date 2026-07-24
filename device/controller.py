@@ -275,6 +275,111 @@ class DeviceController:
         logger.info("Opened app settings package=%s", package)
         return output
 
+    # ── 运行时权限经 adb 直接授予/撤销（绕过系统弹窗，解决弹窗 10s 超时自动消失）──
+    _PERMISSION_ALIAS_MAP = {
+        "camera": "android.permission.CAMERA",
+        "fine_location": "android.permission.ACCESS_FINE_LOCATION",
+        "location": "android.permission.ACCESS_FINE_LOCATION",
+        "coarse_location": "android.permission.ACCESS_COARSE_LOCATION",
+        "read_storage": "android.permission.READ_EXTERNAL_STORAGE",
+        "write_storage": "android.permission.WRITE_EXTERNAL_STORAGE",
+        "storage": "android.permission.READ_EXTERNAL_STORAGE",
+        "read_calendar": "android.permission.READ_CALENDAR",
+        "write_calendar": "android.permission.WRITE_CALENDAR",
+        "calendar": "android.permission.READ_CALENDAR",
+        "read_contacts": "android.permission.READ_CONTACTS",
+        "write_contacts": "android.permission.WRITE_CONTACTS",
+        "contacts": "android.permission.READ_CONTACTS",
+        "microphone": "android.permission.RECORD_AUDIO",
+        "phone": "android.permission.READ_PHONE_STATE",
+        "sms": "android.permission.SEND_SMS",
+        "notifications": "android.permission.POST_NOTIFICATIONS",
+        "body_sensors": "android.permission.BODY_SENSORS",
+        "bluetooth": "android.permission.BLUETOOTH_CONNECT",
+        # Android 13+ 媒体权限（「选择照片 / 选择视频」类弹窗）
+        "photos": "android.permission.READ_MEDIA_IMAGES",
+        "images": "android.permission.READ_MEDIA_IMAGES",
+        "media_images": "android.permission.READ_MEDIA_IMAGES",
+        "select_photos": "android.permission.READ_MEDIA_IMAGES",
+        "videos": "android.permission.READ_MEDIA_VIDEO",
+        "video": "android.permission.READ_MEDIA_VIDEO",
+        "media_video": "android.permission.READ_MEDIA_VIDEO",
+        "select_videos": "android.permission.READ_MEDIA_VIDEO",
+        "media_audio": "android.permission.READ_MEDIA_AUDIO",
+        "audio": "android.permission.READ_MEDIA_AUDIO",
+        "music": "android.permission.READ_MEDIA_AUDIO",
+        # Android 14「仅允许访问所选照片/视频」（部分媒体访问）
+        "visual_selected": "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "selected_media": "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "partial_media": "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+    }
+
+    # pm grant 不支持的特殊权限（如悬浮窗/系统设置）→ 回退 cmd appops
+    # 注意：只列 pm grant 确实不支持的特殊权限，普通运行时权限（CAMERA/CALENDAR 等）不在此列
+    _APPOPS_FOR_PERMISSION = {
+        "android.permission.SYSTEM_ALERT_WINDOW": "SYSTEM_ALERT_WINDOW",
+        "android.permission.WRITE_SETTINGS": "WRITE_SETTINGS",
+        "android.permission.PACKAGE_USAGE_STATS": "PACKAGE_USAGE_STATS",
+    }
+
+    _PKG_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+")
+
+    def _resolve_permission_name(self, perm: str) -> str:
+        """权限别名 → 完整权限名；已给完整名或短名则原样/补前缀。"""
+        perm = (perm or "").strip()
+        if not perm:
+            raise ValueError("权限名不能为空")
+        if perm in self._PERMISSION_ALIAS_MAP:
+            return self._PERMISSION_ALIAS_MAP[perm]
+        if perm.startswith("android.permission.") and "." in perm:
+            return perm
+        # 形如 READ_CALENDAR 的短名补前缀
+        return f"android.permission.{perm}"
+
+    def _set_permission_via_adb(
+        self, package: str, permission: str, grant: bool
+    ) -> str:
+        """经 adb 授予/撤销运行时权限：先试 pm grant/revoke，失败回退 cmd appops。"""
+        package = (package or "").strip()
+        if not self._PKG_RE.fullmatch(package):
+            raise ValueError(f"无效的 Android 包名: {package or '<empty>'}")
+        perm = self._resolve_permission_name(permission)
+        verb = "grant" if grant else "revoke"
+        result = self.device.shell(["pm", verb, package, perm])
+        output = str(getattr(result, "output", result) or "").strip()
+        exit_code = getattr(result, "exit_code", None)
+        pm_failed = (
+            exit_code not in (None, 0)
+            or "error" in output.lower()
+            or "not a changeable permission" in output
+        )
+        if not pm_failed:
+            return output or f"ok: pm {verb} {perm}"
+        # pm 不支持（特殊权限/永久拒绝态）→ 回退 appops
+        op = self._APPOPS_FOR_PERMISSION.get(perm)
+        if op:
+            mode = "allow" if grant else "deny"
+            r2 = self.device.shell(["cmd", "appops", "set", package, op, mode])
+            out2 = str(getattr(r2, "output", r2) or "").strip()
+            if getattr(r2, "exit_code", None) in (None, 0):
+                return out2 or f"ok: appops set {op} {mode}"
+            raise RuntimeError(f"pm {verb} 失败({output}); appops 失败({out2})")
+        raise RuntimeError(
+            f"pm {verb} 失败: {output or 'exit_code=' + str(exit_code)}"
+        )
+
+    def grant_permission(self, package: str, permission: str) -> str:
+        """经 adb `pm grant` 授予运行时权限（绕过系统弹窗）。"""
+        msg = self._set_permission_via_adb(package, permission, grant=True)
+        logger.info("Granted permission package=%s perm=%s", package, permission)
+        return msg
+
+    def revoke_permission(self, package: str, permission: str) -> str:
+        """经 adb `pm revoke` 撤销运行时权限（等价于在弹窗点拒绝）。"""
+        msg = self._set_permission_via_adb(package, permission, grant=False)
+        logger.info("Revoked permission package=%s perm=%s", package, permission)
+        return msg
+
     def current_app(self, refresh: bool = False) -> dict[str, Any]:
         """
         获取当前前台应用

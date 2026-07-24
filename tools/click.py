@@ -408,6 +408,120 @@ def _maybe_promote_exact_rule(
     # 不再自动提升为 curated_rule —— 人工知识应仅由测试人员手动维护。
 
 
+# ═══════════════════════════════════════════
+#  权限弹窗自动处理 helper（独立于 click 热路径）
+# ═══════════════════════════════════════════
+
+
+def _maybe_auto_handle_permission(
+    ctx: Any, permission_hint: str, label: str
+) -> dict | None:
+    """权限弹窗自动处理 helper。三路分流：hint > intent > 默认。
+
+    hint 路径：2s one-shot 有界轮询 + 自动点选（现有逻辑不改）。
+    intent 路径：600ms 短轮询 + 自动点选 + TTL 120s 检查（新增）。
+    默认路径：单次检测 + 回写 3 字段布尔值（现有逻辑不改）。
+    """
+    from tools.perceive_tools import (
+        _detect_permission_popup,
+        _match_permission_button,
+        _permission_evidence,
+        _permission_popup_buttons,
+    )
+
+    # ── 检查 intent 有效性（TTL 120s）──
+    intent = getattr(ctx, "_permission_intent", None) or {}
+    intent_valid = bool(intent) and (
+        time.monotonic() - intent.get("set_time", 0) < 120.0
+    )
+
+    if permission_hint:
+        # ── hint 路径：2s one-shot（现有逻辑不改）──
+        info = _detect_permission_popup(ctx, timeout=2.0)
+        if not info:
+            return None
+        activity, controls = info
+        matched = _match_permission_button(controls, permission_hint)
+        if not matched:
+            return {
+                **_permission_evidence(activity, controls),
+                "permission_auto_result": "fallback_match",
+            }
+        text, bounds = matched
+        try:
+            ctx.device.click_bounds(bounds)
+            logger.info(
+                "click: auto-click permission | hint=%s button=%s",
+                permission_hint,
+                text,
+            )
+            return {
+                **_permission_evidence(activity, controls),
+                "permission_auto_handled": permission_hint,
+                "permission_auto_button": text,
+                "permission_auto_result": "handled",
+                "permission_auto_trigger": label,
+            }
+        except Exception:
+            logger.warning(
+                "click: auto-click permission failed | hint=%s", permission_hint
+            )
+            return {
+                **_permission_evidence(activity, controls),
+                "permission_auto_result": "fallback_error",
+            }
+
+    elif intent_valid:
+        # ── intent 路径：600ms 监听（新增）──
+        info = _detect_permission_popup(ctx, timeout=0.6)
+        if not info:
+            return None
+        activity, controls = info
+        action = intent["action"]
+        matched = _match_permission_button(controls, action)
+        if not matched:
+            return {
+                **_permission_evidence(activity, controls),
+                "permission_auto_result": "fallback_match",
+            }
+        text, bounds = matched
+        try:
+            ctx.device.click_bounds(bounds)
+            logger.info(
+                "click: auto-click permission | intent=%s button=%s trigger=%s",
+                action,
+                text,
+                label,
+            )
+            return {
+                **_permission_evidence(activity, controls),
+                "permission_auto_handled": action,
+                "permission_auto_button": text,
+                "permission_auto_result": "handled",
+                "permission_auto_trigger": label,
+                "permission_intent_type": intent.get("permission", ""),
+            }
+        except Exception:
+            logger.warning(
+                "click: auto-click permission failed | intent=%s", action
+            )
+            return {
+                **_permission_evidence(activity, controls),
+                "permission_auto_result": "fallback_error",
+            }
+
+    # ── 默认路径：保持改动前行为——单次检测、写 3 字段、不自动点 ──
+    info = _permission_popup_buttons(ctx)
+    if info:
+        activity, controls = info
+        return {
+            "permission_dialog": True,
+            "permission_activity": activity,
+            "permission_buttons": "|".join(text for text, _ in controls),
+        }
+    return None
+
+
 @tool
 def click(
     label: str = "",
@@ -416,6 +530,7 @@ def click(
     class_name: str = "",
     path_contains: str = "",
     index: int = -1,
+    permission_hint: str = "",
 ) -> str:
     """点击页面上指定文本, 描述, 资源 id 或关联标签的元素。
 
@@ -425,6 +540,10 @@ def click(
        - switch / switch_row → 直接用 bounds 点击（避免 click_text 误点到同名导航项）
        - 其他→ 先 click_text → click_resource_id → bounds 兑底
     3. 记录时输出语义信息（label/rid/role/context_path）供知识库沉淀，不记录原始坐标。
+
+    permission_hint: 可选，"grant" 或 "deny"。点击后若系统权限弹窗出现，
+    自动点击对应按钮（毫秒级响应，消除 LLM 时延竞态）。
+    不传则保持原有行为（仅回写弹窗存在性字段，不自动点选）。
     """
     ctx = get_tool_context()
     # 测试场景中所有操作均可执行（数据为临时测试数据）
@@ -667,8 +786,6 @@ def click(
         The message retains the legacy click log and post-click page facts for people,
         while the evidence block contains only stable, directly parseable facts.
         """
-        from tools.perceive_tools import _permission_popup_buttons
-
         _save_click_identity(ctx, label, clicked_el, understanding)
         parts = [message]
         snap = _post_click_snapshot(ctx, _pre_title, label)
@@ -699,16 +816,11 @@ def click(
             evidence["fuzzy_match"] = bool(_el_label) and _q != _el_label and (
                 _q not in _el_label or len(_q) < len(_el_label) * 0.5
             )
-        permission_info = _permission_popup_buttons(ctx)
-        if permission_info:
-            activity, controls = permission_info
-            evidence.update(
-                {
-                    "permission_dialog": True,
-                    "permission_activity": activity,
-                    "permission_buttons": "|".join(text for text, _ in controls),
-                }
-            )
+        permission_fields = _maybe_auto_handle_permission(
+            ctx, permission_hint, label
+        )
+        if permission_fields:
+            evidence.update(permission_fields)
         return make_result("OK", " | ".join(parts), evidence)
 
     def _resolved_from_element(element: Any | None) -> dict[str, str]:
@@ -845,6 +957,27 @@ def click(
             fallback_used=True,
             clicked_el=None,
         )
+    # Fix A: 主匹配全部失败，但如果 permission intent 有效，弹窗可能已经
+    # 弹出（只是主点击目标找不到）。让 auto-handler 尝试接住，避免 NOT_FOUND
+    # 后 Agent 又走不稳定的直点路径（152259 雪崩根因之一）。
+    _intent = getattr(ctx, "_permission_intent", None) or {}
+    _intent_valid = bool(_intent) and (
+        time.monotonic() - _intent.get("set_time", 0) < 120.0
+    )
+    if _intent_valid:
+        _perm = _maybe_auto_handle_permission(ctx, permission_hint, label)
+        if _perm and _perm.get("permission_auto_result") == "handled":
+            logger.info(
+                "click: NOT_FOUND but permission dialog auto-handled | "
+                "label=%s intent=%s",
+                label,
+                _intent.get("action", "?"),
+            )
+            return make_result(
+                "OK",
+                f"未找到可点击元素: {label}，但权限弹窗已自动处理",
+                _perm,
+            )
     return make_result(NOT_FOUND, f"未找到可点击元素: {label}")
 
 

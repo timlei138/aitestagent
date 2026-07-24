@@ -44,7 +44,7 @@ def _calc_budget(goal: dict) -> dict[str, int]:
     verifications = (
         _safe_len(goal.get("verification", [])) if isinstance(goal, dict) else 0
     )
-    max_tool_calls_total = 24 + pages * 12 + verifications * 10
+    max_tool_calls_total = 36 + pages * 12 + verifications * 10
     max_agent_iterations = min(max(2 + pages + verifications, 8), 24)
     # 每轮子图预算作为断路器，不应过小导致在关键动作前被截断。
     # 迭代层(route)负责主导结束；这里取较宽上限，避免"即将点击关键元素时 __end__"。
