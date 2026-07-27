@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Callable
 
 from langgraph.types import Command
+from langgraph.errors import GraphInterrupt
 
 from config import TestConfig
 from agents.graph import build_graph
@@ -589,7 +590,7 @@ class TestOrchestrator:
 
         except Exception as exc:
             exc_msg = str(exc)
-            if "GraphInterrupt" in type(exc).__name__:
+            if isinstance(exc, GraphInterrupt):
                 interrupt_info = _extract_interrupt_info(exc)
                 interrupt_info["thread_id"] = thread_id
                 itype = interrupt_info.get("type", "need_human_approval")
@@ -852,8 +853,11 @@ class TestOrchestrator:
 
     def _handle_exception(self, thread_id: str, exc: Exception) -> dict[str, Any]:
         exc_msg = str(exc)
-        logger.info("Graph exception: %s", exc_msg)
-        if "GraphInterrupt" in type(exc).__name__:
+        if isinstance(exc, GraphInterrupt):
+            logger.debug("Graph interrupt (expected): %s", exc_msg)
+        else:
+            logger.info("Graph exception: %s", exc_msg)
+        if isinstance(exc, GraphInterrupt):
             info = _extract_interrupt_info(exc)
             info["thread_id"] = thread_id
             self._emit(info.get("type", "need_human_approval"), info)

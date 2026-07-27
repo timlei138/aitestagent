@@ -121,7 +121,13 @@ def detect_overlay() -> str:
     payload = {
         "has_overlay": has_overlay,
         "overlay_type": overlay_type,
-        "reason": result.get("reason", "vision unavailable"),
+        "available": result.get("ok"),
+        "reason": (
+            result.get("reason", "vision unavailable")
+            + "，检测业务弹窗请改用 detect_popup()（基于 UI 树，不依赖 vision）"
+            if not result.get("ok")
+            else result.get("reason", "")
+        ),
         "evidence": result.get("evidence", ""),
         "blocking": blocking,
     }
@@ -251,13 +257,27 @@ def _detect_permission_popup(
     return None
 
 
+# detect_popup 关键词：覆盖常见弹窗按钮文案
+_POPUP_KEYWORDS = (
+    "允许", "拒绝", "确定", "取消", "同意", "继续", "进入", "关闭", "跳过", "知道了",
+    "前往设置", "Allow", "Deny", "OK", "Cancel", "Agree", "Continue", "Dismiss",
+)
+_POPUP_RETRY_MAX = 3       # 最多重试次数
+_POPUP_RETRY_INTERVAL = 0.5  # 重试间隔（秒），覆盖弹窗 200~500ms 渲染延迟
+
+
 @tool
 def detect_popup() -> str:
-    """检测当前弹窗；权限弹窗只返回当前事实，不会自动处理。"""
+    """检测当前弹窗（基于 UI 树，不依赖 vision）。
+
+    权限弹窗由专用检测路径处理；本工具覆盖业务弹窗（确认/取消/允许等）。
+    内置重试：弹窗渲染有延迟，会自动重试最多 3 次（间隔 0.5s）。
+    """
     ctx = get_tool_context()
     if ctx.device is None:
         return make_result(ERROR, "未连接 Android 设备")
 
+    # 1) 权限弹窗专用检测（确定性事实）
     permission_info = _permission_popup_buttons(ctx)
     if permission_info:
         activity, controls = permission_info
@@ -267,21 +287,33 @@ def detect_popup() -> str:
             _permission_evidence(activity, controls),
         )
 
-    try:
-        root = ET.fromstring(ctx.device.dump_hierarchy())
-    except Exception as exc:
-        return make_result(ERROR, f"读取弹窗层级失败: {exc}")
-    keywords = [
-        "允许", "拒绝", "确定", "取消", "同意", "关闭", "跳过", "知道了",
-        "前往设置", "Allow", "Deny", "OK", "Cancel", "Agree", "Dismiss",
-    ]
-    buttons: list[str] = []
-    for node in root.iter():
-        text = node.get("text", "")
-        if node.get("clickable") == "true" and text in keywords:
-            buttons.append(text)
-    if buttons:
-        return make_result(OK, "检测到弹窗按钮", {"buttons": "|".join(buttons)})
+    # 2) 业务弹窗检测：轮询重试（覆盖渲染延迟）+ text/content-desc 双字段 + strip 后子串匹配
+    for attempt in range(_POPUP_RETRY_MAX):
+        try:
+            root = ET.fromstring(ctx.device.dump_hierarchy())
+        except Exception as exc:
+            return make_result(ERROR, f"读取弹窗层级失败: {exc}")
+        buttons: list[str] = []
+        for node in root.iter():
+            if node.get("clickable") != "true":
+                continue
+            # 同时检查 text 和 content-desc（部分 OEM 弹窗按钮只设 content-desc）
+            text = (node.get("text") or "").strip()
+            desc = (node.get("content-desc") or "").strip()
+            for candidate in (text, desc):
+                if not candidate:
+                    continue
+                for kw in _POPUP_KEYWORDS:
+                    if kw in candidate:  # 子串匹配：「确定(2)」也能命中「确定」
+                        buttons.append(candidate)
+                        break
+                else:
+                    continue
+                break  # 一个节点只记一次
+        if buttons:
+            return make_result(OK, "检测到弹窗按钮", {"buttons": "|".join(buttons)})
+        if attempt < _POPUP_RETRY_MAX - 1:
+            time.sleep(_POPUP_RETRY_INTERVAL)
     return make_result(NOT_FOUND, "未检测到弹窗")
 
 
@@ -356,6 +388,19 @@ def set_permission_intent(permission: str = "", action: str = "") -> str:
         return make_result(OK, "权限测试意图已清除")
     if action not in ("grant", "deny"):
         return make_result(ERROR, "action 必须是 grant 或 deny")
+    # T2: 弹窗在屏却传空 permission → 结构化错误（确定性事实 + 正确工具名）
+    if action and not permission:
+        _popup = _permission_popup_buttons(ctx)
+        if _popup:
+            _activity, _controls = _popup
+            _btns = "|".join(t for t, _, _ in _controls)
+            return make_result(
+                ERROR,
+                f"当前屏幕存在权限弹窗({_activity})，请直接用 "
+                f"respond_to_permission_dialog(button=\"...\") 响应（可见按钮: {_btns}）；"
+                f"或传入具体 permission 类型后再用 click() 自动处理。",
+                _permission_evidence(_activity, _controls),
+            )
     ctx._permission_intent = {
         "permission": permission.lower().strip(),
         "action": action.strip(),

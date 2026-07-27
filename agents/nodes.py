@@ -1218,9 +1218,10 @@ def _summarize_stale_screen_dumps(um: list[Any]) -> None:
 
 
 def _prune_messages(
-    um: list[Any], max_len: int = 16, summarize_stale_screens: bool = True
+    um: list[Any], max_len: int = 14, summarize_stale_screens: bool = True
 ) -> None:
     """Phase 1.4: 裁剪消息列表，保留 system prompt + Goal 上下文 + 最近消息。
+    T5: max_len 16→14，仅微调跨轮累积的 AIMessage/ToolMessage 体积。
     O2: summarize_stale_screens=True 时先折叠历史 get_screen_info 大输出。"""
     if summarize_stale_screens:
         _summarize_stale_screen_dumps(um)

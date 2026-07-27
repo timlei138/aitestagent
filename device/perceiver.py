@@ -103,6 +103,46 @@ class PageUnderstanding:
         }
 
 
+# T6: 系统 UI 噪声过滤
+# 主判定：包名前缀（确定性事实——系统包下的元素都是系统 UI）
+# 注意：不含 com.zui.launcher（桌面图标也在该包下，需交互）
+_SYSTEM_UI_PACKAGES = (
+    "com.android.systemui:",
+    "com.android.launcher:",
+)
+# 兜底：resource_id 后缀 / class 名（应对包名前缀缺失的边缘情况，
+# 同时覆盖 com.zui.launcher 下的任务栏/导航栏噪声——按后缀精确匹配，不误杀桌面图标）
+_SYSTEM_UI_RESOURCE_IDS = frozenset({
+    # systemui 常见后缀（包名前缀已覆盖，此处双重保险）
+    "status_bar", "system_icons", "notificationIcons",
+    "nav_buttons", "navigation_bar", "recent_apps",
+    # zui.launcher 任务栏噪声（桌面图标 rid 后缀不在此列，故安全）
+    "taskbar_container", "taskbar_scrim", "taskbar_bubbles_container",
+    "navbuttons_view", "stashed_handle", "start_contextual_buttons",
+})
+_SYSTEM_UI_CLASSES = frozenset({
+    "StatusBarWindowView", "NavigationBarWindowView",
+    "SystemBarsWindowView",
+})
+
+
+def _is_system_ui_noise(el) -> bool:
+    """只按元素自身属性判断是否为系统 UI 噪声（状态栏/导航栏/通知栏等），
+    不看祖先 context_path，避免误删挂在系统容器下的 App 内容。
+    三层判定：包名前缀（稳定事实）→ rid 后缀 → class 名。"""
+    rid_full = getattr(el, "resource_id", "") or ""
+    # 1) 包名前缀匹配——com.android.systemui / com.zui.launcher 等系统包下的元素
+    if rid_full.startswith(_SYSTEM_UI_PACKAGES):
+        return True
+    # 2) 后缀兜底（应对极少数不带完整包名的情况）
+    rid_tail = rid_full.split("/")[-1] if rid_full else ""
+    if rid_tail and rid_tail in _SYSTEM_UI_RESOURCE_IDS:
+        return True
+    # 3) class 名兜底
+    cls = (getattr(el, "class_name", "") or "").split(".")[-1]
+    return cls in _SYSTEM_UI_CLASSES
+
+
 class SmartPerceiver:
     """UI 树 + 按需视觉补充的页面语义理解器。"""
 
@@ -245,6 +285,9 @@ class SmartPerceiver:
             self.logger.debug("Perceive cache hit sig=%s", sig[:8])
             return self._cache_result
         elements = self.parse_elements(xml)
+        # T6: 过滤系统 UI 噪声（状态栏/导航栏/通知栏等），只按元素自身
+        # resource-id/class 判断，不影响挂在系统容器下的 App 内容与权限弹窗。
+        elements = [e for e in elements if not _is_system_ui_noise(e)]
         # 经验推断补充：无屏上标签但有 rid 的控件，按 rid 查知识库填充 rag_hint
         # （不污染 label，仅供 LLM 参考）。知识库缺数据时无副作用。
         self._enrich_rag_hints(elements)

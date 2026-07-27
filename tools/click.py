@@ -455,6 +455,7 @@ def _maybe_auto_handle_permission(
                 permission_hint,
                 text,
             )
+            ctx._last_auto_permission_time = time.monotonic()
             return {
                 **_permission_evidence(activity, controls),
                 "permission_auto_handled": permission_hint,
@@ -475,9 +476,9 @@ def _maybe_auto_handle_permission(
         # ── intent 路径：3s 轮询监听（P0: 0.6→3.0，接住 ZUI 等慢弹窗设备）──
         # 多弹窗轮询：一次 click 后可能连续弹出多个 GrantPermissionsActivity，
         # 循环处理直到无弹窗或达上限（3 次），确保初始化阶段一串弹窗全部接住。
-        _MAX_CHAINED_POPUPS = 3
+        _PERMISSION_CHAIN_SAFETY_CEILING = 10  # 熔断上限，非功能上限；循环退出靠 if not info: break
         _last_result = None
-        for _popup_i in range(_MAX_CHAINED_POPUPS):
+        for _popup_i in range(_PERMISSION_CHAIN_SAFETY_CEILING):
             info = _detect_permission_popup(ctx, timeout=3.0)
             if not info:
                 # 无弹窗：如果是第一轮则返回 None，否则返回上一轮结果
@@ -508,6 +509,7 @@ def _maybe_auto_handle_permission(
                     "permission_auto_trigger": label,
                     "permission_intent_type": intent.get("permission", ""),
                 }
+                ctx._last_auto_permission_time = time.monotonic()
                 if _popup_i > 0:
                     _last_result["permission_chain_count"] = _popup_i + 1
                 # 点完后短暂等待，看是否有下一个弹窗
@@ -722,6 +724,16 @@ def click(
         return False
 
     def _perform_click_on_element(el: Any, desc: str) -> tuple[bool, str]:
+        # T8: 防御性拦截 disabled 元素。Android 上 disabled 按钮 clickable 仍
+        # 可能为 true，点了也是 no-op（设备不响应），导致 agent 反复点击空转。
+        # 命中即返回明确提示，逼 LLM 先完成前置操作（如先选中课程表）再点击。
+        if getattr(el, "enabled", True) is False:
+            return (
+                False,
+                f"DISABLED: 元素 '{desc}' 当前为禁用状态（无法点击）。"
+                f"请先完成前置操作使其变为可用（例如先选中一个课程表），"
+                f"再点击该按钮；不要反复点击禁用按钮。",
+            )
         role = getattr(el, "role", "")
         rid = getattr(el, "resource_id", "") or ""
         label_text = (getattr(el, "label", "") or "").lower()
@@ -739,16 +751,20 @@ def click(
                 if (e.resource_id or "") == rid
             )
             rid_is_unique = rid_count <= 1
-        if role in ("switch", "switch_row"):
+        if role in ("switch", "switch_row") or _is_checkbox_like(el):
             ctx.device.click_bounds(el.bounds)
             time.sleep(1.0)
             new_checked = _check_switch_state(ctx, el)
             if new_checked is not None:
-                state_cn = "开启" if new_checked else "关闭"
+                if role in ("switch", "switch_row"):
+                    state_cn = "开启" if new_checked else "关闭"
+                    tail = f" | 开关状态: {state_cn}"
+                else:
+                    state_cn = "已勾选" if new_checked else "未勾选"
+                    tail = f" | 勾选状态: {state_cn}"
                 return (
                     True,
-                    _format_click_log(desc, el, strategy="bounds")
-                    + f" | 开关状态: {state_cn}",
+                    _format_click_log(desc, el, strategy="bounds") + tail,
                 )
             return True, _format_click_log(desc, el, strategy="bounds")
         if rid_is_unique and rid and (exact_mode or (not _should_skip_rid_fastpath(el, desc))):
@@ -813,14 +829,12 @@ def click(
             "resolved_class": resolved.get("class_name", ""),
             "resolved_path": resolved.get("path", ""),
         }
-        # A2: 开关点击后回写确定性勾选态（不让 LLM 靠截图猜）。
-        if clicked_el is not None and getattr(clicked_el, "role", "") in (
-            "switch",
-            "switch_row",
-        ):
-            _m = re.search(r"开关状态:\s*([开启关闭]+)", message or "")
+        # A2: 开关/复选框点击后回写确定性勾选态（不让 LLM 靠截图猜）。
+        _click_role = getattr(clicked_el, "role", "") if clicked_el is not None else ""
+        if _click_role in ("switch", "switch_row", "checkbox", "checkbox_row"):
+            _m = re.search(r"(?:开关|勾选)状态:\s*(开启|关闭|已勾选|未勾选)", message or "")
             if _m:
-                evidence["checked"] = _m.group(1) == "开启"
+                evidence["checked"] = _m.group(1) in ("开启", "已勾选")
         # C: 模糊匹配（搜索词≠实际标签的语义命中）是独立事实，透传供指标统计。
         if clicked_el is not None:
             _el_label = (getattr(clicked_el, "label", "") or "").strip().lower()
@@ -1012,13 +1026,41 @@ def click(
             )
     except Exception:
         pass
+    _auto_ts = getattr(ctx, "_last_auto_permission_time", 0)
+    if _auto_ts and (time.monotonic() - _auto_ts) < 3.0:
+        return make_result(
+            NOT_FOUND,
+            f"未找到可点击元素: {label} | 提示：权限弹窗刚被 auto-handler 自动处理（可能已消失），请 get_screen_info() 确认当前页面。",
+        )
     return make_result(NOT_FOUND, f"未找到可点击元素: {label}")
 
 
-def _check_switch_state(ctx: Any, target_el: Any) -> bool | None:
-    """点击开关后重新解析 UI 树，查找目标元素的 checked 状态。
+def _is_checkbox_like(el: Any) -> bool:
+    """判断元素是否为可勾选的复选框（含 CheckBox 容器/复合控件）。
 
-    优先读 Switch 子控件的原生 checked（若有），其次读目标元素自身的 checked。
+    与 switch 对称：P1 修复中 click.py 此前对 checkbox 完全无点击后状态回检，
+    导致 agent 连点 5 次也拿不到"是否勾上"的反馈、只能靠猜→空转。这里对齐 switch，
+    让 checkbox 也能在点击后回读 checked 状态。
+    """
+    role = _normalize_text(getattr(el, "role", ""))
+    if role in ("checkbox", "checkbox_row"):
+        return True
+    cls = _normalize_text(getattr(el, "class_name", "")).split(".")[-1]
+    if "checkbox" in cls:
+        return True
+    # 复合控件（list_entry/容器等）若自身携带 checked 属性，视为可勾选
+    if getattr(el, "checked", None) is not None:
+        if any(k in cls for k in ("check", "radio", "switch", "compound", "toggle")):
+            return True
+        if role in ("list_entry", "container", "compound_button", "checkable"):
+            return True
+    return False
+
+
+def _check_switch_state(ctx: Any, target_el: Any) -> bool | None:
+    """点击开关/复选框后重新解析 UI 树，查找目标元素的 checked 状态。
+
+    优先读 Switch/CheckBox 子控件的原生 checked（若有），其次读目标元素自身的 checked。
     """
     try:
         if ctx.perceiver is None:
@@ -1037,6 +1079,17 @@ def _check_switch_state(ctx: Any, target_el: Any) -> bool | None:
                     checked = getattr(el, "checked", None)
                     if checked is not None:
                         return checked
+        # 第一优先（checkbox）：目标含 CheckBox 子控件 → 读子的原生 checked。
+        # 联想日历编辑模式的 checkbox_select 常为外层 list_entry，真正的 CheckBox
+        # 是其子控件，点击后需从子控件读 checked。
+        for el in understanding.elements:
+            cls = _normalize_text(getattr(el, "class_name", "")).split(".")[-1]
+            if (el.role == "checkbox" or "checkbox" in cls) and _bounds_overlap(
+                target_bounds, el.bounds
+            ):
+                checked = getattr(el, "checked", None)
+                if checked is not None:
+                    return checked
 
         # 第二优先：按 resource_id 或 bounds 匹配目标自身
         for el in understanding.elements:

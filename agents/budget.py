@@ -44,11 +44,16 @@ def _calc_budget(goal: dict) -> dict[str, int]:
     verifications = (
         _safe_len(goal.get("verification", [])) if isinstance(goal, dict) else 0
     )
-    max_tool_calls_total = 36 + pages * 12 + verifications * 10
-    max_agent_iterations = min(max(2 + pages + verifications, 8), 24)
+    # T9: 提高预算上限。原公式（36 + pages*12 + verifications*10）对多子目标
+    # 任务偏紧——例如「设为当前(确定/取消)+删除全部+验证空状态」(3 页/4 验证)
+    # 仅 112 次，agent 在跑完所有验证、还没来得及调用 report_done 收尾时就被
+    # MAX_TOOL_CALLS 掐断，被判失败。系数整体上调约 1.6x，并放宽两个 cap，
+    # 给复杂任务留足收尾余量（T8 已消除禁用按钮空转，放宽不会 reintroduce 死循环）。
+    max_tool_calls_total = 48 + pages * 20 + verifications * 18
+    max_agent_iterations = min(max(2 + pages + verifications, 10), 40)
     # 每轮子图预算作为断路器，不应过小导致在关键动作前被截断。
     # 迭代层(route)负责主导结束；这里取较宽上限，避免"即将点击关键元素时 __end__"。
-    max_turns_per_iteration = min(max(max_tool_calls_total, 10), 64)
+    max_turns_per_iteration = min(max(max_tool_calls_total, 10), 120)
     return {
         "max_tool_calls_total": max_tool_calls_total,
         "max_agent_iterations": max_agent_iterations,

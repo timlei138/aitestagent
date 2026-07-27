@@ -287,7 +287,14 @@ def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
     ctx_path = getattr(item, "context_path", "") or ""
     has_switch = getattr(item, "has_switch_child", False)
     checked = item.checked
-    clickable_mark = " [CLICKABLE]" if getattr(item, "clickable", False) else ""
+    # T8: 区分 enabled/disabled —— disabled 的按钮（如未选中课程表时的
+    # "设为当前课程表"）Android 仍会把 clickable 标为 true，必须按 enabled
+    # 显式呈现，否则 LLM 会误以为可点而反复点击空转。
+    _enabled = getattr(item, "enabled", True)
+    if getattr(item, "clickable", False):
+        clickable_mark = " [DISABLED]" if not _enabled else " [CLICKABLE]"
+    else:
+        clickable_mark = ""
     extra = f" rid={rid}" if rid else ""
     extra += f" class={cls.split('.')[-1]}" if cls else ""
     if assoc and assoc != item.label:

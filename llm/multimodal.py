@@ -204,7 +204,10 @@ def multimodal_vision_call(
         )
 
     if not vision_enabled:
-        disable_msg = "vision disabled by config (vision_enabled=false)"
+        disable_msg = (
+            "vision disabled by config (vision_enabled=false)"
+            "，检测弹窗请改用 detect_popup()（基于 UI 树，不依赖 vision）"
+        )
         with _CAP_LOCK:
             _CAP_STATE = "unsupported"
             _CAP_ERROR = disable_msg
