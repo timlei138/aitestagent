@@ -40,43 +40,20 @@ click("A") → click("B") → click("A") → ...
 - `index` 与当前 `page_info` 的 `[n]` 是**同一全局位置**；传入 index 时会直接按该全局位置选择，不会再与 rid/path/class 做过滤组合。页面变化后必须重新感知，不可复用旧 index。
 - 无法使用当前 page_info 的 index 时，再使用 rid/path/class 等稳定属性；页面特定导航规则从 RAG 读取，不在此处硬编码场景特例。
 
-## 系统权限弹窗（三层处理架构）
-
-**第一层（主路径）：set_permission_intent + click() 自动监听**
-- 在每个测试分支开头，调 `set_permission_intent(action="deny")` 或 `set_permission_intent(action="grant")` 声明意图。
-- 后续每次 `click()` 会自动监听权限弹窗（600ms 快速探测），若出现则自动点击对应按钮。
-- 如果 click 返回的 evidence 包含 `permission_auto_handled`，说明权限弹窗已被自动处理，**不要再调 `wait_for_permission_dialog`**，先 `get_screen_info()` 获取最新页面，再验证后续功能。
-- 分支结束时调 `set_permission_intent()` 清除意图（TTL 120s 自动过期兑底）。
-- 中间介绍弹窗（“知道了”/“请确保图片清晰”）不会阻断监听——权限弹窗在哪次 click 里出现，就在哪次被处理。
-
-**第二层（降级）：respond_to_permission_dialog 手动处理**
-- 如果 click 返回的 evidence 不包含 `permission_auto_handled`，但包含 `permission_dialog=true`（弹窗已出现但未被自动处理，如按钮不匹配或 intent 未设），用 `wait_for_permission_dialog()` 读取当前真实按钮，然后用 `respond_to_permission_dialog(button="当前可见按钮文本")` 显式点击。
-- 如果 evidence 中有 `permission_state=settings_required`，不要反复请求旧授权按钮；可显式调用 `open_app_permission_settings(package)`，随后重新感知并验证。
-
-**第三层（兑底）：set_runtime_permission ADB 授权**
-- 如果 `respond_to_permission_dialog` 返回 `NOT_FOUND`（弹窗已超时消失，点不到），**不要空转重试**；改用 `set_runtime_permission(package, permissions="camera,location", action="grant")` 经 adb `pm grant` 直接授予，或 `set_runtime_permission(package, include_common=true)` 批量授予常用权限兑底；需验证拒绝路径时用 `action="deny"`（等价 `pm revoke`）。
-- ⚠️ **`pm grant` 不会触发 App 的 `onRequestPermissionsResult` 回调**：App 在回调里写的后续逻辑（打开相机、跳转页面等）不会被执行。因此用 `set_runtime_permission(grant)` 授权后，必须**导航回触发点并重新点击触发操作**，让 App 再次调 `requestPermissions()`，此时 Android 发现权限已 GRANTED，直接触发回调，App 正常流程才跑通。
+## 系统权限弹窗（工具自动处理，Agent 只声明策略）
+- 权限弹窗由 `click()` 在工具层**确定性消解**，Agent 无需手动调用 `wait_for_permission_dialog` / `respond_to_permission_dialog`。
+- 在每个测试分支开头调 `set_permission_intent(action="deny"|"grant")` 声明意图；后续 `click()` 会自动监听并按对应按钮响应（按控件 resource-id 匹配，与文案/语言无关，无需关心「全部允许」「允许访问所有照片」等差异）。
+- `click()` 返回的 evidence 若含 `permission_auto_handled`，说明弹窗已被自动处理 → 直接 `get_screen_info()` 获取最新页面，再验证后续功能，**不要再处理弹窗**。
+- 极端情况下弹窗未被自动接住（如 >3s 才出现），工具会提示真实可见按钮，按提示用真实文案重试即可；不要空转重试，也不要主动走 adb 授权（adb 授权不触发 App 回调，会污染验证）。
 
 ## 权限双分支测试（允许路径 + 拒绝路径）
-当 verification 中同一触发操作同时含「授予/允许」和「拒绝」两种预期结果时，**必须分两轮执行**，不能只测其中一条路径就报告完成。
-
-**第一轮（拒绝路径）**：
-1. 如果初始化 deny intent 还在（未清除），直接复用；否则 `set_permission_intent(action="deny")`
-2. `click(触发操作)` — 不传 permission_hint，intent 自动监听
-3. 检查返回 evidence：若 `permission_auto_handled=deny` → 弹窗已自动点击拒绝，`get_screen_info()` 后验证拒绝提示
-4. 若弹窗未出现（`permission_auto_handled` 不存在且 `permission_dialog` 不存在）→ 弹窗可能已超时，用 `set_runtime_permission(action="deny")` 撤销权限后重新触发
-5. `set_permission_intent()` 清除意图
-
-**第二轮（允许路径）**：
-1. `set_runtime_permission(action="deny")` 撤销权限（确保弹窗会再次弹出），导航回触发点
-2. `set_permission_intent(action="grant")`
-3. `click(触发操作)` — 不传 permission_hint
-4. 检查返回 evidence：若 `permission_auto_handled=grant` → 弹窗已自动点击允许，`get_screen_info()` 后验证后续功能（相机是否打开、照片是否可选）
-5. 若弹窗未出现 → 用 `set_runtime_permission(action="grant")` 直接授予，然后**导航回触发点并重新点击操作**（pm grant 不触发 App 回调，必须重新触发让 App 再次调 requestPermissions，回调才会执行）
-6. `set_permission_intent()` 清除意图
-
-- 如果 hints 中已明确指定执行顺序，以 hints 为准。
-- **禁止**只完成其中一个分支就调用 `report_done`；检查 verification 列表确认所有分支对应的 key 都已上报。
+当同一触发操作需验证「授予」和「拒绝」两种结果时，**必须分两轮，顺序固定为先拒绝后授予**：
+1. 复用初始化 `set_permission_intent(action="deny")` 基线（若已清除则重设）；
+2. 第一轮（拒绝）：`click(触发操作)` → 自动拒绝 → `get_screen_info()` 验证拒绝提示；
+3. 第二轮（授予）：不清除 deny、不 revoke，改设 `set_permission_intent(action="grant")` 后再次 `click(触发操作)` → 自动授予 → 验证后续功能；
+4. 两轮都走真实弹窗点击，零 adb；完成后 `set_permission_intent()` 统一清除意图。
+- ❗ 拒绝必须点「拒绝」，**禁止「拒绝并不再询问」**（会设置 don't-ask-again，导致授予分支弹窗不再弹出）。
+- 若 hints 已明确指定执行顺序，以 hints 为准；**禁止**只完成单分支就 `report_done`，须确认所有分支 key 已上报。
 
 ## 精确点击
 - click 支持精确参数：`index`、`rid`、`path_contains`、`class_name`，可组合使用。

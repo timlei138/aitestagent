@@ -26,11 +26,15 @@ def _b(x1: int, y1: int, x2: int, y2: int) -> str:
 
 
 def _xml(*buttons):
-    """buttons: (text, bounds_str) 序列，生成可解析的 hierarchy XML。"""
+    """buttons: (text, rid, bounds_str) 或 (text, bounds_str) 序列。
+
+    2-tuple 时 resource-id 为空（纯文案匹配测试）；
+    3-tuple 时传入 rid（rid 匹配测试）。
+    """
     nodes = "".join(
-        f'<node index="0" text="{t}" resource-id="" '
-        f'class="android.widget.Button" clickable="true" bounds="[{b}]"/>'
-        for t, b in buttons
+        f'<node index="0" text="{b[0]}" resource-id="{b[1] if len(b) == 3 else ""}" '
+        f'class="android.widget.Button" clickable="true" bounds="[{b[-1]}]"/>'
+        for b in buttons
     )
     return (
         f'<hierarchy rotation="0">'
@@ -40,20 +44,29 @@ def _xml(*buttons):
 
 
 class _Device:
-    """立即返回权限弹窗的 device（marker activity + 给定可点击按钮）。"""
+    """立即返回权限弹窗的 device（marker activity + 给定可点击按钮）。
+    点击后弹窗消失（activity 变回普通页面），模拟真实设备行为。
+    """
 
     def __init__(self, buttons, activity="com.android.permissioncontroller.PermissionActivity"):
         self.activity = activity
-        self.hierarchy = _xml(*buttons)
+        self._perm_hierarchy = _xml(*buttons)
+        self._normal_hierarchy = _xml()  # 点击后返回普通页面
+        self._clicked = False
         self.click_bounds_calls: list[tuple[int, int, int, int]] = []
 
     def current_app(self, refresh=True):
+        if self._clicked:
+            return {"package": "com.demo", "activity": "com.demo.MainActivity"}
         return {"package": "com.demo", "activity": self.activity}
 
     def dump_hierarchy(self):
-        return self.hierarchy
+        if self._clicked:
+            return self._normal_hierarchy
+        return self._perm_hierarchy
 
     def click_bounds(self, bounds):
+        self._clicked = True
         self.click_bounds_calls.append(tuple(bounds))
         return True
 
@@ -100,40 +113,104 @@ def _ctx(device):
 
 def test_match_grant_picks_min_index_not_first_hit():
     # 「始终允许」先于「仅在使用中允许」出现，但下标更小者优先
-    controls = [("始终允许", (0, 0, 1, 1)), ("仅在使用中允许", (0, 0, 2, 2))]
+    controls = [("始终允许", "", (0, 0, 1, 1)), ("仅在使用中允许", "", (0, 0, 2, 2))]
     assert _match_permission_button(controls, "grant") == ("仅在使用中允许", (0, 0, 2, 2))
 
 
 def test_match_deny_picks_min_index():
-    controls = [("不允许", (0, 0, 1, 1)), ("拒绝", (0, 0, 2, 2))]
+    controls = [("不允许", "", (0, 0, 1, 1)), ("拒绝", "", (0, 0, 2, 2))]
     assert _match_permission_button(controls, "deny") == ("拒绝", (0, 0, 2, 2))
 
 
-def test_match_skips_media_buttons():
+def test_match_skips_partial_media_buttons():
+    # "只允许访问所选照片" 和 "选择照片" 是部分媒体访问，不归 grant/deny
     controls = [
-        ("只允许访问所选照片", (0, 0, 1, 1)),
-        ("允许访问所有照片", (0, 0, 2, 2)),
+        ("只允许访问所选照片", "", (0, 0, 1, 1)),
+        ("选择照片", "", (0, 0, 3, 3)),
     ]
     assert _match_permission_button(controls, "grant") is None
+    assert _match_permission_button(controls, "deny") is None
+
+
+def test_match_hits_full_media_grant_buttons():
+    # "全部允许" / "允许访问所有照片" 应匹配 grant
+    controls1 = [("全部允许", "", (0, 0, 2, 2))]
+    assert _match_permission_button(controls1, "grant") == ("全部允许", (0, 0, 2, 2))
+    controls2 = [("允许访问所有照片", "", (0, 0, 2, 2))]
+    assert _match_permission_button(controls2, "grant") == ("允许访问所有照片", (0, 0, 2, 2))
 
 
 def test_match_skips_settings_button():
-    controls = [("前往设置", (0, 0, 1, 1))]
+    controls = [("前往设置", "", (0, 0, 1, 1))]
     assert _match_permission_button(controls, "grant") is None
 
 
 def test_match_strips_whitespace():
-    controls = [("  允许  ", (0, 0, 1, 1))]
+    controls = [("  允许  ", "", (0, 0, 1, 1))]
     assert _match_permission_button(controls, "grant") == ("允许", (0, 0, 1, 1))
 
 
 def test_match_no_hit_returns_none():
-    controls = [("确定", (0, 0, 1, 1))]
+    controls = [("确定", "", (0, 0, 1, 1))]
     assert _match_permission_button(controls, "grant") is None
 
 
 def test_match_empty_controls_returns_none():
     assert _match_permission_button([], "grant") is None
+
+
+# ── O1: rid 匹配优先于文案 ──────────────────────────────────
+
+_RID_PREFIX = "com.android.permissioncontroller:id/"
+
+
+def test_rid_grant_picks_allow_all_over_basic_allow():
+    # permission_allow_all_button (score=1) 优于 permission_allow_button (score=2)
+    controls = [
+        ("允许", f"{_RID_PREFIX}permission_allow_button", (0, 0, 1, 1)),
+        ("全部允许", f"{_RID_PREFIX}permission_allow_all_button", (0, 0, 2, 2)),
+    ]
+    assert _match_permission_button(controls, "grant") == ("全部允许", (0, 0, 2, 2))
+
+
+def test_rid_grant_picks_foreground_only():
+    controls = [
+        ("仅在使用中允许", f"{_RID_PREFIX}permission_allow_foreground_only_button", (0, 0, 3, 3)),
+    ]
+    assert _match_permission_button(controls, "grant") == ("仅在使用中允许", (0, 0, 3, 3))
+
+
+def test_rid_deny_skips_dont_ask_again():
+    # permission_deny_and_dont_ask_again_button 不能点
+    controls = [
+        ("拒绝并不再询问", f"{_RID_PREFIX}permission_deny_and_dont_ask_again_button", (0, 0, 1, 1)),
+        ("拒绝", f"{_RID_PREFIX}permission_deny_button", (0, 0, 2, 2)),
+    ]
+    assert _match_permission_button(controls, "deny") == ("拒绝", (0, 0, 2, 2))
+
+
+def test_rid_deny_only_dont_ask_again_returns_text_fallback():
+    # 只有 dont_ask_again 按钮时 rid 不命中 → 文案兜底也找不到「拒绝」→ None
+    controls = [
+        ("拒绝并不再询问", f"{_RID_PREFIX}permission_deny_and_dont_ask_again_button", (0, 0, 1, 1)),
+    ]
+    assert _match_permission_button(controls, "deny") is None
+
+
+def test_rid_grant_with_unknown_text_still_hits():
+    # 即使文案是陌生 OEM 文案，rid 命中也自动点选
+    controls = [
+        ("全部授予", f"{_RID_PREFIX}permission_allow_all_button", (0, 0, 4, 4)),
+    ]
+    assert _match_permission_button(controls, "grant") == ("全部授予", (0, 0, 4, 4))
+
+
+def test_rid_empty_falls_back_to_text():
+    # rid 为空时回退到文案匹配
+    controls = [
+        ("仅在使用中允许", "", (0, 0, 5, 5)),
+    ]
+    assert _match_permission_button(controls, "grant") == ("仅在使用中允许", (0, 0, 5, 5))
 
 
 # ── _permission_popup_buttons：activity gate + 解析 ────────
@@ -150,8 +227,8 @@ def test_permission_popup_parses_clickable():
     assert info is not None
     activity, controls = info
     assert "permissioncontroller" in activity.lower()
-    assert ("拒绝", (0, 0, 2, 2)) in controls
-    assert ("允许", (0, 5, 2, 7)) in controls
+    assert ("拒绝", "", (0, 0, 2, 2)) in controls
+    assert ("允许", "", (0, 5, 2, 7)) in controls
 
 
 def test_permission_popup_no_clickable_text_returns_empty():
@@ -174,7 +251,7 @@ def test_detect_finds_dialog_after_delay():
     assert info is not None
     activity, controls = info
     assert "permissioncontroller" in activity.lower()
-    assert ("允许", (0, 0, 2, 2)) in controls
+    assert ("允许", "", (0, 0, 2, 2)) in controls
 
 
 def test_detect_returns_none_on_timeout():
@@ -256,7 +333,8 @@ def test_intent_auto_handles_permission():
         device=device,
         _permission_intent={"permission": "camera", "action": "deny", "set_time": _time.monotonic()},
     )
-    result = _maybe_auto_handle_permission(ctx, "", "拍照导入")
+    with patch("tools.click.time.sleep", lambda *a, **k: None):
+        result = _maybe_auto_handle_permission(ctx, "", "拍照导入")
     assert result is not None
     assert result["permission_auto_handled"] == "deny"
     assert result["permission_auto_button"] == "拒绝"

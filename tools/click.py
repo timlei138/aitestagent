@@ -419,7 +419,7 @@ def _maybe_auto_handle_permission(
     """权限弹窗自动处理 helper。三路分流：hint > intent > 默认。
 
     hint 路径：2s one-shot 有界轮询 + 自动点选（现有逻辑不改）。
-    intent 路径：600ms 短轮询 + 自动点选 + TTL 120s 检查（新增）。
+    intent 路径：3s 轮询 + 自动点选 + 多弹窗链式处理（最多 3 个）+ TTL 120s。
     默认路径：单次检测 + 回写 3 字段布尔值（现有逻辑不改）。
     """
     from tools.perceive_tools import (
@@ -472,43 +472,55 @@ def _maybe_auto_handle_permission(
             }
 
     elif intent_valid:
-        # ── intent 路径：600ms 监听（新增）──
-        info = _detect_permission_popup(ctx, timeout=0.6)
-        if not info:
-            return None
-        activity, controls = info
-        action = intent["action"]
-        matched = _match_permission_button(controls, action)
-        if not matched:
-            return {
-                **_permission_evidence(activity, controls),
-                "permission_auto_result": "fallback_match",
-            }
-        text, bounds = matched
-        try:
-            ctx.device.click_bounds(bounds)
-            logger.info(
-                "click: auto-click permission | intent=%s button=%s trigger=%s",
-                action,
-                text,
-                label,
-            )
-            return {
-                **_permission_evidence(activity, controls),
-                "permission_auto_handled": action,
-                "permission_auto_button": text,
-                "permission_auto_result": "handled",
-                "permission_auto_trigger": label,
-                "permission_intent_type": intent.get("permission", ""),
-            }
-        except Exception:
-            logger.warning(
-                "click: auto-click permission failed | intent=%s", action
-            )
-            return {
-                **_permission_evidence(activity, controls),
-                "permission_auto_result": "fallback_error",
-            }
+        # ── intent 路径：3s 轮询监听（P0: 0.6→3.0，接住 ZUI 等慢弹窗设备）──
+        # 多弹窗轮询：一次 click 后可能连续弹出多个 GrantPermissionsActivity，
+        # 循环处理直到无弹窗或达上限（3 次），确保初始化阶段一串弹窗全部接住。
+        _MAX_CHAINED_POPUPS = 3
+        _last_result = None
+        for _popup_i in range(_MAX_CHAINED_POPUPS):
+            info = _detect_permission_popup(ctx, timeout=3.0)
+            if not info:
+                # 无弹窗：如果是第一轮则返回 None，否则返回上一轮结果
+                return _last_result if _last_result else None
+            activity, controls = info
+            action = intent["action"]
+            matched = _match_permission_button(controls, action)
+            if not matched:
+                return {
+                    **_permission_evidence(activity, controls),
+                    "permission_auto_result": "fallback_match",
+                }
+            text, bounds = matched
+            try:
+                ctx.device.click_bounds(bounds)
+                logger.info(
+                    "click: auto-click permission | intent=%s button=%s trigger=%s chain=%d",
+                    action,
+                    text,
+                    label,
+                    _popup_i + 1,
+                )
+                _last_result = {
+                    **_permission_evidence(activity, controls),
+                    "permission_auto_handled": action,
+                    "permission_auto_button": text,
+                    "permission_auto_result": "handled",
+                    "permission_auto_trigger": label,
+                    "permission_intent_type": intent.get("permission", ""),
+                }
+                if _popup_i > 0:
+                    _last_result["permission_chain_count"] = _popup_i + 1
+                # 点完后短暂等待，看是否有下一个弹窗
+                time.sleep(0.3)
+            except Exception:
+                logger.warning(
+                    "click: auto-click permission failed | intent=%s chain=%d", action, _popup_i + 1
+                )
+                return {
+                    **_permission_evidence(activity, controls),
+                    "permission_auto_result": "fallback_error",
+                }
+        return _last_result
 
     # ── 默认路径：保持改动前行为——单次检测、写 3 字段、不自动点 ──
     info = _permission_popup_buttons(ctx)
@@ -517,7 +529,7 @@ def _maybe_auto_handle_permission(
         return {
             "permission_dialog": True,
             "permission_activity": activity,
-            "permission_buttons": "|".join(text for text, _ in controls),
+            "permission_buttons": "|".join(text for text, _, _b in controls),
         }
     return None
 
@@ -978,6 +990,28 @@ def click(
                 f"未找到可点击元素: {label}，但权限弹窗已自动处理",
                 _perm,
             )
+    # 误判防护（对应 agent.txt 第二层 #2）：NOT_FOUND 时若系统权限弹窗
+    # 仍在（GrantPermissionsActivity 可见），把真实按钮回写给 LLM，避免它
+    # 把"点空"误判成"弹窗超时"去烧 adb 兜底。
+    try:
+        from tools.perceive_tools import _permission_popup_buttons
+
+        _pd = _permission_popup_buttons(ctx)
+        if _pd:
+            _act, _ctrls = _pd
+            return make_result(
+                NOT_FOUND,
+                f"未找到可点击元素: {label}，但权限弹窗仍在（{_act}），"
+                f"真实按钮为: {'|'.join(t for t, _ in _ctrls)}；"
+                f"请先 get_screen_info() 读取真实按钮文案再点击，勿直接走 adb",
+                {
+                    "permission_dialog": "true",
+                    "permission_activity": _act,
+                    "permission_buttons": "|".join(t for t, _ in _ctrls),
+                },
+            )
+    except Exception:
+        pass
     return make_result(NOT_FOUND, f"未找到可点击元素: {label}")
 
 

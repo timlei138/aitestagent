@@ -134,7 +134,7 @@ _PERMISSION_SETTINGS_BUTTONS = ("前往设置", "Go to settings")
 
 def _permission_popup_buttons(
     ctx: Any,
-) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]] | None:
+) -> tuple[str, list[tuple[str, str, tuple[int, int, int, int]]]] | None:
     """读取系统权限弹窗的当前可点击控件，不作任何点击或授权决定。"""
     try:
         try:
@@ -146,7 +146,7 @@ def _permission_popup_buttons(
         if not any(marker in activity.lower() for marker in _PERMISSION_ACTIVITY_MARKERS):
             return None
         root = ET.fromstring(ctx.device.dump_hierarchy())
-        controls: list[tuple[str, tuple[int, int, int, int]]] = []
+        controls: list[tuple[str, str, tuple[int, int, int, int]]] = []
         for node in root.iter():
             if node.get("clickable") != "true":
                 continue
@@ -154,16 +154,20 @@ def _permission_popup_buttons(
             raw_bounds = node.get("bounds", "")
             match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", raw_bounds)
             if text and match:
-                controls.append((text, tuple(int(value) for value in match.groups())))
+                rid = node.get("resource-id") or ""
+                controls.append(
+                    (text, rid, tuple(int(value) for value in match.groups()))
+                )
         return activity, controls
     except Exception:
         return None
 
 
 def _permission_evidence(
-    activity: str, controls: list[tuple[str, tuple[int, int, int, int]]]
+    activity: str,
+    controls: list[tuple[str, str, tuple[int, int, int, int]]],
 ) -> dict[str, str]:
-    labels = [text for text, _ in controls]
+    labels = [item[0] for item in controls]
     return {
         "permission_dialog": "true",
         "permission_activity": activity,
@@ -176,26 +180,52 @@ def _permission_evidence(
     }
 
 
-# 确定性规则：精确匹配，不做语义判断
-# 元组顺序 = 优先级（下标越小越优先，最小权限优先）
-_GRANT_BUTTONS = ("仅在使用中允许", "仅本次使用时允许", "始终允许", "允许", "Allow")
+# O1: resource-id → 角色映射（标准 Android permissioncontroller 前缀）
+# rid 优先于文案，消除 OEM / 语言差异（如 ZUI「全部允许」vs 其它「允许访问所有照片」）
+# 注意：permission_deny_and_dont_ask_again_button 永不自动点（避免设 don't-ask-again）
+_GRANT_RID_SCORES = {
+    "permission_allow_all_button": 1,               # 媒体全量「全部允许」
+    "permission_allow_always_button": 1,            # 始终允许
+    "permission_allow_foreground_only_button": 2,
+    "permission_allow_button": 2,                   # 基本允许（单次）
+    "permission_allow_one_time_button": 2,          # 仅本次使用
+}
+_DENY_RID = "permission_deny_button"
+# 文案兜底表（兼容非标准 OEM / 自定义 rid 的设备）
+_GRANT_BUTTONS = ("仅在使用中允许", "仅本次使用时允许", "始终允许", "允许", "全部允许", "允许访问所有照片", "Allow")
 _DENY_BUTTONS = ("拒绝", "不允许", "Deny", "Don't allow")
-# 注意：以下按钮故意不在任何一侧：
-# - "前往设置" / "Go to settings" → settings_required，单独处理
-# - "只允许访问所选照片" / "允许访问所有照片" → 媒体范围决策，归 LLM
 
 
 def _match_permission_button(
-    controls: list[tuple[str, tuple[int, int, int, int]]],
+    controls: list[tuple[str, str, tuple[int, int, int, int]]],
     hint: str,
 ) -> tuple[str, tuple[int, int, int, int]] | None:
-    """在所有命中项中选 _GRANT/_DENY_BUTTONS 下标最小的（最小权限优先）。
+    """按 rid 优先、文案兜底，确定性匹配权限按钮。
 
-    返回 (text, bounds) 或 None（匹配不到时）。
+    返回 (text, bounds) 或 None。grant 优先「全部/始终」(score 最小)，
+    deny 只命中 permission_deny_button，绝不命中 dont_ask_again。
     """
-    table = _DENY_BUTTONS if hint == "deny" else _GRANT_BUTTONS
+    if hint == "deny":
+        for text, rid, bounds in controls:
+            if rid.endswith(_DENY_RID) and not rid.endswith("dont_ask_again_button"):
+                return (text, bounds)
+        return _match_by_text(controls, _DENY_BUTTONS)
+    best, best_score = None, None
+    for text, rid, bounds in controls:
+        for key, score in _GRANT_RID_SCORES.items():
+            if rid.endswith(key) and (best_score is None or score < best_score):
+                best, best_score = (text, bounds), score
+                break
+    return best if best else _match_by_text(controls, _GRANT_BUTTONS)
+
+
+def _match_by_text(
+    controls: list[tuple[str, str, tuple[int, int, int, int]]],
+    table: tuple[str, ...],
+) -> tuple[str, tuple[int, int, int, int]] | None:
+    """rid 未命中时的文案兜底（最小权限优先）。"""
     best, best_idx = None, None
-    for text, bounds in controls:
+    for text, _rid, bounds in controls:
         t = text.strip()
         if t in table:
             idx = table.index(t)
@@ -206,7 +236,7 @@ def _match_permission_button(
 
 def _detect_permission_popup(
     ctx: Any, timeout: float = 2.0
-) -> tuple[str, list[tuple[str, tuple[int, int, int, int]]]] | None:
+) -> tuple[str, list[tuple[str, str, tuple[int, int, int, int]]]] | None:
     """有界轮询检测权限弹窗（非单次）。
 
     覆盖弹窗 100~300ms 渲染延迟，每 200ms 检测一次，最多等 timeout 秒。
@@ -288,7 +318,7 @@ def respond_to_permission_dialog(button: str, timeout: float = 3.0) -> str:
         if info:
             activity, controls = info
             evidence = _permission_evidence(activity, controls)
-            for label, bounds in controls:
+            for label, rid, bounds in controls:
                 if label == requested:
                     ctx.device.click_bounds(bounds)
                     evidence["selected_button"] = label
@@ -296,7 +326,8 @@ def respond_to_permission_dialog(button: str, timeout: float = 3.0) -> str:
             return make_result(
                 NOT_FOUND,
                 f"当前权限弹窗不存在指定按钮: {requested}；"
-                f"若弹窗已超时消失，可改用 set_runtime_permission(package, permissions, action) 经 adb 直接授权",
+                f"当前可见按钮为: {'|'.join(label for label, _, _b in controls)}，"
+                f"请用 get_screen_info() 读取真实按钮文案后重试",
                 evidence,
             )
         if time.monotonic() >= deadline:
@@ -305,8 +336,8 @@ def respond_to_permission_dialog(button: str, timeout: float = 3.0) -> str:
     return make_result(
         NOT_FOUND,
         "权限弹窗未在等待时间内出现（可能已超时 10s 自动消失）；"
-        "请勿空转重试，改用 set_runtime_permission(package, permissions='camera,location', action='grant') 经 adb pm grant 直接授予，"
-        "或 set_runtime_permission(include_common=true) 批量授予常用权限兜底",
+        "请先 get_screen_info() 确认弹窗是否仍在，若仍在则用真实按钮文案重试；"
+        "若确已消失，可改用 set_runtime_permission(package, permissions, action) 经 adb 授权",
     )
 
 

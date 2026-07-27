@@ -635,16 +635,17 @@ class TestOrchestrator:
         )
 
         resume_value = decision
-        # 如果是计划编辑结果，包装为标准格式
+        # plan_review_node 期望 resume 回来的是顶层结构
+        # {action:"confirm", goal, target_pages, verification, hints}
+        # （前端 confirmPlan 也正是这样回传的）。原代码误把编辑内容塞进
+        # decision["plan"] 再包成 {"plan":..., "action":"confirm"}，
+        # 导致 plan_review_node 读不到 goal/target_pages/verification，沿用旧计划。
+        # 这里原样透传 decision（含编辑字段），仅 cancel 转为字符串。
         if isinstance(decision, dict):
-            plan = decision.get("plan")
             action = decision.get("action", "confirm")
-            if action == "cancel":
+            if action == "cancel" or decision.get("plan") == "cancel":
                 resume_value = "cancel"
-            elif plan and isinstance(plan, list):
-                resume_value = {"plan": plan, "action": "confirm"}
-            else:
-                resume_value = "confirm"
+            # 其余情况：decision 本身已是 plan_review_node 需要的形状，原样透传
 
         from config import start_run_log, append_run_log
 
@@ -699,14 +700,10 @@ class TestOrchestrator:
 
         resume_value = decision
         if isinstance(decision, dict):
-            plan = decision.get("plan")
             action = decision.get("action", "confirm")
-            if action == "cancel":
+            if action == "cancel" or decision.get("plan") == "cancel":
                 resume_value = "cancel"
-            elif plan and isinstance(plan, list):
-                resume_value = {"plan": plan, "action": "confirm"}
-            else:
-                resume_value = "confirm"
+            # 其余情况原样透传，保持与 plan_review_node 契约一致
 
         from config import start_run_log, append_run_log
 

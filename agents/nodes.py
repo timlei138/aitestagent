@@ -1165,14 +1165,12 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
     )
     # If user edited the goal, use the edited version
     if isinstance(result, dict) and result.get("action") == "confirm":
-        edited = {
-            "goal": result.get("goal", goal.get("goal", "")),
-            "target_pages": result.get("target_pages", goal.get("target_pages", [])),
-            "verification": result.get("verification", goal.get("verification", [])),
-            "hints": result.get("hints", goal.get("hints", [])),
-            "app_package": goal.get("app_package", ""),
-            "app_name": goal.get("app_name", ""),
-        }
+        # 在原计划基础上覆盖用户编辑的字段，保留 execution_plan 等其余字段
+        edited = dict(goal)
+        edited["goal"] = result.get("goal", goal.get("goal", ""))
+        edited["target_pages"] = result.get("target_pages", goal.get("target_pages", []))
+        edited["verification"] = result.get("verification", goal.get("verification", []))
+        edited["hints"] = result.get("hints", goal.get("hints", []))
         logger.info("Plan review: user edited goal")
         return Command(update={"goal_description": edited})
     if result == "cancel" or (
