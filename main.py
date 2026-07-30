@@ -71,6 +71,11 @@ def _init_tool_context(config: TestConfig) -> None:
         v_api_key  = config.vision_api_key  or config.api_key
         v_base_url = config.vision_base_url or config.base_url
 
+        logging.getLogger(__name__).info(
+            "[vision-build] provider=%s model=%s base_url=%s enabled=%s",
+            v_provider, v_model, v_base_url, bool(config.vision_model),
+        )
+
         def _vision_call(
             prompt: str, image_base64: str, purpose: str, strict_json: bool
         ):
@@ -84,7 +89,7 @@ def _init_tool_context(config: TestConfig) -> None:
                 api_key=v_api_key,
                 base_url=v_base_url,
                 vision_enabled=bool(config.vision_model),
-                timeout_sec=12,
+                timeout_sec=30,
             )
 
         def _screenshot_sink(path: str) -> None:

@@ -54,6 +54,7 @@ def _reset_run_scoped(ctx) -> None:
             "_rag_same_app_count",
             "_rag_cross_app_count",
             "_rag_empty_hit_count",
+            "_vision_tap_fail_streak",  # vision_tap run 级连续失败计数
         ):
             if hasattr(ctx, _rag_attr):
                 setattr(ctx, _rag_attr, 0)

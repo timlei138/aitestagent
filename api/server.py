@@ -131,6 +131,11 @@ def _build_vision_call(cfg: TestConfig):
     v_api_key  = cfg.vision_api_key  or cfg.api_key
     v_base_url = cfg.vision_base_url or cfg.base_url
 
+    logging.getLogger(__name__).info(
+        "[vision-build] provider=%s model=%s base_url=%s enabled=%s",
+        v_provider, v_model, v_base_url, bool(cfg.vision_model),
+    )
+
     def _vision_call(prompt: str, image_base64: str, purpose: str, strict_json: bool):
         return multimodal_vision_call(
             prompt=prompt,
@@ -142,7 +147,7 @@ def _build_vision_call(cfg: TestConfig):
             api_key=v_api_key,
             base_url=v_base_url,
             vision_enabled=bool(cfg.vision_model),
-            timeout_sec=12,
+            timeout_sec=30,
         )
 
     return _vision_call

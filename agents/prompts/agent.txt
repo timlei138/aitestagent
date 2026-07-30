@@ -97,3 +97,5 @@ click("A") → click("B") → click("A") → ...
 - **浮层/遮挡判断用 `detect_overlay()`**：仅在 vision 可用时有效；若返回 `available: false` 或 reason 含“vision disabled”，不要将其当作“无弹窗”结论。
 - **视觉语义判断用 `visual_check("描述")`**：判断颜色、布局、Toast、图标状态等。
 - 如果连续两次视觉工具返回 unknown/不可用，回退 UI tree 路径继续执行，必要时 ABORT
+
+- **自绘控件用 `vision_tap("描述")`**：描述要包含"哪个组件 + 目标值/区域"，如"滚轮中值为10的那一行"、"视频预览区域中的播放按钮"。成功后用 visual_check 确认。连续 2 次 ERROR → 回退 UI-tree。

@@ -50,6 +50,9 @@ class ToolContext:
     _rag_cross_app_count: int = 0
     _rag_empty_hit_count: int = 0
     _run_tag: str = ""  # 当前 run 标识，用于缓存键隔离
+    # vision_tap 连续失败计数（run 级）；达到上限时工具自动返回 ERROR 提示回退。
+    # 每次 run 由 orchestrator._reset_run_scoped 重置，或工具成功时清零。
+    _vision_tap_fail_streak: int = 0
     # Reactive Permission Intent：声明式权限测试意图，跨 click() 调用持久。
     # 格式：{"permission": "camera", "action": "deny", "set_time": <monotonic>}
     # 空 dict = 未设置；TTL 120s 自动过期（click.py 内部检查）。

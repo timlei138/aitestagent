@@ -567,7 +567,7 @@ def assert_verification(
                     image_base64=image_b64,
                     purpose="verification_fail_analyze",
                     strict_json=True,
-                    timeout_sec=10,
+                    timeout_sec=30,
                 )
                 if vres.get("ok"):
                     vis = f"vision={vres.get('decision', 'unknown')}: {vres.get('reason', '')}"

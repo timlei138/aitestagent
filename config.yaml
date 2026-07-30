@@ -10,4 +10,4 @@ click_mode: legacy
 context_history_steps: 5
 vision_provider: openai
 vision_model: qwen3.7-flash
-vision_base_url: https://dashscope.aliyuncs.com/api/v1
+vision_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1

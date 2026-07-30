@@ -146,6 +146,7 @@ def _invoke_openai_multimodal(
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout_sec,
+                max_retries=0,  # 视觉调用不需要 SDK 层重试，超时即失败
             )
             _OPENAI_CLIENTS[cache_key] = client
     msg = [
@@ -160,8 +161,29 @@ def _invoke_openai_multimodal(
             ],
         }
     ]
-    resp = client.invoke(msg)
-    return str(getattr(resp, "content", "") or "")
+    img_kb = len(image_base64) * 3 // 4 // 1024
+    logger.info(
+        "[vision-invoke] calling model=%s base_url=%s timeout=%ds image=%dKB prompt_len=%d",
+        model, base_url, timeout_sec, img_kb, len(prompt),
+    )
+    import time as _time
+    t0 = _time.monotonic()
+    try:
+        resp = client.invoke(msg)
+        elapsed = _time.monotonic() - t0
+        content = str(getattr(resp, "content", "") or "")
+        logger.info(
+            "[vision-invoke] OK model=%s elapsed=%.1fs response_len=%d",
+            model, elapsed, len(content),
+        )
+        return content
+    except Exception as exc:
+        elapsed = _time.monotonic() - t0
+        logger.warning(
+            "[vision-invoke] FAIL model=%s base_url=%s elapsed=%.1fs error_type=%s error=%s",
+            model, base_url, elapsed, type(exc).__name__, exc,
+        )
+        raise
 
 
 def _invoke_multimodal(
@@ -189,11 +211,18 @@ def multimodal_vision_call(
     api_key: str | None = None,
     base_url: str | None = None,
     vision_enabled: bool = True,
-    timeout_sec: int = 12,
+    timeout_sec: int = 30,
 ) -> dict[str, Any]:
     cap = _get_cap(model or "", base_url)
     cap_state = cap["state"]
     cap_error = cap["error"]
+
+    logger.info(
+        "[vision-call] purpose=%s provider=%s model=%s base_url=%s state=%s "
+        "image_size=%d enabled=%s timeout_sec=%d",
+        purpose, provider, model, base_url, cap_state,
+        len(image_base64 or ""), vision_enabled, timeout_sec,
+    )
 
     if not image_base64:
         return _mk_result(False, cap_state, reason="empty image", error="empty image")

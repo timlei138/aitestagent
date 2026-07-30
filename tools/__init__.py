@@ -78,6 +78,7 @@ from tools.perceive_tools import (
     set_runtime_permission,
     switch_perception_mode,
     visual_check,
+    vision_tap,
     wait_for_permission_dialog,
     wait_seconds,
 )
@@ -115,7 +116,7 @@ def _run_multimodal_from_context(
     image_base64: str,
     purpose: str,
     strict_json: bool = True,
-    timeout_sec: int = 12,
+    timeout_sec: int = 30,
 ) -> dict[str, Any]:
     ctx = get_tool_context()
     # 视觉优先用独立配置，不配则回退主模型
@@ -391,6 +392,7 @@ AGENT_TOOLS: list[Any] = [
     launch_app,
     open_app_permission_settings,
     visual_check,
+    vision_tap,
     detect_overlay,
     detect_popup,
     dismiss_popup,

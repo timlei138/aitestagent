@@ -490,6 +490,10 @@ class DeviceController:
         left, top, right, bottom = bounds
         self.device.click((left + right) // 2, (top + bottom) // 2)
 
+    def click_xy(self, x: int, y: int) -> None:
+        """单点坐标点击，供 vision_tap 等需要精确坐标的工具调用。"""
+        self.device.click(x, y)
+
     def long_click_bounds(self, bounds, duration: float = 0.8) -> None:
         """长按元素（swipe 同点模拟）。"""
         x, y = (bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2

@@ -57,7 +57,7 @@ def visual_check(description: str) -> str:
         image_base64=snap.image_base64,
         purpose="visual_check",
         strict_json=True,
-        timeout_sec=12,
+        timeout_sec=30,
     )
     payload = {
         "decision": (
@@ -98,7 +98,7 @@ def detect_overlay() -> str:
         image_base64=snap.image_base64,
         purpose="detect_overlay",
         strict_json=True,
-        timeout_sec=12,
+        timeout_sec=30,
     )
     # _mk_result 在 strict_json 成功解析时已将完整 dict 放入 data 字段
     raw_data = result.get("data") or {}
@@ -685,3 +685,122 @@ def recover_from_anomaly(app_package: str = "") -> str:
         device.app_start(package)
         return f"已重启应用: {package}"
     return "已按返回键尝试恢复"
+
+
+# ═══ vision_tap：视觉定位点击（Canvas/滚轮等 view tree 无法访问的 UI 元素） ═══
+
+_VISION_TAP_FAIL_STREAK_CAP = 2
+
+
+@tool
+def vision_tap(description: str) -> str:
+    """基于截图让 vision 模型定位目标区域并点击。
+
+    专用于 Canvas 绘制、滚轮选择器等 view tree 无法访问的 UI 元素。
+
+    description 示例：
+      - "上课时长滚轮中显示数字 10 的那一行"
+      - "休息时间滚轮中显示数字 5 的那一行"
+      - "颜色选择器中紫色色块"
+    """
+    from tools import _run_multimodal_from_context  # 延迟 import 避免循环依赖
+    import logging as _logging
+
+    _logger = _logging.getLogger(__name__)
+    ctx = get_tool_context()
+
+    # 1) 设备可用性
+    if ctx.device is None:
+        return make_result(ERROR, "未连接 Android 设备")
+
+    # 2) vision 可用性：独立视觉模型优先，否则回退主模型
+    actual_model = ctx.vision_model or ctx.llm_model
+    if not (ctx.llm_vision_enabled and actual_model):
+        return make_result(
+            ERROR,
+            "vision 未启用，请配置 vision_model 或使用多模态主模型",
+        )
+
+    # 3) fail_streak 防卡死：连续 2 次失败 → 提示 LLM 回退 UI-tree
+    streak = getattr(ctx, "_vision_tap_fail_streak", 0)
+    if streak >= _VISION_TAP_FAIL_STREAK_CAP:
+        return make_result(
+            ERROR,
+            "vision_tap 连续失败，建议回退 UI-tree 路径",
+        )
+
+    try:
+        # 4) 截图 + 坐标系
+        snap = ctx.device.snapshot()
+        W, H = snap.width, snap.height
+        _logger.info(
+            "[vision_tap] snapshot=%dx%d desc=%s",
+            W, H, description,
+        )
+
+        # 5) 构造 prompt
+        prompt = (
+            f"截图尺寸 {W}x{H}，坐标原点左上角。"
+            f"找到「{description}」所在位置。"
+            f'只返回 JSON: {{"x": int, "y": int, "reason": str}}，'
+            f"x in [0,{W}]，y in [0,{H}]。"
+        )
+
+        # 6) 调用 vision
+        res = _run_multimodal_from_context(
+            prompt,
+            snap.image_base64,
+            purpose="locate_tap",
+            strict_json=True,
+            timeout_sec=30,
+        )
+    except Exception as exc:
+        _logger.warning("[vision_tap] 工具内部异常: %s", exc, exc_info=True)
+        ctx._vision_tap_fail_streak = streak + 1
+        return make_result(ERROR, f"工具内部异常 {exc}")
+
+    # 7) 检查 vision 调用结果
+    if not res.get("ok"):
+        ctx._vision_tap_fail_streak = streak + 1
+        return make_result(
+            ERROR,
+            "vision 调用失败 {error}".format(
+                error=res.get("error", res.get("reason", "unknown")),
+            ),
+        )
+
+    # 8) 解析 + 边界裁剪
+    data = res.get("data") or {}
+    if "x" not in data or "y" not in data:
+        ctx._vision_tap_fail_streak = streak + 1
+        return make_result(ERROR, "vision 返回格式无效（缺少 x/y 字段）")
+
+    try:
+        raw_x = int(data["x"])
+        raw_y = int(data["y"])
+    except (ValueError, TypeError):
+        ctx._vision_tap_fail_streak = streak + 1
+        return make_result(
+            ERROR,
+            "vision 返回坐标非整数: x={x} y={y}".format(
+                x=data.get("x"), y=data.get("y"),
+            ),
+        )
+
+    x = max(0, min(W, raw_x))
+    y = max(0, min(H, raw_y))
+    clipped = (x != raw_x or y != raw_y)
+
+    # 9) 执行点击
+    ctx.device.click_xy(x, y)
+
+    # 成功 → 重置 fail_streak
+    ctx._vision_tap_fail_streak = 0
+    reason = data.get("reason", "")
+    clip_note = " (已裁剪)" if clipped else ""
+    return make_result(
+        OK,
+        "已点击坐标({x},{y}) reason={reason}{clip}".format(
+            x=x, y=y, reason=reason, clip=clip_note,
+        ),
+    )
