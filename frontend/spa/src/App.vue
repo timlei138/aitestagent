@@ -229,12 +229,30 @@
                 <el-form-item label="Base URL">
                   <el-input v-model="configData.base_url" placeholder="如: https://api.deepseek.com" />
                 </el-form-item>
-                <el-form-item label="多模态开关">
-                  <el-switch
-                    v-model="configData.vision_enabled"
-                    active-text="开启"
-                    inactive-text="关闭"
-                  />
+              </el-form>
+            </div>
+
+            <!-- 视觉备用模型 -->
+            <div class="settings-group">
+              <h4 class="settings-group-title">视觉备用模型
+                <el-tooltip content="主模型不支持多模态时自动走此模型，不填则回退主模型" placement="top">
+                  <span style="font-size:12px;color:var(--text-muted);cursor:help;margin-left:4px">ℹ️</span>
+                </el-tooltip>
+              </h4>
+              <el-form label-width="110px" size="default">
+                <el-form-item label="Provider">
+                  <el-select v-model="configData.vision_provider" style="width:100%" clearable placeholder="不填则复用主模型">
+                    <el-option label="OpenAI (兼容)" value="openai" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item label="模型名称">
+                  <el-input v-model="configData.vision_model" placeholder="如: qwen-vl-max, glm-4v-flash" clearable />
+                </el-form-item>
+                <el-form-item label="API Key">
+                  <el-input v-model="configData.vision_api_key" type="password" show-password placeholder="视觉模型 API Key" />
+                </el-form-item>
+                <el-form-item label="Base URL">
+                  <el-input v-model="configData.vision_base_url" placeholder="如: https://dashscope.aliyuncs.com/compatible-mode" clearable />
                 </el-form-item>
               </el-form>
             </div>
@@ -270,6 +288,10 @@
                     <el-option label="Strict（严格）" value="strict" />
                     <el-option label="Relaxed（宽松）" value="relaxed" />
                   </el-select>
+                </el-form-item>
+                <el-form-item label="历史摘要步数">
+                  <el-input-number v-model="configData.context_history_steps" :min="1" :max="20" :step="1" style="width:140px" />
+                  <span style="font-size:12px;color:var(--text-muted);margin-left:8px">agent 每轮注入的摘要层历史步数</span>
                 </el-form-item>
               </el-form>
             </div>

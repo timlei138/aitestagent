@@ -141,7 +141,7 @@ def _build_vision_call(cfg: TestConfig):
             model=v_model,
             api_key=v_api_key,
             base_url=v_base_url,
-            vision_enabled=cfg.vision_enabled,
+            vision_enabled=bool(cfg.vision_model),
             timeout_sec=12,
         )
 
@@ -221,7 +221,7 @@ _ctx = ToolContext(
     llm_model=config.model,
     llm_api_key=config.api_key,
     llm_base_url=config.base_url,
-    llm_vision_enabled=config.vision_enabled,
+    llm_vision_enabled=bool(config.vision_model),
     vision_provider=config.vision_provider,
     vision_model=config.vision_model,
     vision_api_key=config.vision_api_key,
@@ -282,7 +282,7 @@ def _rebuild_tool_context() -> None:
         llm_model=config.model,
         llm_api_key=config.api_key,
         llm_base_url=config.base_url,
-        llm_vision_enabled=config.vision_enabled,
+        llm_vision_enabled=bool(config.vision_model),
         vision_provider=config.vision_provider,
         vision_model=config.vision_model,
         vision_api_key=config.vision_api_key,

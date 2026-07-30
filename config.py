@@ -45,9 +45,6 @@ class TestConfig:
     # ── 安全 / Debug ──
     safety_level: str = "strict"
     langchain_debug: bool = True
-    # None = 自动（from_yaml 加载时：配了 vision_model 即开，没配即关）
-    # API PUT 路径设 null 时视为关闭（与文件省略的语义不同）
-    vision_enabled: bool | None = None
 
     # ── 视觉备用模型（可选）──
     # 配了 → 主模型不支持多模态时自动走这个模型做视觉分析
@@ -138,10 +135,6 @@ class TestConfig:
         config.vision_api_key = config.vision_api_key or os.getenv("VISION_API_KEY")
         config.vision_base_url = config.vision_base_url or os.getenv("VISION_BASE_URL")
 
-        # vision_enabled tri-state：None = 自动推导
-        if config.vision_enabled is None:
-            config.vision_enabled = bool(config.vision_model)
-
         # 默认 LLM → zhipu
         if config.llm_provider.lower() == "zhipu" and not config.api_key:
             config.api_key = config.zhipu_api_key
@@ -198,12 +191,11 @@ class TestConfig:
         )
         if config.vision_model:
             logger.info(
-                "[vision] provider=%s model=%s base_url=%s api_key=%s enabled=%s",
+                "[vision] provider=%s model=%s base_url=%s api_key=%s",
                 config.vision_provider or config.llm_provider,
                 config.vision_model,
                 config.vision_base_url or "<default>",
                 cls._mask_secret(config.vision_api_key),
-                config.vision_enabled,
             )
 
     @classmethod

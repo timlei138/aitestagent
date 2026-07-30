@@ -83,7 +83,7 @@ def _init_tool_context(config: TestConfig) -> None:
                 model=v_model,
                 api_key=v_api_key,
                 base_url=v_base_url,
-                vision_enabled=config.vision_enabled,
+                vision_enabled=bool(config.vision_model),
                 timeout_sec=12,
             )
 
@@ -112,7 +112,7 @@ def _init_tool_context(config: TestConfig) -> None:
             llm_model=config.model,
             llm_api_key=config.api_key,
             llm_base_url=config.base_url,
-            llm_vision_enabled=config.vision_enabled,
+            llm_vision_enabled=bool(config.vision_model),
             vision_provider=config.vision_provider,
             vision_model=config.vision_model,
             vision_api_key=config.vision_api_key,

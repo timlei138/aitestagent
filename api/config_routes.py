@@ -25,7 +25,6 @@ _EDITABLE_FIELDS = (
     "embedding_base_url",
     "perception_mode",
     "safety_level",
-    "vision_enabled",
     # ── 视觉备用模型 ──
     "vision_provider",
     "vision_model",
@@ -85,7 +84,6 @@ class ConfigUpdateRequest(BaseModel):
     embedding_base_url: str | None = None
     perception_mode: str | None = None
     safety_level: str | None = None
-    vision_enabled: bool | None = None
     vision_provider: str | None = None
     vision_model: str | None = None
     vision_api_key: str | None = None
@@ -126,7 +124,6 @@ async def update_config(req: ConfigUpdateRequest):
             "model",
             "api_key",
             "base_url",
-            "vision_enabled",
             "vision_provider",
             "vision_model",
             "vision_api_key",

@@ -89,7 +89,7 @@ def test_golden_case_end_to_end(case: GoldenCase):
             llm_model=cfg.model,
             llm_api_key=cfg.api_key,
             llm_base_url=cfg.base_url,
-            llm_vision_enabled=cfg.vision_enabled,
+            llm_vision_enabled=bool(cfg.vision_model),
             vision_provider=cfg.vision_provider,
             vision_model=cfg.vision_model,
             vision_api_key=cfg.vision_api_key,
