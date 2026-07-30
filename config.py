@@ -45,7 +45,24 @@ class TestConfig:
     # ── 安全 / Debug ──
     safety_level: str = "strict"
     langchain_debug: bool = True
-    vision_enabled: bool = True
+    # None = 自动（from_yaml 加载时：配了 vision_model 即开，没配即关）
+    # API PUT 路径设 null 时视为关闭（与文件省略的语义不同）
+    vision_enabled: bool | None = None
+
+    # ── 视觉备用模型（可选）──
+    # 配了 → 主模型不支持多模态时自动走这个模型做视觉分析
+    # 不配 → 行为与当前一致（用主模型尝试，不支持就放弃视觉）
+    # 后期多模态降价 → 注释掉 vision_* + model 改为多模态即可
+    # ⚠️ 若将 vision_api_key 加入 config_routes._EDITABLE_FIELDS，
+    #    必须同时加入 _SECRET_FIELDS，否则密钥会写入 config.yaml（已 git 跟踪）
+    vision_provider: str | None = None
+    vision_model: str | None = None
+    vision_api_key: str | None = None
+    vision_base_url: str | None = None
+
+    # ── 上下文历史步数（摘要层）──
+    # agent 每轮注入的 step_history 摘要条数（原硬编码 10）
+    context_history_steps: int = 5
 
     # ── 上下文优化 (O2) ──
     # 历史消息中，除最新一次外的 get_screen_info 大输出折叠为占位符，
@@ -117,6 +134,14 @@ class TestConfig:
         config.zhipu_api_key = config.zhipu_api_key or os.getenv("ZHIPU_API_KEY")
         config.zhipu_base_url = config.zhipu_base_url or os.getenv("ZHIPU_BASE_URL")
 
+        # ── 视觉模型凭证回退链 ──
+        config.vision_api_key = config.vision_api_key or os.getenv("VISION_API_KEY")
+        config.vision_base_url = config.vision_base_url or os.getenv("VISION_BASE_URL")
+
+        # vision_enabled tri-state：None = 自动推导
+        if config.vision_enabled is None:
+            config.vision_enabled = bool(config.vision_model)
+
         # 默认 LLM → zhipu
         if config.llm_provider.lower() == "zhipu" and not config.api_key:
             config.api_key = config.zhipu_api_key
@@ -171,6 +196,15 @@ class TestConfig:
             config.base_url or "<default>",
             cls._mask_secret(config.api_key),
         )
+        if config.vision_model:
+            logger.info(
+                "[vision] provider=%s model=%s base_url=%s api_key=%s enabled=%s",
+                config.vision_provider or config.llm_provider,
+                config.vision_model,
+                config.vision_base_url or "<default>",
+                cls._mask_secret(config.vision_api_key),
+                config.vision_enabled,
+            )
 
     @classmethod
     def _ensure_service_log_handler(cls) -> None:

@@ -118,15 +118,20 @@ def _run_multimodal_from_context(
     timeout_sec: int = 12,
 ) -> dict[str, Any]:
     ctx = get_tool_context()
+    # 视觉优先用独立配置，不配则回退主模型
+    provider = ctx.vision_provider or ctx.llm_provider
+    model    = ctx.vision_model    or ctx.llm_model
+    api_key  = ctx.vision_api_key  or ctx.llm_api_key
+    base_url = ctx.vision_base_url or ctx.llm_base_url
     return multimodal_vision_call(
         prompt=prompt,
         image_base64=image_base64,
         purpose=purpose,
         strict_json=strict_json,
-        provider=ctx.llm_provider,
-        model=ctx.llm_model,
-        api_key=ctx.llm_api_key,
-        base_url=ctx.llm_base_url,
+        provider=provider,
+        model=model,
+        api_key=api_key,
+        base_url=base_url,
         vision_enabled=ctx.llm_vision_enabled,
         timeout_sec=timeout_sec,
     )

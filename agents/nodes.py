@@ -504,9 +504,10 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             budget_violation_count += 1
     if include_rag and rag_summary and ctx:
         _apply_click_preferences(ctx, rag_summary, effective_app_package)
+    _cfg_steps = max(1, getattr(cfg, "context_history_steps", 5) or 5)
     hist_lines = [
         f"  [{s.get('status','')}] {s.get('intent','')}: {str(s.get('observation',''))[:100]}"
-        for s in history[-10:]
+        for s in history[-_cfg_steps:]
     ]
     hist_str = "\n".join(hist_lines) if hist_lines else "(none)"
     key_lookup, key_to_item = _build_verification_key_maps(goal)

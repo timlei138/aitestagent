@@ -7,21 +7,26 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_CAP_STATE = "unknown"  # unknown | supported | unsupported
-_CAP_ERROR = ""
-_CAP_FAIL_STREAK = 0
+# 按 (model, base_url) 隔离的视觉能力状态，避免主模型和视觉模型的探测结果串扰
+_CAP_STATES: dict[tuple[str, str], dict] = {}
 _CAP_LOCK = Lock()
 _CLIENT_CACHE_LOCK = Lock()
 _OPENAI_CLIENTS: dict[tuple[str, str, str, int], Any] = {}
 _FAIL_STREAK_UNSUPPORTED_THRESHOLD = 2
 
 
-def reset_vision_capability_state() -> None:
-    global _CAP_STATE, _CAP_ERROR, _CAP_FAIL_STREAK
+def _get_cap(model: str, base_url: str | None) -> dict:
+    """获取指定模型的视觉能力状态（线程安全）。"""
+    key = (model, base_url or "")
     with _CAP_LOCK:
-        _CAP_STATE = "unknown"
-        _CAP_ERROR = ""
-        _CAP_FAIL_STREAK = 0
+        if key not in _CAP_STATES:
+            _CAP_STATES[key] = {"state": "unknown", "error": "", "fail_streak": 0}
+        return _CAP_STATES[key]
+
+
+def reset_vision_capability_state() -> None:
+    with _CAP_LOCK:
+        _CAP_STATES.clear()
 
 
 def _mk_result(
@@ -90,14 +95,13 @@ def _is_unsupported_error(
     return any(k in msg for k in keys)
 
 
-def _record_probe_failure(message: str) -> tuple[int, bool]:
-    global _CAP_FAIL_STREAK
+def _record_probe_failure(message: str, cap: dict) -> tuple[int, bool]:
     with _CAP_LOCK:
         if _is_payload_format_error(message):
-            _CAP_FAIL_STREAK += 1
+            cap["fail_streak"] += 1
         else:
-            _CAP_FAIL_STREAK = 0
-        streak = _CAP_FAIL_STREAK
+            cap["fail_streak"] = 0
+        streak = cap["fail_streak"]
     return streak, streak >= _FAIL_STREAK_UNSUPPORTED_THRESHOLD
 
 
@@ -187,11 +191,9 @@ def multimodal_vision_call(
     vision_enabled: bool = True,
     timeout_sec: int = 12,
 ) -> dict[str, Any]:
-    global _CAP_STATE, _CAP_ERROR, _CAP_FAIL_STREAK
-
-    with _CAP_LOCK:
-        cap_state = _CAP_STATE
-        cap_error = _CAP_ERROR
+    cap = _get_cap(model or "", base_url)
+    cap_state = cap["state"]
+    cap_error = cap["error"]
 
     if not image_base64:
         return _mk_result(False, cap_state, reason="empty image", error="empty image")
@@ -209,9 +211,9 @@ def multimodal_vision_call(
             "，检测弹窗请改用 detect_popup()（基于 UI 树，不依赖 vision）"
         )
         with _CAP_LOCK:
-            _CAP_STATE = "unsupported"
-            _CAP_ERROR = disable_msg
-            _CAP_FAIL_STREAK = 0
+            cap["state"] = "unsupported"
+            cap["error"] = disable_msg
+            cap["fail_streak"] = 0
         return _mk_result(
             False,
             "unsupported",
@@ -247,18 +249,18 @@ def multimodal_vision_call(
                     "Multimodal probe returned non-JSON but accepted image input"
                 )
             with _CAP_LOCK:
-                _CAP_STATE = "supported"
-                _CAP_ERROR = ""
-                _CAP_FAIL_STREAK = 0
-                cap_state = _CAP_STATE
+                cap["state"] = "supported"
+                cap["error"] = ""
+                cap["fail_streak"] = 0
+                cap_state = cap["state"]
         except Exception as exc:
             msg = str(exc)
             if _is_unsupported_error(msg, provider, model):
                 with _CAP_LOCK:
-                    _CAP_STATE = "unsupported"
-                    _CAP_ERROR = msg
-                    _CAP_FAIL_STREAK = 0
-                    cap_state = _CAP_STATE
+                    cap["state"] = "unsupported"
+                    cap["error"] = msg
+                    cap["fail_streak"] = 0
+                    cap_state = cap["state"]
                 logger.warning("Multimodal unsupported: %s", msg)
                 return _mk_result(
                     False,
@@ -267,13 +269,13 @@ def multimodal_vision_call(
                     error=msg,
                 )
 
-            streak, should_mark_unsupported = _record_probe_failure(msg)
+            streak, should_mark_unsupported = _record_probe_failure(msg, cap)
             if should_mark_unsupported:
                 with _CAP_LOCK:
-                    _CAP_STATE = "unsupported"
-                    _CAP_ERROR = msg
-                    _CAP_FAIL_STREAK = 0
-                    cap_state = _CAP_STATE
+                    cap["state"] = "unsupported"
+                    cap["error"] = msg
+                    cap["fail_streak"] = 0
+                    cap_state = cap["state"]
                 logger.warning(
                     "Multimodal marked unsupported by repeated probe failures: %s",
                     msg,
@@ -290,9 +292,9 @@ def multimodal_vision_call(
 
             # 网络/限流等临时问题，不标记 unsupported
             with _CAP_LOCK:
-                _CAP_STATE = "unknown"
-                _CAP_ERROR = msg
-                cap_state = _CAP_STATE
+                cap["state"] = "unknown"
+                cap["error"] = msg
+                cap_state = cap["state"]
             logger.warning("Multimodal probe transient failure: %s", msg)
             return _mk_result(False, "unknown", reason="probe failed", error=msg)
 
@@ -335,19 +337,19 @@ def multimodal_vision_call(
         msg = str(exc)
         if _is_unsupported_error(msg, provider, model):
             with _CAP_LOCK:
-                _CAP_STATE = "unsupported"
-                _CAP_ERROR = msg
-                _CAP_FAIL_STREAK = 0
+                cap["state"] = "unsupported"
+                cap["error"] = msg
+                cap["fail_streak"] = 0
             return _mk_result(
                 False, "unsupported", reason="model does not support vision", error=msg
             )
 
-        streak, should_mark_unsupported = _record_probe_failure(msg)
+        streak, should_mark_unsupported = _record_probe_failure(msg, cap)
         if should_mark_unsupported:
             with _CAP_LOCK:
-                _CAP_STATE = "unsupported"
-                _CAP_ERROR = msg
-                _CAP_FAIL_STREAK = 0
+                cap["state"] = "unsupported"
+                cap["error"] = msg
+                cap["fail_streak"] = 0
             return _mk_result(
                 False,
                 "unsupported",

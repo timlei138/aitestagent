@@ -125,16 +125,22 @@ _ctx: ToolContext | None = None
 
 
 def _build_vision_call(cfg: TestConfig):
+    # 视觉优先用独立配置，不配则回退主模型
+    v_provider = cfg.vision_provider or cfg.llm_provider
+    v_model    = cfg.vision_model    or cfg.model
+    v_api_key  = cfg.vision_api_key  or cfg.api_key
+    v_base_url = cfg.vision_base_url or cfg.base_url
+
     def _vision_call(prompt: str, image_base64: str, purpose: str, strict_json: bool):
         return multimodal_vision_call(
             prompt=prompt,
             image_base64=image_base64,
             purpose=purpose,
             strict_json=strict_json,
-            provider=cfg.llm_provider,
-            model=cfg.model,
-            api_key=cfg.api_key,
-            base_url=cfg.base_url,
+            provider=v_provider,
+            model=v_model,
+            api_key=v_api_key,
+            base_url=v_base_url,
             vision_enabled=cfg.vision_enabled,
             timeout_sec=12,
         )
@@ -216,6 +222,10 @@ _ctx = ToolContext(
     llm_api_key=config.api_key,
     llm_base_url=config.base_url,
     llm_vision_enabled=config.vision_enabled,
+    vision_provider=config.vision_provider,
+    vision_model=config.vision_model,
+    vision_api_key=config.vision_api_key,
+    vision_base_url=config.vision_base_url,
     click_mode=config.click_mode,
 )
 set_tool_context(_ctx)
@@ -273,6 +283,10 @@ def _rebuild_tool_context() -> None:
         llm_api_key=config.api_key,
         llm_base_url=config.base_url,
         llm_vision_enabled=config.vision_enabled,
+        vision_provider=config.vision_provider,
+        vision_model=config.vision_model,
+        vision_api_key=config.vision_api_key,
+        vision_base_url=config.vision_base_url,
         click_mode=config.click_mode,
     )
     set_tool_context(_ctx)

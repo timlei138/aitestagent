@@ -26,9 +26,16 @@ _EDITABLE_FIELDS = (
     "perception_mode",
     "safety_level",
     "vision_enabled",
+    # ── 视觉备用模型 ──
+    "vision_provider",
+    "vision_model",
+    "vision_api_key",
+    "vision_base_url",
+    # ── 上下文历史步数 ──
+    "context_history_steps",
 )
 
-_SECRET_FIELDS = ("api_key", "embedding_api_key")
+_SECRET_FIELDS = ("api_key", "embedding_api_key", "vision_api_key")
 
 
 def _get_config():
@@ -79,6 +86,11 @@ class ConfigUpdateRequest(BaseModel):
     perception_mode: str | None = None
     safety_level: str | None = None
     vision_enabled: bool | None = None
+    vision_provider: str | None = None
+    vision_model: str | None = None
+    vision_api_key: str | None = None
+    vision_base_url: str | None = None
+    context_history_steps: int | None = None
 
 
 @router.put("")
@@ -107,7 +119,7 @@ async def update_config(req: ConfigUpdateRequest):
         setattr(cfg, field, normalized_val)
         changed[field] = True
         changed_values[field] = normalized_val
-        # perception_mode 或主 LLM 凭证变更需要重建 perceiver/context
+        # perception_mode 或主 LLM / 视觉 凭证变更需要重建 perceiver/context
         if field in (
             "perception_mode",
             "llm_provider",
@@ -115,6 +127,10 @@ async def update_config(req: ConfigUpdateRequest):
             "api_key",
             "base_url",
             "vision_enabled",
+            "vision_provider",
+            "vision_model",
+            "vision_api_key",
+            "vision_base_url",
         ):
             need_rebuild_perceiver = True
 

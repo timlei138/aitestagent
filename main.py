@@ -65,6 +65,12 @@ def _init_tool_context(config: TestConfig) -> None:
         mode, auto_switch = resolve_perception_mode(config)
         ctx_holder: dict[str, ToolContext | None] = {"ctx": None}
 
+        # 视觉优先用独立配置，不配则回退主模型
+        v_provider = config.vision_provider or config.llm_provider
+        v_model    = config.vision_model    or config.model
+        v_api_key  = config.vision_api_key  or config.api_key
+        v_base_url = config.vision_base_url or config.base_url
+
         def _vision_call(
             prompt: str, image_base64: str, purpose: str, strict_json: bool
         ):
@@ -73,10 +79,10 @@ def _init_tool_context(config: TestConfig) -> None:
                 image_base64=image_base64,
                 purpose=purpose,
                 strict_json=strict_json,
-                provider=config.llm_provider,
-                model=config.model,
-                api_key=config.api_key,
-                base_url=config.base_url,
+                provider=v_provider,
+                model=v_model,
+                api_key=v_api_key,
+                base_url=v_base_url,
                 vision_enabled=config.vision_enabled,
                 timeout_sec=12,
             )
@@ -107,6 +113,10 @@ def _init_tool_context(config: TestConfig) -> None:
             llm_api_key=config.api_key,
             llm_base_url=config.base_url,
             llm_vision_enabled=config.vision_enabled,
+            vision_provider=config.vision_provider,
+            vision_model=config.vision_model,
+            vision_api_key=config.vision_api_key,
+            vision_base_url=config.vision_base_url,
             click_mode=config.click_mode,
         )
         ctx_holder["ctx"] = ctx

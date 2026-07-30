@@ -21,6 +21,11 @@ class ToolContext:
     llm_base_url: str | None = None
     llm_vision_enabled: bool = True
     verification_auto_vision: bool = True
+    # ── 视觉备用模型（可选，不配则回退主模型）──
+    vision_provider: str | None = None
+    vision_model: str | None = None
+    vision_api_key: str | None = None
+    vision_base_url: str | None = None
     # M4：确定性断言（assert_page_contains/assert_element_exists）作为 ground truth
     # 参与 assert_verification 结果核实。默认「仅证据」（annotate 不改判定）；
     # 置 True 时开启「硬核实」——代码核实与模型判定冲突时按代码结果修正。
