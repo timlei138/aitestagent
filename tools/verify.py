@@ -556,7 +556,20 @@ def assert_verification(
         ):
             try:
                 with open(shot_abs_path, "rb") as fh:
-                    image_b64 = base64.b64encode(fh.read()).decode("utf-8")
+                    raw_bytes = fh.read()
+                from io import BytesIO as _BytesIO
+                from PIL import Image as _PILImage
+                img = _PILImage.open(_BytesIO(raw_bytes))
+                w, h = img.size
+                longer = max(w, h)
+                if longer > 1024:
+                    ratio = 1024 / longer
+                    img = img.resize((int(w * ratio), int(h * ratio)), _PILImage.LANCZOS)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                buf = _BytesIO()
+                img.save(buf, format="JPEG", quality=75)
+                image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
                 prompt = (
                     "请分析该失败截图，说明此验证项失败的可能原因。"
                     "只返回 JSON，字段: decision(yes/no/unknown), reason, evidence。"

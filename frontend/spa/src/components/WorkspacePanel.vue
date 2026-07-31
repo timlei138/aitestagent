@@ -40,7 +40,7 @@
     <!-- 输入区 -->
     <div class="wp-input-area">
       <div class="wp-input-wrap">
-        <el-input v-model="inputText" type="textarea" :rows="2"
+        <el-input v-model="inputText" type="textarea" :rows="3"
                   placeholder="输入测试指令，如: 检查 Settings 的 WLAN 开关是否正常"
                   class="wp-textarea"
                   @keydown.enter.ctrl="$emit('run', inputText)" />
@@ -57,12 +57,13 @@
               {{ stopping ? '正在停止...' : '停止运行' }}
             </el-button>
             <el-button
-              v-else
               type="primary"
+              :loading="executing"
+              :disabled="executing"
               @click="$emit('run', inputText); inputText = ''"
               round
             >
-              开始执行
+              {{ executing ? '执行中...' : '开始执行' }}
             </el-button>
           </div>
         </div>
@@ -323,10 +324,11 @@ watch(() => timeline.value.length, () => {
 .wp-textarea :deep(.el-textarea__inner) {
   border-radius: var(--radius-md, 12px) !important;
   border: 1.5px solid var(--line, #e8eaed);
-  padding: 12px 16px;
+  padding: 14px 18px;
   font-size: 14px;
-  line-height: 1.6;
+  line-height: 1.65;
   resize: none;
+  min-height: 80px;
   transition: border-color var(--duration, .2s) var(--ease, ease),
               box-shadow var(--duration, .2s) var(--ease, ease);
 }

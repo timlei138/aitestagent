@@ -26,6 +26,8 @@ class ToolContext:
     vision_model: str | None = None
     vision_api_key: str | None = None
     vision_base_url: str | None = None
+    # 视觉调用超时秒数，对应 config.vision_timeout
+    vision_timeout: int = 45
     # M4：确定性断言（assert_page_contains/assert_element_exists）作为 ground truth
     # 参与 assert_verification 结果核实。默认「仅证据」（annotate 不改判定）；
     # 置 True 时开启「硬核实」——代码核实与模型判定冲突时按代码结果修正。

@@ -254,6 +254,10 @@
                 <el-form-item label="Base URL">
                   <el-input v-model="configData.vision_base_url" placeholder="如: https://dashscope.aliyuncs.com/compatible-mode" clearable />
                 </el-form-item>
+                <el-form-item label="调用超时(s)">
+                  <el-input-number v-model="configData.vision_timeout" :min="10" :max="120" :step="5" style="width:140px" />
+                  <span style="font-size:12px;color:var(--text-muted);margin-left:8px">视觉调用超时秒数（建议 30-60）</span>
+                </el-form-item>
               </el-form>
             </div>
 
@@ -756,7 +760,7 @@ function handleEvent(data) {
         ElMessage.info("当前没有正在执行的运行");
       }
       break;
-    case "status": wp?.addEntry({ type: "log", text: String(content) }); refreshSnapshot(); break;
+    case "status": wp?.addEntry({ type: "log", text: typeof content === 'object' ? JSON.stringify(content) : String(content) }); refreshSnapshot(); break;
     case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
@@ -789,7 +793,7 @@ if (activeMenu.value === 'cases') loadReports();
       // 如果在用例中心，运行结束后刷新用例列表（更新 last_run_status）
       if (activeMenu.value === 'cases') testCasePanelRef.value?.fetchCases();
       break;
-    case "error": wp?.addEntry({ type: "error", icon: "❌", text: String(content) }); executing.value = false; stopping.value = false; currentThreadId.value = ""; break;
+    case "error": wp?.addEntry({ type: "error", icon: "❌", text: typeof content === 'object' ? JSON.stringify(content) : String(content) }); executing.value = false; stopping.value = false; currentThreadId.value = ""; break;
     default: wp?.addEntry({ type: "log", text: "[" + type + "] " + JSON.stringify(content).substring(0, 200) });
   }
 }

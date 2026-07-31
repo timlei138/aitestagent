@@ -30,6 +30,7 @@ _EDITABLE_FIELDS = (
     "vision_model",
     "vision_api_key",
     "vision_base_url",
+    "vision_timeout",
     # ── 上下文历史步数 ──
     "context_history_steps",
 )
@@ -88,6 +89,7 @@ class ConfigUpdateRequest(BaseModel):
     vision_model: str | None = None
     vision_api_key: str | None = None
     vision_base_url: str | None = None
+    vision_timeout: int | None = None
     context_history_steps: int | None = None
 
 
@@ -133,6 +135,18 @@ async def update_config(req: ConfigUpdateRequest):
 
     # 写回 YAML（敏感字段写 config.local.yaml，非敏感写 config.yaml）
     _save_yaml(changed_values)
+
+    # vision_timeout 只改 ctx 字段，无需重建 perceiver
+    if "vision_timeout" in changed_values:
+        try:
+            from tools.context import get_tool_context
+
+            ctx = get_tool_context()
+            if ctx is not None:
+                ctx.vision_timeout = changed_values["vision_timeout"]
+                logger.info("vision_timeout hot-updated to %s", changed_values["vision_timeout"])
+        except Exception as exc:
+            logger.warning("Failed to hot-update vision_timeout on ctx: %s", exc)
 
     # 热更新 perceiver
     if need_rebuild_perceiver:

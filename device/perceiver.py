@@ -334,12 +334,14 @@ class SmartPerceiver:
         )
         if should_use_vision:
             indexed_elements = understanding.primary_paths[:20]
-            # 视觉缓存：截图不变时复用上次视觉结果（图像 hash）
+            # ── 使用压缩快照节省 vision token（~300KB → ~50KB）──
+            vision_snap = self.device.snapshot_for_vision()
+            vision_b64 = vision_snap.image_base64
             import hashlib as _hashlib
 
             img_hash = (
-                _hashlib.md5(snapshot.image_base64.encode()).hexdigest()
-                if snapshot.image_base64
+                _hashlib.md5(vision_b64.encode()).hexdigest()
+                if vision_b64
                 else ""
             )
             if (
@@ -355,7 +357,7 @@ class SmartPerceiver:
             else:
                 self._vision_calls += 1
                 understanding.raw_vision = self._vision_describe(
-                    snapshot.image_base64, understanding
+                    vision_b64, understanding
                 )
                 self._vision_cache_img_hash = img_hash
                 self._vision_cache_text = understanding.raw_vision

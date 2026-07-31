@@ -10,9 +10,17 @@ from dataclasses import dataclass
 from io import BytesIO
 from typing import Any
 
+from PIL import Image
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_EXCLUDED_LAUNCHER_KEYWORDS = ("LeakLauncherActivity",)
+
+# ── vision 快照压缩参数 ──
+# VISION_SNAPSHOT_MAX_DIMENSION: 长边超过此像素数时等比缩放，避免发送过大图片给 vision 模型。
+# VISION_SNAPSHOT_QUALITY: JPEG 压缩质量（1-100），越小文件越小但越模糊。
+VISION_SNAPSHOT_MAX_DIMENSION = 1024
+VISION_SNAPSHOT_QUALITY = 75
 
 
 class DeviceUnavailableError(RuntimeError):
@@ -27,6 +35,8 @@ class DeviceSnapshot:
     height: int
     image_base64: str
     hierarchy_xml: str
+    original_width: int = 0
+    original_height: int = 0
 
 
 class DeviceController:
@@ -486,13 +496,62 @@ class DeviceController:
             hierarchy_xml=self.dump_hierarchy(),
         )
 
+    def snapshot_for_vision(
+        self,
+        max_dimension: int = VISION_SNAPSHOT_MAX_DIMENSION,
+        quality: int = VISION_SNAPSHOT_QUALITY,
+    ) -> DeviceSnapshot:
+        """截图并压缩为适合视觉大模型的 JPEG（节省 token）。
+
+        Args:
+            max_dimension: 长边最大像素，超出则等比缩放。默认 1024。
+            quality: JPEG 质量 1-100。默认 75。
+
+        Returns:
+            DeviceSnapshot，其中 image_base64 为压缩后的 JPEG。
+        """
+        image = self.screenshot()
+        # 如果图片过大，等比缩放
+        w, h = image.width, image.height
+        longer = max(w, h)
+        if longer > max_dimension:
+            ratio = max_dimension / longer
+            new_size = (int(w * ratio), int(h * ratio))
+            image = image.resize(new_size, Image.LANCZOS)
+        # 转为 RGB（JPEG 不支持 RGBA）
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+        buf = BytesIO()
+        image.save(buf, format="JPEG", quality=quality)
+        app = self.current_app()
+        img_kb = buf.tell() // 1024
+        logger.info(
+            "snapshot_for_vision: %dx%d -> %dx%d JPEG q=%d %dKB",
+            w, h, image.width, image.height, quality, img_kb,
+        )
+        return DeviceSnapshot(
+            package=app.get("package", ""),
+            activity=app.get("activity", ""),
+            width=image.width,
+            height=image.height,
+            image_base64=base64.b64encode(buf.getvalue()).decode("ascii"),
+            hierarchy_xml=self.dump_hierarchy(),
+            original_width=w,
+            original_height=h,
+        )
+
     def click_bounds(self, bounds: tuple[int, int, int, int]) -> None:
         left, top, right, bottom = bounds
         self.device.click((left + right) // 2, (top + bottom) // 2)
 
     def click_xy(self, x: int, y: int) -> None:
-        """单点坐标点击，供 vision_tap 等需要精确坐标的工具调用。"""
-        self.device.click(x, y)
+        """单点坐标点击，供 vision_tap 等需要精确坐标的工具调用。
+
+        使用 adb shell input tap 代替 uiautomator2 click，避免横屏下
+        uiautomator2 坐标变换不一致的问题。
+        """
+        logger.info("[click_xy] adb shell input tap %d %d", x, y)
+        self.device.shell(["input", "tap", str(x), str(y)])
 
     def long_click_bounds(self, bounds, duration: float = 0.8) -> None:
         """长按元素（swipe 同点模拟）。"""

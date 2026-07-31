@@ -122,6 +122,7 @@ def _init_tool_context(config: TestConfig) -> None:
             vision_model=config.vision_model,
             vision_api_key=config.vision_api_key,
             vision_base_url=config.vision_base_url,
+            vision_timeout=config.vision_timeout,
             click_mode=config.click_mode,
         )
         ctx_holder["ctx"] = ctx

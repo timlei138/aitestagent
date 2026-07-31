@@ -231,6 +231,7 @@ _ctx = ToolContext(
     vision_model=config.vision_model,
     vision_api_key=config.vision_api_key,
     vision_base_url=config.vision_base_url,
+    vision_timeout=config.vision_timeout,
     click_mode=config.click_mode,
 )
 set_tool_context(_ctx)
@@ -292,6 +293,7 @@ def _rebuild_tool_context() -> None:
         vision_model=config.vision_model,
         vision_api_key=config.vision_api_key,
         vision_base_url=config.vision_base_url,
+        vision_timeout=config.vision_timeout,
         click_mode=config.click_mode,
     )
     set_tool_context(_ctx)

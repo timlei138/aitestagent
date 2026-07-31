@@ -46,7 +46,7 @@ def visual_check(description: str) -> str:
             },
             ensure_ascii=False,
         )
-    snap = ctx.device.snapshot()
+    snap = ctx.device.snapshot_for_vision()
     prompt = (
         "请根据截图判断描述是否成立，并只返回 JSON。"
         "字段: decision(yes/no/unknown), reason, evidence, confidence(high/medium/low)。"
@@ -57,7 +57,7 @@ def visual_check(description: str) -> str:
         image_base64=snap.image_base64,
         purpose="visual_check",
         strict_json=True,
-        timeout_sec=30,
+        timeout_sec=getattr(ctx, "vision_timeout", 45),
     )
     payload = {
         "decision": (
@@ -87,7 +87,7 @@ def detect_overlay() -> str:
             },
             ensure_ascii=False,
         )
-    snap = ctx.device.snapshot()
+    snap = ctx.device.snapshot_for_vision()
     prompt = (
         "请分析截图是否存在遮挡层（toast/dialog/popup/sheet）。"
         "只返回 JSON，字段: has_overlay(boolean), overlay_type(toast/dialog/popup/sheet/unknown/none),"
@@ -98,7 +98,7 @@ def detect_overlay() -> str:
         image_base64=snap.image_base64,
         purpose="detect_overlay",
         strict_json=True,
-        timeout_sec=30,
+        timeout_sec=getattr(ctx, "vision_timeout", 45),
     )
     # _mk_result 在 strict_json 成功解析时已将完整 dict 放入 data 字段
     raw_data = result.get("data") or {}
@@ -730,20 +730,31 @@ def vision_tap(description: str) -> str:
         )
 
     try:
-        # 4) 截图 + 坐标系
-        snap = ctx.device.snapshot()
-        W, H = snap.width, snap.height
+        # 4) 截图 + 坐标系（使用压缩快照节省 token）
+        snap = ctx.device.snapshot_for_vision()
+        # 压缩图尺寸（vision 模型看到的尺寸）
+        img_w, img_h = snap.width, snap.height
+        # 原始设备分辨率（用于坐标映射）
+        dev_w = snap.original_width
+        dev_h = snap.original_height
+        # 防御：如果 original 字段未正确填写（为 0），回退恒等映射
+        if dev_w <= 0 or dev_h <= 0:
+            _logger.warning(
+                "[vision_tap] original_width/height 无效 (%d, %d)，回退恒等映射",
+                dev_w, dev_h,
+            )
+            dev_w, dev_h = img_w, img_h
         _logger.info(
-            "[vision_tap] snapshot=%dx%d desc=%s",
-            W, H, description,
+            "[vision_tap] snapshot=%dx%d (device=%dx%d) desc=%s",
+            img_w, img_h, dev_w, dev_h, description,
         )
 
-        # 5) 构造 prompt
+        # 5) 构造 prompt（让 vision 模型基于压缩图输出坐标，我们再映射回设备空间）
         prompt = (
-            f"截图尺寸 {W}x{H}，坐标原点左上角。"
+            f"截图尺寸 {img_w}x{img_h}，坐标原点左上角。"
             f"找到「{description}」所在位置。"
             f'只返回 JSON: {{"x": int, "y": int, "reason": str}}，'
-            f"x in [0,{W}]，y in [0,{H}]。"
+            f"x in [0,{img_w}]，y in [0,{img_h}]。"
         )
 
         # 6) 调用 vision
@@ -752,7 +763,7 @@ def vision_tap(description: str) -> str:
             snap.image_base64,
             purpose="locate_tap",
             strict_json=True,
-            timeout_sec=30,
+            timeout_sec=getattr(ctx, "vision_timeout", 45),
         )
     except Exception as exc:
         _logger.warning("[vision_tap] 工具内部异常: %s", exc, exc_info=True)
@@ -787,20 +798,52 @@ def vision_tap(description: str) -> str:
             ),
         )
 
-    x = max(0, min(W, raw_x))
-    y = max(0, min(H, raw_y))
-    clipped = (x != raw_x or y != raw_y)
+    # 先裁剪到压缩图边界（vision 模型输出的是压缩图坐标）
+    x_img = max(0, min(img_w, raw_x))
+    y_img = max(0, min(img_h, raw_y))
+    clipped = (x_img != raw_x or y_img != raw_y)
+    # 映射回原始设备坐标
+    x = int(x_img * dev_w / img_w)
+    y = int(y_img * dev_h / img_h)
 
-    # 9) 执行点击
+    # 详细日志：打印完整坐标变换链路
+    _logger.info(
+        "[vision_tap] 坐标变换: raw=(%d,%d) → clip=(%d,%d) → "
+        "dev=(%d,%d) [img=%dx%d dev=%dx%d]%s",
+        raw_x, raw_y, x_img, y_img,
+        x, y, img_w, img_h, dev_w, dev_h,
+        " CLIPPED" if clipped else "",
+    )
+
+    # 横屏纠正：uiautomator2 在横屏时截图使用物理方向坐标，
+    # 但点击坐标仍基于自然方向（竖屏），导致 X/Y 轴互换。
+    # 检测：截图宽度 > 高度（横屏截图特征）
+    landscape = dev_w > dev_h
+    if landscape:
+        _logger.warning(
+            "[vision_tap] ★ 横屏模式：坐标轴互换 (%d,%d) -> (%d,%d)",
+            x, y, y, x,
+        )
+        x, y = y, x
+    else:
+        _logger.info(
+            "[vision_tap] 竖屏模式 (dev_w=%d <= dev_h=%d)，坐标不互换",
+            dev_w, dev_h,
+        )
+
+    # 9) 执行点击（使用设备坐标）
+    _logger.info("[vision_tap] 最终点击坐标: (%d, %d) landscape=%s", x, y, landscape)
     ctx.device.click_xy(x, y)
 
     # 成功 → 重置 fail_streak
     ctx._vision_tap_fail_streak = 0
     reason = data.get("reason", "")
     clip_note = " (已裁剪)" if clipped else ""
+    orient_note = " (横屏互换)" if landscape else ""
     return make_result(
         OK,
-        "已点击坐标({x},{y}) reason={reason}{clip}".format(
-            x=x, y=y, reason=reason, clip=clip_note,
+        "已点击设备坐标({x},{y}) [压缩图坐标({x_img},{y_img})] reason={reason}{clip}{orient}".format(
+            x=x, y=y, x_img=x_img, y_img=y_img,
+            reason=reason, clip=clip_note, orient=orient_note,
         ),
     )
