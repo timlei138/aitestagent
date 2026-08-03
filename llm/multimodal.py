@@ -149,6 +149,8 @@ def _invoke_openai_multimodal(
                 max_retries=0,  # 视觉调用不需要 SDK 层重试，超时即失败
             )
             _OPENAI_CLIENTS[cache_key] = client
+    # 根据 base64 前缀自动检测图片格式（JPEG 以 /9j/ 开头，PNG 以 iVBOR 开头）
+    mime = "image/jpeg" if image_base64.startswith("/9j/") else "image/png"
     msg = [
         {
             "role": "user",
@@ -156,7 +158,7 @@ def _invoke_openai_multimodal(
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_base64}"},
+                    "image_url": {"url": f"data:{mime};base64,{image_base64}"},
                 },
             ],
         }

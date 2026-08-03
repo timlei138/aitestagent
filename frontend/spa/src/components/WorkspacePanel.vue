@@ -12,9 +12,16 @@
         <!-- tool -->
         <template v-else-if="entry.type === 'tool'">
           <span class="wp-icon-wrap wp-icon-tool">⚙</span>
-          <span v-if="entry.intent" class="wp-intent">AI意图: {{ entry.intent }}</span>
-          <span class="wp-text">{{ entry.text }}</span>
-          <span v-if="entry.detail" class="wp-detail">{{ entry.detail }}</span>
+          <div class="wp-tool-body">
+            <div v-if="entry.intent" class="wp-intent">
+              <span class="wp-intent-tag">AI</span>
+              <span class="wp-intent-text">{{ entry.intent }}</span>
+            </div>
+            <div class="wp-tool-call">
+              <span class="wp-tool-name">{{ entry.text }}</span>
+              <span v-if="entry.detail" class="wp-detail">{{ entry.detail }}</span>
+            </div>
+          </div>
           <span class="wp-time">{{ entry.time }}</span>
         </template>
         <!-- result -->
@@ -112,10 +119,9 @@ function _stripPrefix(s) {
   return String(s || '').replace(/^(?:#{1,3}\s*)?(?:DONE|ABORT)\s*[:：]\s*/im, '').trim()
 }
 
-function _shortIntentText(text) {
+function _cleanIntentText(text) {
   const cleaned = _stripPrefix(text).replace(/\s+/g, ' ').trim()
-  if (!cleaned) return ''
-  return cleaned.length > 80 ? cleaned.slice(0, 80) + '…' : cleaned
+  return cleaned
 }
 
 function addTool(name, target, intentText = '') {
@@ -127,7 +133,7 @@ function addTool(name, target, intentText = '') {
     type: 'tool',
     icon: '⚙',
     text,
-    intent: _shortIntentText(intentText),
+    intent: _cleanIntentText(intentText),
     time: now(),
     id: Date.now(),
   })
@@ -257,7 +263,47 @@ watch(() => timeline.value.length, () => {
 }
 .wp-text { color: var(--text-secondary, #5f6368); }
 .wp-entry.wp-user .wp-text { color: var(--text-primary, #1a1d23); }
-.wp-intent { color: var(--text-primary, #1a1d23); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42%; }
+.wp-intent {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  line-height: 1.5;
+}
+.wp-intent-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent, #6366f1);
+  background: #eef2ff;
+  padding: 1px 6px;
+  border-radius: 4px;
+  line-height: 1.6;
+  letter-spacing: 0.5px;
+}
+.wp-intent-text {
+  color: var(--text-primary, #1a1d23);
+  font-size: 12px;
+  word-break: break-word;
+  line-height: 1.6;
+}
+.wp-tool-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.wp-tool-call {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.wp-tool-name {
+  color: var(--text-secondary, #5f6368);
+  font-size: 13px;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  letter-spacing: -0.3px;
+}
 .wp-detail { color: var(--text-muted, #9aa0a6); font-size: 11px; }
 .wp-result-text { font-weight: 600; }
 

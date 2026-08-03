@@ -8,10 +8,12 @@ tools/__init__.py，采用函数内延迟 import 以避免加载期循环依赖�
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
 import xml.etree.ElementTree as ET
+from io import BytesIO
 from typing import Any
 
 import numpy as np
@@ -48,8 +50,13 @@ def visual_check(description: str) -> str:
         )
     snap = ctx.device.snapshot_for_vision()
     prompt = (
-        "请根据截图判断描述是否成立，并只返回 JSON。"
-        "字段: decision(yes/no/unknown), reason, evidence, confidence(high/medium/low)。"
+        "请根据截图判断以下描述是否成立，并只返回 JSON。"
+        "字段: decision(yes/no/unknown), reason, evidence, confidence(high/medium/low)。\n"
+        "规则："
+        "- 如果描述是陈述句，判断其是否与截图内容一致（yes/no）\n"
+        "- 如果描述是疑问句或祈使句（如'XX是什么'、'描述XX'），"
+        "提取截图中可观察到的事实作为 evidence，decision 设为 yes\n"
+        "- 不要以'这是疑问句无法判断'为由拒绝，始终提取截图中的视觉事实\n"
         f"描述: {description}"
     )
     result = _run_multimodal_from_context(
@@ -57,7 +64,7 @@ def visual_check(description: str) -> str:
         image_base64=snap.image_base64,
         purpose="visual_check",
         strict_json=True,
-        timeout_sec=getattr(ctx, "vision_timeout", 45),
+        timeout_sec=getattr(ctx, "vision_timeout", 60),
     )
     payload = {
         "decision": (
@@ -98,7 +105,7 @@ def detect_overlay() -> str:
         image_base64=snap.image_base64,
         purpose="detect_overlay",
         strict_json=True,
-        timeout_sec=getattr(ctx, "vision_timeout", 45),
+        timeout_sec=getattr(ctx, "vision_timeout", 60),
     )
     # _mk_result 在 strict_json 成功解析时已将完整 dict 放入 data 字段
     raw_data = result.get("data") or {}
@@ -692,8 +699,48 @@ def recover_from_anomaly(app_package: str = "") -> str:
 _VISION_TAP_FAIL_STREAK_CAP = 2
 
 
+def _parse_android_bounds(bounds_str: str) -> tuple[int, int, int, int] | None:
+    """解析 Android UI Automator bounds 格式 '[x1,y1][x2,y2]'。"""
+    m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str or "")
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+    return None
+
+
+def _find_dialog_crop_bounds(hierarchy_xml: str) -> tuple[int, int, int, int] | None:
+    """从 view tree XML 中找到弹窗区域的 bounds，用于 vision_tap 智能裁剪。
+
+    策略（按优先级）：
+      1. parentPanel rid — 标准 Android 弹窗（含标题+内容）
+      2. customPanel rid — 弹窗内容区（仅滚轮/Canvas）
+      3. 找不到则返回 None，回退全屏截图
+    """
+    try:
+        root = ET.fromstring(hierarchy_xml)
+    except ET.ParseError:
+        return None
+
+    # 策略1: parentPanel（含标题+内容+按钮，上下文最完整）
+    for node in root.iter("node"):
+        rid = node.get("resource-id", "")
+        if "parentPanel" in rid:
+            bounds = _parse_android_bounds(node.get("bounds", ""))
+            if bounds:
+                return bounds
+
+    # 策略2: customPanel（仅内容区）
+    for node in root.iter("node"):
+        rid = node.get("resource-id", "")
+        if "customPanel" in rid:
+            bounds = _parse_android_bounds(node.get("bounds", ""))
+            if bounds:
+                return bounds
+
+    return None
+
+
 @tool
-def vision_tap(description: str) -> str:
+def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
     """基于截图让 vision 模型定位目标区域并点击。
 
     专用于 Canvas 绘制、滚轮选择器等 view tree 无法访问的 UI 元素。
@@ -702,6 +749,20 @@ def vision_tap(description: str) -> str:
       - "上课时长滚轮中显示数字 10 的那一行"
       - "休息时间滚轮中显示数字 5 的那一行"
       - "颜色选择器中紫色色块"
+      - "开始时间小时滚轮中当前选中数字下方的那一行"（当需要连续点击多次时）
+
+    repeat 参数：在同一坐标上重复点击的次数（默认 1）。
+    时间拾取器高效策略：
+      - 时间轴每列显示 3 个值：上一值 / 选中值 / 下一值
+      - 点击上方值可选中上一值，点击下方值可选中下一值
+      - 设置分钟时，先定位到"下方值"的位置，然后用 repeat=N 连续点击 N 次
+        例如：当前分钟 00，目标是 10 → vision_tap("分钟列当前选中值下方的位置", repeat=10)
+        避免多次调用 vision_tap 浪费 token 和时间
+
+    verify 参数：点击后用新截图验证结果（可选）。
+      - 示例：verify="分钟列当前选中值是否为53"
+      - 点击后自动等待 0.3s 动画 → 重新截图 → vision 验证
+      - 如果 verify 显示值未变，说明坐标可能偏差，请调整 description 后重试
     """
     from tools import _run_multimodal_from_context  # 延迟 import 避免循环依赖
     import logging as _logging
@@ -730,26 +791,58 @@ def vision_tap(description: str) -> str:
         )
 
     try:
-        # 4) 截图 + 坐标系（使用压缩快照节省 token）
-        snap = ctx.device.snapshot_for_vision()
-        # 压缩图尺寸（vision 模型看到的尺寸）
-        img_w, img_h = snap.width, snap.height
-        # 原始设备分辨率（用于坐标映射）
-        dev_w = snap.original_width
-        dev_h = snap.original_height
-        # 防御：如果 original 字段未正确填写（为 0），回退恒等映射
-        if dev_w <= 0 or dev_h <= 0:
-            _logger.warning(
-                "[vision_tap] original_width/height 无效 (%d, %d)，回退恒等映射",
-                dev_w, dev_h,
-            )
-            dev_w, dev_h = img_w, img_h
-        _logger.info(
-            "[vision_tap] snapshot=%dx%d (device=%dx%d) desc=%s",
-            img_w, img_h, dev_w, dev_h, description,
-        )
+        # 4) 截图 + view tree，尝试智能裁剪（只发 Canvas 区域给 vision 模型）
+        image = ctx.device.screenshot()
+        hierarchy = ctx.device.dump_hierarchy()
+        dev_w, dev_h = image.width, image.height
 
-        # 5) 构造 prompt（让 vision 模型基于压缩图输出坐标，我们再映射回设备空间）
+        crop_bounds = _find_dialog_crop_bounds(hierarchy)
+
+        if crop_bounds:
+            # ── 裁剪模式：从原图裁出弹窗区域，不加压缩 ──
+            pad = 30  # 四周留边距，给模型上下文
+            cx1 = max(0, crop_bounds[0] - pad)
+            cy1 = max(0, crop_bounds[1] - pad)
+            cx2 = min(dev_w, crop_bounds[2] + pad)
+            cy2 = min(dev_h, crop_bounds[3] + pad)
+            cropped = image.crop((cx1, cy1, cx2, cy2))
+            img_w, img_h = cropped.width, cropped.height
+
+            # PNG 无损，保留灰色文字等低对比度细节
+            if cropped.mode in ("RGBA", "P"):
+                cropped = cropped.convert("RGB")
+            buf = BytesIO()
+            cropped.save(buf, format="PNG")
+            img_base64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            # 坐标映射：device = crop_offset + vision_coord（零缩放，零精度损失）
+            offset_x, offset_y = cx1, cy1
+            scale_x, scale_y = 1.0, 1.0
+
+            _logger.info(
+                "[vision_tap] CROPPED mode: crop=(%d,%d,%d,%d) img=%dx%d "
+                "(device=%dx%d) desc=%s",
+                cx1, cy1, cx2, cy2, img_w, img_h, dev_w, dev_h, description,
+            )
+        else:
+            # ── 全屏模式：压缩快照（visual_check 也用这条路径） ──
+            snap = ctx.device.snapshot_for_vision()
+            img_w, img_h = snap.width, snap.height
+            dev_w = snap.original_width or img_w
+            dev_h = snap.original_height or img_h
+            img_base64 = snap.image_base64
+
+            # 坐标映射：device = vision_coord * scale
+            offset_x, offset_y = 0, 0
+            scale_x = dev_w / img_w if img_w > 0 else 1.0
+            scale_y = dev_h / img_h if img_h > 0 else 1.0
+
+            _logger.info(
+                "[vision_tap] FULLSCREEN mode: snapshot=%dx%d (device=%dx%d) desc=%s",
+                img_w, img_h, dev_w, dev_h, description,
+            )
+
+        # 5) 构造 prompt（让 vision 模型基于图片输出坐标）
         prompt = (
             f"截图尺寸 {img_w}x{img_h}，坐标原点左上角。"
             f"找到「{description}」所在位置。"
@@ -760,10 +853,10 @@ def vision_tap(description: str) -> str:
         # 6) 调用 vision
         res = _run_multimodal_from_context(
             prompt,
-            snap.image_base64,
+            img_base64,
             purpose="locate_tap",
             strict_json=True,
-            timeout_sec=getattr(ctx, "vision_timeout", 45),
+            timeout_sec=getattr(ctx, "vision_timeout", 60),
         )
     except Exception as exc:
         _logger.warning("[vision_tap] 工具内部异常: %s", exc, exc_info=True)
@@ -798,52 +891,176 @@ def vision_tap(description: str) -> str:
             ),
         )
 
-    # 先裁剪到压缩图边界（vision 模型输出的是压缩图坐标）
+    # 先裁剪到图片边界（vision 模型输出的是图片坐标）
     x_img = max(0, min(img_w, raw_x))
     y_img = max(0, min(img_h, raw_y))
     clipped = (x_img != raw_x or y_img != raw_y)
-    # 映射回原始设备坐标
-    x = int(x_img * dev_w / img_w)
-    y = int(y_img * dev_h / img_h)
+    # 统一坐标映射：device = offset + vision_coord * scale
+    # 裁剪模式: offset=(crop_x1,crop_y1), scale=(1.0,1.0) — 零精度损失
+    # 全屏模式: offset=(0,0), scale=(dev/img) — 等比缩放
+    x = int(offset_x + x_img * scale_x)
+    y = int(offset_y + y_img * scale_y)
 
     # 详细日志：打印完整坐标变换链路
     _logger.info(
         "[vision_tap] 坐标变换: raw=(%d,%d) → clip=(%d,%d) → "
-        "dev=(%d,%d) [img=%dx%d dev=%dx%d]%s",
+        "dev=(%d,%d) [img=%dx%d dev=%dx%d offset=(%d,%d) scale=(%.3f,%.3f)]%s",
         raw_x, raw_y, x_img, y_img,
         x, y, img_w, img_h, dev_w, dev_h,
+        offset_x, offset_y, scale_x, scale_y,
         " CLIPPED" if clipped else "",
     )
 
-    # 横屏纠正：uiautomator2 在横屏时截图使用物理方向坐标，
-    # 但点击坐标仍基于自然方向（竖屏），导致 X/Y 轴互换。
-    # 检测：截图宽度 > 高度（横屏截图特征）
-    landscape = dev_w > dev_h
-    if landscape:
-        _logger.warning(
-            "[vision_tap] ★ 横屏模式：坐标轴互换 (%d,%d) -> (%d,%d)",
-            x, y, y, x,
-        )
-        x, y = y, x
-    else:
-        _logger.info(
-            "[vision_tap] 竖屏模式 (dev_w=%d <= dev_h=%d)，坐标不互换",
-            dev_w, dev_h,
-        )
+    # click_xy 使用 adb shell input tap，坐标系与截图一致，无需横屏互换
+    _logger.info(
+        "[vision_tap] 点击坐标: (%d, %d) dev=%dx%d img=%dx%d landscape=%s",
+        x, y, dev_w, dev_h, img_w, img_h, dev_w > dev_h,
+    )
 
-    # 9) 执行点击（使用设备坐标）
-    _logger.info("[vision_tap] 最终点击坐标: (%d, %d) landscape=%s", x, y, landscape)
-    ctx.device.click_xy(x, y)
+    # 9) 执行点击（使用设备坐标），支持 repeat 批量连点
+    actual_repeat = max(1, int(repeat))
+    _logger.info(
+        "[vision_tap] 最终点击坐标: (%d, %d) repeat=%d", x, y, actual_repeat,
+    )
+    for _i in range(actual_repeat):
+        ctx.device.click_xy(x, y)
+        if _i < actual_repeat - 1:
+            time.sleep(0.15)  # 连点间隔，给滚轮动画留时间
 
-    # 成功 → 重置 fail_streak
+    # 成功 → 重置 fail_streak 和上次 evidence
     ctx._vision_tap_fail_streak = 0
+    ctx._vision_tap_last_evidence = ""
     reason = data.get("reason", "")
+    mode_note = " [裁剪模式]" if crop_bounds else " [全屏模式]"
     clip_note = " (已裁剪)" if clipped else ""
-    orient_note = " (横屏互换)" if landscape else ""
+    repeat_note = f" 连点{actual_repeat}次" if actual_repeat > 1 else ""
+    base_msg = "已点击设备坐标({x},{y}) [图坐标({x_img},{y_img})]{mode} reason={reason}{clip}{repeat}".format(
+        x=x, y=y, x_img=x_img, y_img=y_img,
+        mode=mode_note, reason=reason, clip=clip_note, repeat=repeat_note,
+    )
+
+    # ── verify 闭环：点击后用新截图验证 ──
+    if verify:
+        time.sleep(0.3)  # 等滚轮动画
+        try:
+            snap2 = ctx.device.snapshot_for_vision()
+            verify_prompt = (
+                f"请根据截图判断：{verify}。"
+                f'只返回 JSON: {{"decision": "yes/no", "reason": str, "evidence": str}}'
+            )
+            vr = _run_multimodal_from_context(
+                verify_prompt,
+                snap2.image_base64,
+                purpose="visual_check",
+                strict_json=True,
+                timeout_sec=getattr(ctx, "vision_timeout", 60),
+            )
+            if vr.get("ok"):
+                vd = vr.get("data") or {}
+                v_decision = vd.get("decision", "unknown")
+                v_evidence = vd.get("evidence", "")
+                # 缓存 evidence 供下次 vision_tap 参考
+                ctx._vision_tap_last_evidence = v_evidence
+                base_msg += (
+                    f"\nverify=[{v_decision}] {v_evidence}"
+                    f"\n⚠️ 如果 verify 显示值未变，说明坐标可能偏差，"
+                    f"请调整 description 使其更精确（如指定列号）后重试。"
+                )
+                _logger.info(
+                    "[vision_tap] verify: decision=%s evidence=%s",
+                    v_decision, v_evidence,
+                )
+            else:
+                base_msg += f"\nverify=vision 调用失败: {vr.get('error', 'unknown')}"
+        except Exception as exc:
+            base_msg += f"\nverify=截图或验证异常: {exc}"
+            _logger.warning("[vision_tap] verify 异常: %s", exc)
+
+    # ── evidence 反馈：附带上次验证结果（如果有） ──
+    elif hasattr(ctx, "_vision_tap_last_evidence") and ctx._vision_tap_last_evidence:
+        base_msg += (
+            f"\n⚠️ 上次验证结果: {ctx._vision_tap_last_evidence}"
+            f"\n如果目标值未改变，请调整 description 后重试。"
+        )
+
+    return make_result(OK, base_msg)
+
+
+# ═══ click_and_check：点击后立即截图验证（捕获 toast 等瞬态 UI） ═══
+
+
+@tool
+def click_and_check(label: str, check_description: str, wait_ms: int = 500) -> str:
+    """点击元素后立即截图并用 vision 验证。专用于捕获 toast 等瞬态 UI 提示。
+
+    普通 visual_check 流程太慢（LLM 思考 + vision 推理 >> toast 显示时长），
+    此工具将点击和截图绑定为一步：点击 → 等待 wait_ms → 立即截图 → 再送 vision 分析。
+
+    label: 要点击的元素文本，如 "完成"、"确定"
+    check_description: 让 vision 验证的内容，如 "屏幕底部是否出现toast提示"
+    wait_ms: 点击后等待毫秒数（默认 500ms，toast 通常 1-2 秒内可见）
+
+    示例：
+      - click_and_check("完成", "屏幕底部是否出现toast提示")
+      - click_and_check("保存", "页面中央是否出现加载动画", wait_ms=300)
+    """
+    from tools import _run_multimodal_from_context
+    import logging as _logging
+
+    _logger = _logging.getLogger(__name__)
+    ctx = get_tool_context()
+
+    if ctx.device is None:
+        return make_result(ERROR, "未连接 Android 设备")
+
+    actual_model = ctx.vision_model or ctx.llm_model
+    if not (ctx.llm_vision_enabled and actual_model):
+        return make_result(ERROR, "vision 未启用")
+
+    # 1) 点击元素
+    clicked = ctx.device.click_text(label)
+    if not clicked:
+        return make_result(NOT_FOUND, f"未找到可点击元素: {label}")
+    _logger.info("[click_and_check] clicked '%s', waiting %dms", label, wait_ms)
+
+    # 2) 等待 toast/动画出现
+    time.sleep(max(0, wait_ms) / 1000.0)
+
+    # 3) 立即截图（压缩，toast 通常 2 秒内可见）
+    try:
+        snap = ctx.device.snapshot_for_vision()
+    except Exception as exc:
+        return make_result(ERROR, f"截图失败: {exc}")
+
+    # 4) 送 vision 模型分析
+    prompt = (
+        f"观察截图，{check_description}。"
+        f'只返回 JSON: {{"decision": "yes/no", "reason": str, "evidence": str}}'
+    )
+    res = _run_multimodal_from_context(
+        prompt,
+        snap.image_base64,
+        purpose="click_and_check",
+        strict_json=True,
+        timeout_sec=getattr(ctx, "vision_timeout", 60),
+    )
+
+    if not res.get("ok"):
+        return make_result(
+            ERROR,
+            f"已点击'{label}'并截图，但 vision 分析失败: {res.get('error', 'unknown')}",
+        )
+
+    data = res.get("data") or {}
+    decision = data.get("decision", "unknown")
+    reason = data.get("reason", "")
+    evidence = data.get("evidence", "")
+
+    _logger.info(
+        "[click_and_check] '%s' → decision=%s reason=%s",
+        label, decision, reason,
+    )
     return make_result(
         OK,
-        "已点击设备坐标({x},{y}) [压缩图坐标({x_img},{y_img})] reason={reason}{clip}{orient}".format(
-            x=x, y=y, x_img=x_img, y_img=y_img,
-            reason=reason, clip=clip_note, orient=orient_note,
-        ),
+        f"已点击'{label}'并截图验证 [{decision}] {reason} | evidence: {evidence}",
     )

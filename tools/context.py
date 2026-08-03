@@ -27,7 +27,7 @@ class ToolContext:
     vision_api_key: str | None = None
     vision_base_url: str | None = None
     # 视觉调用超时秒数，对应 config.vision_timeout
-    vision_timeout: int = 45
+    vision_timeout: int = 60
     # M4：确定性断言（assert_page_contains/assert_element_exists）作为 ground truth
     # 参与 assert_verification 结果核实。默认「仅证据」（annotate 不改判定）；
     # 置 True 时开启「硬核实」——代码核实与模型判定冲突时按代码结果修正。
@@ -55,6 +55,8 @@ class ToolContext:
     # vision_tap 连续失败计数（run 级）；达到上限时工具自动返回 ERROR 提示回退。
     # 每次 run 由 orchestrator._reset_run_scoped 重置，或工具成功时清零。
     _vision_tap_fail_streak: int = 0
+    # vision_tap 上次 verify 的 evidence，用于下次调用时注入诊断信息
+    _vision_tap_last_evidence: str = ""
     # Reactive Permission Intent：声明式权限测试意图，跨 click() 调用持久。
     # 格式：{"permission": "camera", "action": "deny", "set_time": <monotonic>}
     # 空 dict = 未设置；TTL 120s 自动过期（click.py 内部检查）。

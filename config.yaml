@@ -9,6 +9,6 @@ safety_level: strict
 click_mode: legacy
 context_history_steps: 5
 vision_provider: openai
-vision_model: qwen3.7-flash
+vision_model: qwen3.7-plus
 vision_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-vision_timeout: 45  # 视觉调用超时秒数，可调整（建议 30-60）
+vision_timeout: 60

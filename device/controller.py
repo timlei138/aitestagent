@@ -18,8 +18,9 @@ DEFAULT_EXCLUDED_LAUNCHER_KEYWORDS = ("LeakLauncherActivity",)
 
 # ── vision 快照压缩参数 ──
 # VISION_SNAPSHOT_MAX_DIMENSION: 长边超过此像素数时等比缩放，避免发送过大图片给 vision 模型。
-# VISION_SNAPSHOT_QUALITY: JPEG 压缩质量（1-100），越小文件越小但越模糊。
-VISION_SNAPSHOT_MAX_DIMENSION = 1024
+#   2048 对 3040px 横屏设备可保留足够精度定位滚轮中的小字（每行约 190px vs 1024 时仅 90px）。
+# VISION_SNAPSHOT_QUALITY: JPEG 压缩质量（1-100），越小文件越小但越模糊。PNG 无损时忽略此参数。
+VISION_SNAPSHOT_MAX_DIMENSION = 2048
 VISION_SNAPSHOT_QUALITY = 75
 
 
@@ -501,14 +502,14 @@ class DeviceController:
         max_dimension: int = VISION_SNAPSHOT_MAX_DIMENSION,
         quality: int = VISION_SNAPSHOT_QUALITY,
     ) -> DeviceSnapshot:
-        """截图并压缩为适合视觉大模型的 JPEG（节省 token）。
+        """截图并压缩为适合视觉大模型的 PNG（无损保留灰色文字等低对比度细节）。
 
         Args:
             max_dimension: 长边最大像素，超出则等比缩放。默认 1024。
-            quality: JPEG 质量 1-100。默认 75。
+            quality: 已废弃（PNG 无损，忽略此参数）。
 
         Returns:
-            DeviceSnapshot，其中 image_base64 为压缩后的 JPEG。
+            DeviceSnapshot，其中 image_base64 为缩放后的 PNG。
         """
         image = self.screenshot()
         # 如果图片过大，等比缩放
@@ -518,16 +519,16 @@ class DeviceController:
             ratio = max_dimension / longer
             new_size = (int(w * ratio), int(h * ratio))
             image = image.resize(new_size, Image.LANCZOS)
-        # 转为 RGB（JPEG 不支持 RGBA）
+        # 转为 RGB（PNG 也支持 RGBA，但统一用 RGB 减少文件大小）
         if image.mode in ("RGBA", "P"):
             image = image.convert("RGB")
         buf = BytesIO()
-        image.save(buf, format="JPEG", quality=quality)
+        image.save(buf, format="PNG")
         app = self.current_app()
         img_kb = buf.tell() // 1024
         logger.info(
-            "snapshot_for_vision: %dx%d -> %dx%d JPEG q=%d %dKB",
-            w, h, image.width, image.height, quality, img_kb,
+            "snapshot_for_vision: %dx%d -> %dx%d PNG %dKB",
+            w, h, image.width, image.height, img_kb,
         )
         return DeviceSnapshot(
             package=app.get("package", ""),

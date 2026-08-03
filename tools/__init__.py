@@ -69,6 +69,7 @@ from tools.verify import (
 )
 from tools.perceive_tools import (
     check_page_health,
+    click_and_check,
     detect_overlay,
     detect_popup,
     dismiss_popup,
@@ -393,6 +394,7 @@ AGENT_TOOLS: list[Any] = [
     open_app_permission_settings,
     visual_check,
     vision_tap,
+    click_and_check,
     detect_overlay,
     detect_popup,
     dismiss_popup,

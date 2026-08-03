@@ -57,8 +57,8 @@ class TestConfig:
     vision_api_key: str | None = None
     vision_base_url: str | None = None
     # 视觉调用超时秒数（visual_check / detect_overlay / vision_tap）
-    # DashScope qwen3.7-flash 实测响应 5-20s，偶发排队超 30s，默认 45s 留余量。
-    vision_timeout: int = 45
+    # DashScope qwen3.7-flash 实测响应 5-20s，偶发排队超 30s，默认 60s 留余量。
+    vision_timeout: int = 60
 
     # ── 上下文历史步数（摘要层）──
     # agent 每轮注入的 step_history 摘要条数（原硬编码 10）
