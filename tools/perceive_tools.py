@@ -16,6 +16,8 @@ import xml.etree.ElementTree as ET
 from io import BytesIO
 from typing import Any
 
+from PIL import Image, ImageDraw, ImageFont
+
 import numpy as np
 
 from tools.context import get_tool_context
@@ -739,6 +741,166 @@ def _find_dialog_crop_bounds(hierarchy_xml: str) -> tuple[int, int, int, int] | 
     return None
 
 
+# ═══ SoM 网格定位（Set-of-Mark）══════════════════════════════════════
+
+
+def _draw_som_grid(
+    pil_img: Image.Image,
+) -> tuple[Image.Image, str, int, int, int, float, float]:
+    """在截图上绘制 SoM 网格（列字母 + 行编号），标签放在画布外扩区域。
+
+    Returns:
+        (annotated_image, base64_str, cols, rows, margin, cell_w, cell_h)
+        cell_w / cell_h 是原图坐标系下的格子尺寸（不含外扩偏移）。
+    """
+    img_w, img_h = pil_img.size
+
+    # 自适应网格：目标 30~96 格，格子尺寸 ~60-150px
+    cols = max(4, min(8, img_w // 60))
+    rows = max(4, min(12, img_h // 60))
+    cell_w = img_w / cols
+    cell_h = img_h / rows
+
+    # 画布外扩 margin px 放标签，避免遮挡 UI 内容
+    margin = 30
+
+    if pil_img.mode != "RGBA":
+        pil_img = pil_img.convert("RGBA")
+
+    # 扩展画布
+    extended = Image.new("RGBA", (img_w + 2 * margin, img_h + 2 * margin), (255, 255, 255, 255))
+    extended.paste(pil_img, (margin, margin))
+
+    overlay = Image.new("RGBA", extended.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # 网格线：1px 灰色半透明，不干扰滚轮蓝色高亮
+    grid_color = (128, 128, 128, 100)
+    for c in range(1, cols):
+        x = margin + int(c * cell_w)
+        draw.line([(x, margin), (x, margin + img_h)], fill=grid_color, width=1)
+    for r in range(1, rows):
+        y = margin + int(r * cell_h)
+        draw.line([(margin, y), (margin + img_w, y)], fill=grid_color, width=1)
+
+    # 标签：红色加粗 ≥20px，与 UI 的黑/蓝/灰文字明确区分
+    font = None
+    for font_name in ("arial.ttf", "DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+        try:
+            font = ImageFont.truetype(font_name, 20)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    # anchor="mm" 仅 TrueType 字体支持，位图字体需手动居中
+    _is_truetype = hasattr(font, "getbbox")
+
+    label_color = (255, 0, 0, 255)  # 纯红
+
+    def _draw_centered_label(x: int, y: int, text: str) -> None:
+        if _is_truetype:
+            draw.text((x, y), text, fill=label_color, font=font, anchor="mm")
+        else:
+            # 位图字体 fallback：手动居中
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text((x - tw // 2, y - th // 2), text, fill=label_color, font=font)
+
+    # 列标签（A, B, C, ...）画在顶部外扩区
+    for c in range(cols):
+        label = chr(ord("A") + c)
+        cx = margin + int((c + 0.5) * cell_w)
+        _draw_centered_label(cx, margin // 2, label)
+
+    # 行标签（1, 2, 3, ...）画在左侧外扩区
+    for r in range(rows):
+        label = str(r + 1)
+        cy = margin + int((r + 0.5) * cell_h)
+        _draw_centered_label(margin // 2, cy, label)
+
+    # 合成
+    result = Image.alpha_composite(extended, overlay).convert("RGB")
+
+    # 编码 base64
+    buf = BytesIO()
+    result.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    import logging as _lg
+
+    _lg.getLogger(__name__).info(
+        "[SoM] grid=%dx%d cells=%.0fx%.0fpx margin=%d canvas=%dx%d",
+        cols, rows, cell_w, cell_h, margin,
+        img_w + 2 * margin, img_h + 2 * margin,
+    )
+
+    return result, b64, cols, rows, margin, cell_w, cell_h
+
+
+def _parse_cell_response(data: dict, cols: int, rows: int) -> tuple[str, int] | None:
+    """宽容解析模型返回的格子引用。
+
+    支持格式:
+      {"col": "G", "row": 7}
+      {"col": "g", "row": "7"}
+      {"cell": "G7"}
+      reason 字段内包含 "G7" 等
+    列字母转大写，校验范围 [0, cols) 和 [1, rows]。
+    返回 (col_letter, row_number) 或 None。
+    """
+    col_raw = str(data.get("col", "")).strip().upper()
+    row_raw = str(data.get("row", "")).strip()
+    cell_raw = str(data.get("cell", "")).strip().upper()
+
+    col_letter = ""
+    row_number = 0
+
+    # 格式 1: col + row 分离（col 必须单字母，否则放行到格式 1.5）
+    if col_raw and row_raw and len(col_raw) == 1:
+        col_letter = col_raw
+        try:
+            row_number = int(row_raw)
+        except (ValueError, TypeError):
+            col_letter = ""
+
+    # 格式 1.5: col 字段含合并值（如 {"col": "G7"} 没给 row）
+    if not col_letter and col_raw:
+        m = re.match(r"([A-Z])(\d{1,2})$", col_raw)
+        if m:
+            col_letter = m.group(1)
+            row_number = int(m.group(2))
+
+    # 格式 2: cell 合并（如 "G7"）
+    if not col_letter and cell_raw:
+        m = re.match(r"([A-Z])(\d{1,2})", cell_raw)
+        if m:
+            col_letter = m.group(1)
+            row_number = int(m.group(2))
+
+    # 格式 3: 从 reason 字段提取
+    if not col_letter:
+        reason = str(data.get("reason", ""))
+        m = re.search(r"(?<![A-Za-z0-9])([A-Za-z])(\d{1,2})(?!\d)", reason)
+        if m:
+            col_letter = m.group(1).upper()
+            row_number = int(m.group(2))
+
+    if not col_letter:
+        return None
+
+    # 校验列范围: A=0, B=1, ...
+    col_idx = ord(col_letter) - ord("A")
+    if not (0 <= col_idx < cols):
+        return None
+    # 校验行范围: 1-based
+    if not (1 <= row_number <= rows):
+        return None
+
+    return col_letter, row_number
+
+
 @tool
 def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
     """基于截图让 vision 模型定位目标区域并点击。
@@ -808,12 +970,13 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             cropped = image.crop((cx1, cy1, cx2, cy2))
             img_w, img_h = cropped.width, cropped.height
 
-            # PNG 无损，保留灰色文字等低对比度细节
+            # PNG 无损 + RGBA→RGB 转换
             if cropped.mode in ("RGBA", "P"):
                 cropped = cropped.convert("RGB")
-            buf = BytesIO()
-            cropped.save(buf, format="PNG")
-            img_base64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            # SoM 网格：画网格 + 外扩标签 → 编码
+            grid_pil, img_base64, grid_cols, grid_rows, grid_margin, grid_cell_w, grid_cell_h = _draw_som_grid(cropped)
+            img_w, img_h = grid_pil.size  # 含外扩 margin
 
             # 坐标映射：device = crop_offset + vision_coord（零缩放，零精度损失）
             offset_x, offset_y = cx1, cy1
@@ -832,22 +995,35 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             dev_h = snap.original_height or img_h
             img_base64 = snap.image_base64
 
+            # 保留原图尺寸（格子坐标系基于原图，scale 分母必须用原图尺寸）
+            orig_w, orig_h = snap.width, snap.height
+
+            # SoM 网格：解码压缩快照 → 画网格 → 重新编码
+            snap_bytes = base64.b64decode(img_base64)
+            snap_pil = Image.open(BytesIO(snap_bytes))
+            grid_pil, img_base64, grid_cols, grid_rows, grid_margin, grid_cell_w, grid_cell_h = _draw_som_grid(snap_pil)
+            img_w, img_h = grid_pil.size  # 含外扩 margin
+
             # 坐标映射：device = vision_coord * scale
+            # 注意：scale 分母必须是原图尺寸（格子坐标是原图空间）
             offset_x, offset_y = 0, 0
-            scale_x = dev_w / img_w if img_w > 0 else 1.0
-            scale_y = dev_h / img_h if img_h > 0 else 1.0
+            scale_x = dev_w / orig_w if orig_w > 0 else 1.0
+            scale_y = dev_h / orig_h if orig_h > 0 else 1.0
 
             _logger.info(
                 "[vision_tap] FULLSCREEN mode: snapshot=%dx%d (device=%dx%d) desc=%s",
                 img_w, img_h, dev_w, dev_h, description,
             )
 
-        # 5) 构造 prompt（让 vision 模型基于图片输出坐标）
+        # 5) SoM 网格 prompt：模型只做语义指认（认格子），不做几何估算
+        last_col = chr(ord("A") + grid_cols - 1)
         prompt = (
-            f"截图尺寸 {img_w}x{img_h}，坐标原点左上角。"
-            f"找到「{description}」所在位置。"
-            f'只返回 JSON: {{"x": int, "y": int, "reason": str}}，'
-            f"x in [0,{img_w}]，y in [0,{img_h}]。"
+            f"截图已标注 {grid_cols}列(A-{last_col}) × {grid_rows}行(1-{grid_rows}) 的坐标网格。"
+            f"红色字母和数字是坐标标注，不是界面内容。"
+            f"找到「{description}」所在的格子。"
+            f"如果目标跨多个格子，返回目标中心点所在的格子。"
+            f'只返回 JSON: {{"col": "列字母", "row": 行号, "reason": str}}。'
+            f"列范围 A-{last_col}，行范围 1-{grid_rows}。"
         )
 
         # 6) 调用 vision
@@ -873,42 +1049,45 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             ),
         )
 
-    # 8) 解析 + 边界裁剪
+    # 8) SoM 解析：提取格子引用 → 计算格子中心像素 → 映射设备坐标
     data = res.get("data") or {}
-    if "x" not in data or "y" not in data:
-        ctx._vision_tap_fail_streak = streak + 1
-        return make_result(ERROR, "vision 返回格式无效（缺少 x/y 字段）")
+    cell_ref = _parse_cell_response(data, grid_cols, grid_rows)
+    reason = data.get("reason", "")
 
-    try:
-        raw_x = int(data["x"])
-        raw_y = int(data["y"])
-    except (ValueError, TypeError):
-        ctx._vision_tap_fail_streak = streak + 1
-        return make_result(
-            ERROR,
-            "vision 返回坐标非整数: x={x} y={y}".format(
-                x=data.get("x"), y=data.get("y"),
-            ),
-        )
+    if cell_ref is None:
+        # 宽容解析全部失败 → 尝试 fallback 像素模式
+        _logger.warning("[vision_tap] SoM cell parse failed, data=%s, fallback pixel", data)
+        if "x" not in data or "y" not in data:
+            ctx._vision_tap_fail_streak = streak + 1
+            return make_result(ERROR, "vision 返回格式无效（无法解析格子引用或 x/y）")
+        try:
+            raw_x = int(data["x"])
+            raw_y = int(data["y"])
+        except (ValueError, TypeError):
+            ctx._vision_tap_fail_streak = streak + 1
+            return make_result(ERROR, f"vision 返回坐标非整数: x={data.get('x')} y={data.get('y')}")
+        # fallback x/y 是外扩坐标系，需减去 margin 回到原图空间
+        x_img = max(0, min(img_w - 2 * grid_margin, raw_x - grid_margin))
+        y_img = max(0, min(img_h - 2 * grid_margin, raw_y - grid_margin))
+        cell_note = " [fallback pixel]"
+    else:
+        col_letter, row_number = cell_ref
+        col_idx = ord(col_letter) - ord("A")
+        # 格子中心（原图坐标系，不含外扩 margin）
+        x_img = int((col_idx + 0.5) * grid_cell_w)
+        y_img = int((row_number - 0.5) * grid_cell_h)
+        x_img = max(0, min(int(img_w - 2 * grid_margin), x_img))
+        y_img = max(0, min(int(img_h - 2 * grid_margin), y_img))
+        cell_note = f" [cell {col_letter}{row_number}]"
 
-    # 先裁剪到图片边界（vision 模型输出的是图片坐标）
-    x_img = max(0, min(img_w, raw_x))
-    y_img = max(0, min(img_h, raw_y))
-    clipped = (x_img != raw_x or y_img != raw_y)
     # 统一坐标映射：device = offset + vision_coord * scale
-    # 裁剪模式: offset=(crop_x1,crop_y1), scale=(1.0,1.0) — 零精度损失
-    # 全屏模式: offset=(0,0), scale=(dev/img) — 等比缩放
     x = int(offset_x + x_img * scale_x)
     y = int(offset_y + y_img * scale_y)
 
-    # 详细日志：打印完整坐标变换链路
+    # 详细日志
     _logger.info(
-        "[vision_tap] 坐标变换: raw=(%d,%d) → clip=(%d,%d) → "
-        "dev=(%d,%d) [img=%dx%d dev=%dx%d offset=(%d,%d) scale=(%.3f,%.3f)]%s",
-        raw_x, raw_y, x_img, y_img,
-        x, y, img_w, img_h, dev_w, dev_h,
-        offset_x, offset_y, scale_x, scale_y,
-        " CLIPPED" if clipped else "",
+        "[vision_tap] SoM: img=(%d,%d) → dev=(%d,%d)%s reason=%s",
+        x_img, y_img, x, y, cell_note, reason,
     )
 
     # click_xy 使用 adb shell input tap，坐标系与截图一致，无需横屏互换
@@ -930,13 +1109,11 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
     # 成功 → 重置 fail_streak 和上次 evidence
     ctx._vision_tap_fail_streak = 0
     ctx._vision_tap_last_evidence = ""
-    reason = data.get("reason", "")
     mode_note = " [裁剪模式]" if crop_bounds else " [全屏模式]"
-    clip_note = " (已裁剪)" if clipped else ""
     repeat_note = f" 连点{actual_repeat}次" if actual_repeat > 1 else ""
-    base_msg = "已点击设备坐标({x},{y}) [图坐标({x_img},{y_img})]{mode} reason={reason}{clip}{repeat}".format(
+    base_msg = "已点击设备坐标({x},{y}) [图坐标({x_img},{y_img})]{cell}{mode} reason={reason}{repeat}".format(
         x=x, y=y, x_img=x_img, y_img=y_img,
-        mode=mode_note, reason=reason, clip=clip_note, repeat=repeat_note,
+        cell=cell_note, mode=mode_note, reason=reason, repeat=repeat_note,
     )
 
     # ── verify 闭环：点击后用新截图验证 ──
