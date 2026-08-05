@@ -62,7 +62,6 @@ def _reset_run_scoped(ctx) -> None:
         pass
 
 
-
 class TestOrchestrator:
     """测试编排器 — 对外唯一入口。
 
@@ -114,7 +113,11 @@ class TestOrchestrator:
             "started_at": datetime.now().isoformat(),
             "mode": "run",
         }
-        logger.info("[stop-debug] _register_run tid=%s active_runs=%d", thread_id, len(self._active_runs))
+        logger.info(
+            "[stop-debug] _register_run tid=%s active_runs=%d",
+            thread_id,
+            len(self._active_runs),
+        )
         return ev
 
     def _cleanup_run(self, thread_id: str) -> None:
@@ -127,7 +130,11 @@ class TestOrchestrator:
         """
         self._stop_flags.pop(thread_id, None)
         self._active_runs.pop(thread_id, None)
-        logger.info("[stop-debug] _cleanup_run tid=%s active_runs=%d", thread_id, len(self._active_runs))
+        logger.info(
+            "[stop-debug] _cleanup_run tid=%s active_runs=%d",
+            thread_id,
+            len(self._active_runs),
+        )
 
     def _attach_stop_event(self, ctx, ev: threading.Event) -> None:
         """把 Event 挂到 ToolContext._stop_event，让节点快速检查。"""
@@ -159,6 +166,7 @@ class TestOrchestrator:
             # (resume 期间 ctx._stop_event 仍指向该 Event 的 python 引用)
             try:
                 from tools import get_tool_context
+
                 ctx = get_tool_context()
                 ctx_ev = getattr(ctx, "_stop_event", None)
             except Exception:
@@ -190,9 +198,13 @@ class TestOrchestrator:
                 "status",
                 {"type": "stopping", "thread_id": thread_id, "reason": reason},
             )
-            logger.info("[stop-debug] request_stop: STOP FLAG SET for tid=%s", thread_id)
+            logger.info(
+                "[stop-debug] request_stop: STOP FLAG SET for tid=%s", thread_id
+            )
         else:
-            logger.info("[stop-debug] request_stop: flag already set, ignore. tid=%s", thread_id)
+            logger.info(
+                "[stop-debug] request_stop: flag already set, ignore. tid=%s", thread_id
+            )
         return True
 
     # ── 同步执行 ──
@@ -218,9 +230,7 @@ class TestOrchestrator:
         )
         # F7 并发保护：已有运行在进行则拒绝（先于设备检查和注册）
         if self._active_runs:
-            self._emit(
-                "error", {"message": "已有运行在进行，请等待其结束后重试"}
-            )
+            self._emit("error", {"message": "已有运行在进行，请等待其结束后重试"})
             return {
                 "thread_id": thread_id or "",
                 "status": "busy",
@@ -245,11 +255,14 @@ class TestOrchestrator:
 
                 _r = _sp.run(
                     ["adb", "shell", "pm", "list", "packages", app_package],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 if app_package not in (_r.stdout or ""):
                     logger.warning(
-                        "R20: 应用 %s 在设备上未安装，复跑将注入事实提示 LLM", app_package
+                        "R20: 应用 %s 在设备上未安装，复跑将注入事实提示 LLM",
+                        app_package,
                     )
                     if goal_description is None:
                         goal_description = {}
@@ -313,6 +326,11 @@ class TestOrchestrator:
             "_source_run_id": source_run_id,
             "_source_case_id": source_case_id,
             "_execution_plan_revision": int(execution_plan_revision or 0),
+            "_replay_step_idx": 0,
+            "_replay_mode": "",
+            "_replay_input_actuals": {},
+            "_replay_recovery_used": 0,
+            "_replay_nav_streak": 0,
         }
 
         config_ctx = {
@@ -425,7 +443,10 @@ class TestOrchestrator:
         _reset_run_scoped(_sctx)
 
         if getattr(_sctx, "device", None) is None:
-            yield {"type": "error", "content": "Android 设备未连接，请检查 USB/ADB 连接后重试"}
+            yield {
+                "type": "error",
+                "content": "Android 设备未连接，请检查 USB/ADB 连接后重试",
+            }
             return
         if self._active_runs:
             yield {"type": "error", "content": "已有运行在进行，请等待其结束后重试"}
@@ -464,13 +485,20 @@ class TestOrchestrator:
             "_source_run_id": source_run_id,
             "_source_case_id": source_case_id,
             "_execution_plan_revision": int(execution_plan_revision or 0),
+            "_replay_step_idx": 0,
+            "_replay_mode": "",
+            "_replay_input_actuals": {},
+            "_replay_recovery_used": 0,
+            "_replay_nav_streak": 0,
         }
 
         config_ctx = {
             "configurable": {"thread_id": thread_id, "test_config": self.config}
         }
 
-        logger.info("[stop-debug] start_stream() yielding run_started tid=%s", thread_id)
+        logger.info(
+            "[stop-debug] start_stream() yielding run_started tid=%s", thread_id
+        )
         yield {
             "type": "run_started",
             "content": {
@@ -824,7 +852,9 @@ class TestOrchestrator:
                 exec_status = "cancelled"
             elif is_done:
                 exec_status = "completed"
-            elif is_abort and ("MAX_TURNS" in conclusion or "MAX_TOOL_CALLS" in conclusion):
+            elif is_abort and (
+                "MAX_TURNS" in conclusion or "MAX_TOOL_CALLS" in conclusion
+            ):
                 exec_status = "exhausted"
             elif is_abort:
                 exec_status = "completed"

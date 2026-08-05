@@ -293,6 +293,28 @@
                     <el-option label="Relaxed（宽松）" value="relaxed" />
                   </el-select>
                 </el-form-item>
+                <el-form-item label="复跑执行器">
+                  <div style="display:flex;align-items:center;gap:8px;width:100%">
+                    <el-select v-model="configData.replay_executor" style="flex:1">
+                      <el-option label="direct（确定性直执行，推荐）" value="direct" />
+                      <el-option label="llm（LLM 软回放）" value="llm" />
+                    </el-select>
+                    <el-tooltip placement="top" :show-after="100">
+                      <template #content>
+                        <div style="max-width:320px;line-height:1.6">
+                          <strong>direct（确定性直执行，推荐）</strong><br />
+                          复跑时脚本步骤由代码直接执行对应工具（click / type_input 等），<br />
+                          不再调用主 LLM，速度更快、更稳定。仅在偏离脚本时由 LLM 接管恢复。
+                          <br /><br />
+                          <strong>llm（LLM 软回放）</strong><br />
+                          复跑时每一步仍由 LLM 按脚本指令执行，更保守灵活，<br />
+                          但更慢、且可能在稳定入口偏航。
+                        </div>
+                      </template>
+                      <span style="font-size:14px;color:var(--text-muted);cursor:help">❓</span>
+                    </el-tooltip>
+                  </div>
+                </el-form-item>
                 <el-form-item label="历史摘要步数">
                   <el-input-number v-model="configData.context_history_steps" :min="1" :max="20" :step="1" style="width:140px" />
                   <span style="font-size:12px;color:var(--text-muted);margin-left:8px">agent 每轮注入的摘要层历史步数</span>

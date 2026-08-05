@@ -87,6 +87,11 @@ class TestConfig:
     #   是下线 ~500 行 legacy 语义匹配代码的前置开关。
     click_mode: str = "legacy"
 
+    # ── 回放执行器 ──
+    # llm:    脚本步骤由 LLM 按指令执行（保守，先用于验证状态机与闸门）。
+    # direct: 脚本步骤由代码确定性直执（不调主 LLM），LLM 仅在 recovery 接管。
+    replay_executor: str = "direct"
+
     # ──────────────── YAML 加载 ────────────────
 
     @classmethod

@@ -51,11 +51,13 @@ def build_run_trace(
             "intent": e.get("intent_text", ""),
             "observation": obs,
             "screenshot": e.get("screenshot_path", ""),
+            "tool_input": e.get("tool_input", {}),
+            "replay_source": e.get("replay_source", ""),
+            "replay_step_idx": e.get("replay_step_idx", -1),
         }
         if e.get("name") == "click":
             step["match_mode"] = e.get("match_mode", "")
             step["fallback_used"] = bool(e.get("fallback_used", False))
-            step["tool_input"] = e.get("tool_input", {})
         steps.append(step)
 
     return {

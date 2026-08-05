@@ -158,7 +158,9 @@ def _permission_popup_buttons(
             # 兼容测试替身或尚未升级的设备适配器。
             current = ctx.device.current_app()
         activity = str(current.get("activity", "") or "")
-        if not any(marker in activity.lower() for marker in _PERMISSION_ACTIVITY_MARKERS):
+        if not any(
+            marker in activity.lower() for marker in _PERMISSION_ACTIVITY_MARKERS
+        ):
             return None
         root = ET.fromstring(ctx.device.dump_hierarchy())
         controls: list[tuple[str, str, tuple[int, int, int, int]]] = []
@@ -199,15 +201,23 @@ def _permission_evidence(
 # rid 优先于文案，消除 OEM / 语言差异（如 ZUI「全部允许」vs 其它「允许访问所有照片」）
 # 注意：permission_deny_and_dont_ask_again_button 永不自动点（避免设 don't-ask-again）
 _GRANT_RID_SCORES = {
-    "permission_allow_all_button": 1,               # 媒体全量「全部允许」
-    "permission_allow_always_button": 1,            # 始终允许
+    "permission_allow_all_button": 1,  # 媒体全量「全部允许」
+    "permission_allow_always_button": 1,  # 始终允许
     "permission_allow_foreground_only_button": 2,
-    "permission_allow_button": 2,                   # 基本允许（单次）
-    "permission_allow_one_time_button": 2,          # 仅本次使用
+    "permission_allow_button": 2,  # 基本允许（单次）
+    "permission_allow_one_time_button": 2,  # 仅本次使用
 }
 _DENY_RID = "permission_deny_button"
 # 文案兜底表（兼容非标准 OEM / 自定义 rid 的设备）
-_GRANT_BUTTONS = ("仅在使用中允许", "仅本次使用时允许", "始终允许", "允许", "全部允许", "允许访问所有照片", "Allow")
+_GRANT_BUTTONS = (
+    "仅在使用中允许",
+    "仅本次使用时允许",
+    "始终允许",
+    "允许",
+    "全部允许",
+    "允许访问所有照片",
+    "Allow",
+)
 _DENY_BUTTONS = ("拒绝", "不允许", "Deny", "Don't allow")
 
 
@@ -268,10 +278,26 @@ def _detect_permission_popup(
 
 # detect_popup 关键词：覆盖常见弹窗按钮文案
 _POPUP_KEYWORDS = (
-    "允许", "拒绝", "确定", "取消", "同意", "继续", "进入", "关闭", "跳过", "知道了",
-    "前往设置", "Allow", "Deny", "OK", "Cancel", "Agree", "Continue", "Dismiss",
+    "允许",
+    "拒绝",
+    "确定",
+    "取消",
+    "同意",
+    "继续",
+    "进入",
+    "关闭",
+    "跳过",
+    "知道了",
+    "前往设置",
+    "Allow",
+    "Deny",
+    "OK",
+    "Cancel",
+    "Agree",
+    "Continue",
+    "Dismiss",
 )
-_POPUP_RETRY_MAX = 3       # 最多重试次数
+_POPUP_RETRY_MAX = 3  # 最多重试次数
 _POPUP_RETRY_INTERVAL = 0.5  # 重试间隔（秒），覆盖弹窗 200~500ms 渲染延迟
 
 
@@ -406,7 +432,7 @@ def set_permission_intent(permission: str = "", action: str = "") -> str:
             return make_result(
                 ERROR,
                 f"当前屏幕存在权限弹窗({_activity})，请直接用 "
-                f"respond_to_permission_dialog(button=\"...\") 响应（可见按钮: {_btns}）；"
+                f'respond_to_permission_dialog(button="...") 响应（可见按钮: {_btns}）；'
                 f"或传入具体 permission 类型后再用 click() 自动处理。",
                 _permission_evidence(_activity, _controls),
             )
@@ -768,7 +794,9 @@ def _draw_som_grid(
         pil_img = pil_img.convert("RGBA")
 
     # 扩展画布
-    extended = Image.new("RGBA", (img_w + 2 * margin, img_h + 2 * margin), (255, 255, 255, 255))
+    extended = Image.new(
+        "RGBA", (img_w + 2 * margin, img_h + 2 * margin), (255, 255, 255, 255)
+    )
     extended.paste(pil_img, (margin, margin))
 
     overlay = Image.new("RGBA", extended.size, (0, 0, 0, 0))
@@ -785,7 +813,11 @@ def _draw_som_grid(
 
     # 标签：红色加粗 ≥20px，与 UI 的黑/蓝/灰文字明确区分
     font = None
-    for font_name in ("arial.ttf", "DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+    for font_name in (
+        "arial.ttf",
+        "DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ):
         try:
             font = ImageFont.truetype(font_name, 20)
             break
@@ -832,8 +864,13 @@ def _draw_som_grid(
 
     _lg.getLogger(__name__).info(
         "[SoM] grid=%dx%d cells=%.0fx%.0fpx margin=%d canvas=%dx%d",
-        cols, rows, cell_w, cell_h, margin,
-        img_w + 2 * margin, img_h + 2 * margin,
+        cols,
+        rows,
+        cell_w,
+        cell_h,
+        margin,
+        img_w + 2 * margin,
+        img_h + 2 * margin,
     )
 
     return result, b64, cols, rows, margin, cell_w, cell_h
@@ -975,7 +1012,15 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
                 cropped = cropped.convert("RGB")
 
             # SoM 网格：画网格 + 外扩标签 → 编码
-            grid_pil, img_base64, grid_cols, grid_rows, grid_margin, grid_cell_w, grid_cell_h = _draw_som_grid(cropped)
+            (
+                grid_pil,
+                img_base64,
+                grid_cols,
+                grid_rows,
+                grid_margin,
+                grid_cell_w,
+                grid_cell_h,
+            ) = _draw_som_grid(cropped)
             img_w, img_h = grid_pil.size  # 含外扩 margin
 
             # 坐标映射：device = crop_offset + vision_coord（零缩放，零精度损失）
@@ -985,7 +1030,15 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             _logger.info(
                 "[vision_tap] CROPPED mode: crop=(%d,%d,%d,%d) img=%dx%d "
                 "(device=%dx%d) desc=%s",
-                cx1, cy1, cx2, cy2, img_w, img_h, dev_w, dev_h, description,
+                cx1,
+                cy1,
+                cx2,
+                cy2,
+                img_w,
+                img_h,
+                dev_w,
+                dev_h,
+                description,
             )
         else:
             # ── 全屏模式：压缩快照（visual_check 也用这条路径） ──
@@ -1001,7 +1054,15 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             # SoM 网格：解码压缩快照 → 画网格 → 重新编码
             snap_bytes = base64.b64decode(img_base64)
             snap_pil = Image.open(BytesIO(snap_bytes))
-            grid_pil, img_base64, grid_cols, grid_rows, grid_margin, grid_cell_w, grid_cell_h = _draw_som_grid(snap_pil)
+            (
+                grid_pil,
+                img_base64,
+                grid_cols,
+                grid_rows,
+                grid_margin,
+                grid_cell_w,
+                grid_cell_h,
+            ) = _draw_som_grid(snap_pil)
             img_w, img_h = grid_pil.size  # 含外扩 margin
 
             # 坐标映射：device = vision_coord * scale
@@ -1012,7 +1073,11 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
 
             _logger.info(
                 "[vision_tap] FULLSCREEN mode: snapshot=%dx%d (device=%dx%d) desc=%s",
-                img_w, img_h, dev_w, dev_h, description,
+                img_w,
+                img_h,
+                dev_w,
+                dev_h,
+                description,
             )
 
         # 5) SoM 网格 prompt：模型只做语义指认（认格子），不做几何估算
@@ -1056,7 +1121,9 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
 
     if cell_ref is None:
         # 宽容解析全部失败 → 尝试 fallback 像素模式
-        _logger.warning("[vision_tap] SoM cell parse failed, data=%s, fallback pixel", data)
+        _logger.warning(
+            "[vision_tap] SoM cell parse failed, data=%s, fallback pixel", data
+        )
         if "x" not in data or "y" not in data:
             ctx._vision_tap_fail_streak = streak + 1
             return make_result(ERROR, "vision 返回格式无效（无法解析格子引用或 x/y）")
@@ -1065,7 +1132,9 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             raw_y = int(data["y"])
         except (ValueError, TypeError):
             ctx._vision_tap_fail_streak = streak + 1
-            return make_result(ERROR, f"vision 返回坐标非整数: x={data.get('x')} y={data.get('y')}")
+            return make_result(
+                ERROR, f"vision 返回坐标非整数: x={data.get('x')} y={data.get('y')}"
+            )
         # fallback x/y 是外扩坐标系，需减去 margin 回到原图空间
         x_img = max(0, min(img_w - 2 * grid_margin, raw_x - grid_margin))
         y_img = max(0, min(img_h - 2 * grid_margin, raw_y - grid_margin))
@@ -1087,19 +1156,33 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
     # 详细日志
     _logger.info(
         "[vision_tap] SoM: img=(%d,%d) → dev=(%d,%d)%s reason=%s",
-        x_img, y_img, x, y, cell_note, reason,
+        x_img,
+        y_img,
+        x,
+        y,
+        cell_note,
+        reason,
     )
 
     # click_xy 使用 adb shell input tap，坐标系与截图一致，无需横屏互换
     _logger.info(
         "[vision_tap] 点击坐标: (%d, %d) dev=%dx%d img=%dx%d landscape=%s",
-        x, y, dev_w, dev_h, img_w, img_h, dev_w > dev_h,
+        x,
+        y,
+        dev_w,
+        dev_h,
+        img_w,
+        img_h,
+        dev_w > dev_h,
     )
 
     # 9) 执行点击（使用设备坐标），支持 repeat 批量连点
     actual_repeat = max(1, int(repeat))
     _logger.info(
-        "[vision_tap] 最终点击坐标: (%d, %d) repeat=%d", x, y, actual_repeat,
+        "[vision_tap] 最终点击坐标: (%d, %d) repeat=%d",
+        x,
+        y,
+        actual_repeat,
     )
     for _i in range(actual_repeat):
         ctx.device.click_xy(x, y)
@@ -1112,9 +1195,17 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
     mode_note = " [裁剪模式]" if crop_bounds else " [全屏模式]"
     repeat_note = f" 连点{actual_repeat}次" if actual_repeat > 1 else ""
     base_msg = "已点击设备坐标({x},{y}) [图坐标({x_img},{y_img})]{cell}{mode} reason={reason}{repeat}".format(
-        x=x, y=y, x_img=x_img, y_img=y_img,
-        cell=cell_note, mode=mode_note, reason=reason, repeat=repeat_note,
+        x=x,
+        y=y,
+        x_img=x_img,
+        y_img=y_img,
+        cell=cell_note,
+        mode=mode_note,
+        reason=reason,
+        repeat=repeat_note,
     )
+    verify_decision = ""
+    verify_evidence = ""
 
     # ── verify 闭环：点击后用新截图验证 ──
     if verify:
@@ -1134,8 +1225,12 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             )
             if vr.get("ok"):
                 vd = vr.get("data") or {}
-                v_decision = vd.get("decision", "unknown")
-                v_evidence = vd.get("evidence", "")
+                v_decision = str(vd.get("decision", "unknown") or "unknown").lower()
+                if v_decision not in {"yes", "no", "unknown"}:
+                    v_decision = "unknown"
+                v_evidence = str(vd.get("evidence", "") or "")
+                verify_decision = v_decision
+                verify_evidence = v_evidence
                 # 缓存 evidence 供下次 vision_tap 参考
                 ctx._vision_tap_last_evidence = v_evidence
                 base_msg += (
@@ -1145,11 +1240,14 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
                 )
                 _logger.info(
                     "[vision_tap] verify: decision=%s evidence=%s",
-                    v_decision, v_evidence,
+                    v_decision,
+                    v_evidence,
                 )
             else:
+                verify_decision = "unknown"
                 base_msg += f"\nverify=vision 调用失败: {vr.get('error', 'unknown')}"
         except Exception as exc:
+            verify_decision = "unknown"
             base_msg += f"\nverify=截图或验证异常: {exc}"
             _logger.warning("[vision_tap] verify 异常: %s", exc)
 
@@ -1160,7 +1258,11 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
             f"\n如果目标值未改变，请调整 description 后重试。"
         )
 
-    return make_result(OK, base_msg)
+    evidence = {
+        "verify_decision": verify_decision,
+        "verify_evidence": verify_evidence,
+    }
+    return make_result(OK, base_msg, evidence)
 
 
 # ═══ click_and_check：点击后立即截图验证（捕获 toast 等瞬态 UI） ═══
@@ -1235,7 +1337,9 @@ def click_and_check(label: str, check_description: str, wait_ms: int = 500) -> s
 
     _logger.info(
         "[click_and_check] '%s' → decision=%s reason=%s",
-        label, decision, reason,
+        label,
+        decision,
+        reason,
     )
     return make_result(
         OK,

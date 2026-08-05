@@ -44,7 +44,9 @@ class TestState(TypedDict, total=False):
     llm_call_count: int
     tool_call_400_count: int
     tool_call_400_rate: float
-    token_usage: dict  # O1: 单次运行 token 消耗汇总（input/output/total/cached/llm_calls）
+    token_usage: (
+        dict  # O1: 单次运行 token 消耗汇总（input/output/total/cached/llm_calls）
+    )
     _tool_calls_log: list  # 工具调用实时日志（存入 state，不依赖 ctx）
     _finalization_hint_injected: bool
     _rag_injected_once: bool
@@ -59,3 +61,8 @@ class TestState(TypedDict, total=False):
     _source_run_id: str | None
     _source_case_id: str | None
     _execution_plan_revision: int
+    _replay_step_idx: int
+    _replay_mode: str
+    _replay_input_actuals: dict[str, str]
+    _replay_recovery_used: int
+    _replay_nav_streak: int

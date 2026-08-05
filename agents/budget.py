@@ -61,5 +61,32 @@ def _calc_budget(goal: dict) -> dict[str, int]:
     }
 
 
+def _replay_key_actions(goal: dict) -> list:
+    """取 v4/v3 execution_plan 的 key_actions；无则空列表。"""
+    if not isinstance(goal, dict):
+        return []
+    plan = goal.get("execution_plan")
+    if not isinstance(plan, dict):
+        return []
+    if plan.get("schema_version") == 4:
+        effective = plan.get("effective")
+        actions = (effective or {}).get("key_actions") if isinstance(effective, dict) else []
+    else:
+        actions = plan.get("key_actions")
+    return [a for a in (actions or []) if isinstance(a, dict)]
+
+
 def _calc_budget_from_state(state: dict) -> dict[str, int]:
-    return _calc_budget(state.get("goal_description", {}) or {})
+    goal = state.get("goal_description", {}) or {}
+    budget = _calc_budget(goal)
+    # 回放模式：主图每 iteration 只推进 1 个脚本步骤（one_step / 直执），
+    # 迭代预算必须覆盖脚本长度 + recovery 预算 + entry 对齐/收尾余量，
+    # 否则 26 步脚本会在默认 cap(≤40) 内被 route_after_agent 提前收敛。
+    if str(state.get("_run_type", "") or "") == "rerun":
+        actions = _replay_key_actions(goal)
+        if actions:
+            recovery_budget = int(goal.get("replay_recovery_budget", 3) or 3)
+            budget["max_agent_iterations"] = min(
+                len(actions) + max(1, recovery_budget) + 4, 80
+            )
+    return budget

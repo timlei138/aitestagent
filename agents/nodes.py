@@ -8,11 +8,13 @@ build_graph 也以延迟 import 方式引用本模块，避免加载期循环依
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import logging
 import os
 import re
+import secrets
 from datetime import datetime
 from typing import Any, Annotated
 
@@ -61,6 +63,7 @@ from agents.llm_runtime import (
     _build_tool_target,
     _call_retry,
     _ensure_device_alive,
+    _execute_replay_tool,
     _llm_cfg,
     _run_agent,
 )
@@ -184,7 +187,304 @@ def _load_prompt(name: str) -> str:
 
 
 PLANNER_SYSTEM = _load_prompt("planner.txt")
-AGENT_SYSTEM = _load_prompt("agent.txt")
+AGENT_SYSTEM = (
+    _load_prompt("agent_common.txt") + "\n" + _load_prompt("agent_explore.txt")
+)
+REPLAY_AGENT_SYSTEM = (
+    _load_prompt("agent_common.txt") + "\n" + _load_prompt("agent_replay.txt")
+)
+
+
+def _extract_activity_name(activity: str) -> str:
+    text = str(activity or "").strip()
+    return text.split(".")[-1] if text else ""
+
+
+def _effective_replay_plan(goal_desc: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(goal_desc, dict):
+        return None
+    plan = goal_desc.get("execution_plan")
+    if not isinstance(plan, dict):
+        return None
+    if plan.get("schema_version") == 4:
+        effective = plan.get("effective")
+        if isinstance(effective, dict) and effective.get("schema_version") == 4:
+            return effective
+        return None
+    if isinstance(plan.get("key_actions"), list):
+        return plan
+    return None
+
+
+def _effective_replay_actions(goal_desc: dict[str, Any]) -> list[dict[str, Any]]:
+    effective = _effective_replay_plan(goal_desc)
+    if not isinstance(effective, dict):
+        return []
+    actions = effective.get("key_actions") or []
+    if not isinstance(actions, list):
+        return []
+    return [item for item in actions if isinstance(item, dict)]
+
+
+def _has_replay_actions(state: TestState) -> bool:
+    if str(state.get("_run_type", "") or "") != "rerun":
+        return False
+    return bool(_effective_replay_actions(state.get("goal_description", {}) or {}))
+
+
+def _select_agent_system(state: TestState) -> str:
+    return REPLAY_AGENT_SYSTEM if _has_replay_actions(state) else AGENT_SYSTEM
+
+
+def _get_actual_text(original_text: str, actuals: dict[str, str]) -> str:
+    if original_text not in actuals:
+        actuals[original_text] = original_text + "_" + secrets.token_hex(2)
+    return actuals[original_text]
+
+
+def _resolve_action_texts(
+    action: dict[str, Any], actuals: dict[str, str]
+) -> dict[str, Any]:
+    resolved = copy.deepcopy(action)
+    for original, actual in actuals.items():
+        for holder, key in (
+            (resolved.get("tool_input"), "text"),
+            (resolved.get("preferred_locator"), "label"),
+            (resolved.get("postcondition"), "expected_value"),
+            (resolved.get("args"), "text"),
+        ):
+            if isinstance(holder, dict) and holder.get(key) == original:
+                holder[key] = actual
+    return resolved
+
+
+def _replay_tool_instruction(action: dict[str, Any]) -> str:
+    tool = str(action.get("tool") or "")
+    if tool == "click":
+        locator = action.get("preferred_locator") or {}
+        if isinstance(locator, dict):
+            args = ", ".join(
+                f"{k}={v!r}" for k, v in locator.items() if v not in (None, "", [])
+            )
+            return f"click({args})" if args else "click(label='')"
+    tool_input = dict(action.get("tool_input") or action.get("args") or {})
+    if isinstance(tool_input, dict):
+        # vision_verify 通道：canvas 值弹窗期不在 UI 树，执行时把 expected_value
+        # 转成 verify 描述交给 vision 模型判定，结论经 verify_decision evidence 回读
+        post = action.get("postcondition") or {}
+        expected_value = str(post.get("expected_value", "") or "")
+        if (
+            tool == "vision_tap"
+            and str(action.get("postcondition_channel", "") or "") == "vision_verify"
+            and expected_value
+        ):
+            tool_input.setdefault("verify", f"当前页面是否显示 {expected_value}")
+        args = ", ".join(
+            f"{k}={v!r}" for k, v in tool_input.items() if v not in (None, "", [])
+        )
+        return f"{tool}({args})" if args else f"{tool}()"
+    return f"{tool}()"
+
+
+def _resolve_replay_mode(current_mode: str, precondition_match: bool) -> str:
+    """决定本 turn 的 replay_mode。
+
+    若上一 turn 已处于 recovery，则保持 recovery，避免 postcondition 失败后
+    precondition 仍匹配时被无条件覆写回 script 导致死循环。
+    仅在当前为 script 或初始状态时，根据 precondition 是否匹配决定。
+    """
+    if current_mode == "script":
+        return "script" if precondition_match else "recovery"
+    if current_mode == "recovery":
+        return "recovery"
+    return "script" if precondition_match else "recovery"
+
+
+def _build_direct_click_args(
+    preferred_locator: dict[str, Any] | None,
+    tool_input: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """为 replay direct 模式构造 click 的实际入参。
+
+    优先使用 preferred_locator 中的稳定属性（rid / label+class_name+path_contains）；
+    只有 locator 完全不稳定时才回退追加 tool_input 中的 index。
+    """
+    args = {
+        k: v
+        for k, v in (preferred_locator or {}).items()
+        if v not in (None, "", [])
+    }
+    stable = bool(
+        args.get("rid")
+        or (
+            args.get("label")
+            and args.get("class_name")
+            and args.get("path_contains")
+        )
+    )
+    if not stable:
+        _ti = tool_input or {}
+        if isinstance(_ti.get("index"), int) and _ti["index"] >= 0:
+            args["index"] = _ti["index"]
+    return args
+
+
+def _perceive_page_text(ctx: Any) -> str:
+    """感知当前页并拼接元素 label 文本。失败返回 ""（调用方自行降级）。"""
+    try:
+        if not ctx or not getattr(ctx, "perceiver", None):
+            return ""
+        u = ctx.perceiver.perceive()
+        return " ".join(
+            str(getattr(e, "label", "") or "").strip()
+            for e in (getattr(u, "elements", None) or [])
+            if str(getattr(e, "label", "") or "").strip()
+        )
+    except Exception:
+        return ""
+
+
+def _build_replay_system_instruction(
+    *,
+    action: dict[str, Any],
+    idx: int,
+    total: int,
+    current_activity: str,
+    mode: str,
+    recovery_used: int,
+    recovery_budget: int,
+) -> str:
+    pre = action.get("precondition") or {}
+    expected_activity = str(pre.get("expected_activity", "") or "")
+    if mode == "script":
+        post = action.get("postcondition") or {}
+        return (
+            f"## REPLAY_SCRIPT_STEP [{idx + 1}/{total}]\n"
+            f"当前页面={current_activity or 'unknown'}，脚本前置页面={expected_activity or 'unknown'}。\n"
+            "严格按以下操作执行，不要自由探索：\n"
+            f"- tool: {action.get('tool', '')}\n"
+            f"- instruction: {_replay_tool_instruction(action)}\n"
+            f"- postcondition: {post!r}\n"
+            "执行后等待系统判定是否推进到下一步。"
+        )
+    return (
+        "## REPLAY_RECOVERY\n"
+        f"当前页面={current_activity or 'unknown'}，脚本期望页面={expected_activity or 'unknown'}，"
+        f"当前目标步骤={idx + 1}/{total}。\n"
+        f"已使用 recovery 步数={recovery_used}/{recovery_budget}。\n"
+        "请优先使用确定性工具恢复路径（click 带 rid 或 index、get_screen_info）。"
+    )
+
+
+# 回放直执允许的工具白名单：参数完全确定、无需主 LLM 决策。
+# 名单外的工具（如出现意外类型）自动降级到 LLM 路径。
+_REPLAY_DIRECT_TOOLS = {
+    "click",
+    "type_input",
+    "vision_tap",
+    "set_permission_intent",
+    "click_and_check",
+    "launch_app",
+    "assert_page_contains",
+    "assert_element_exists",
+    "assert_verification",
+    "report_done",
+}
+
+# 只读/导航工具：不计入脚本步骤的 tool_match 判定（跳过取 last_exec），
+# 也不因"本轮只调用了它们"而直接误烧 recovery 预算（有容忍上限）。
+_REPLAY_READ_ONLY_TOOLS = {
+    "get_screen_info",
+    "check_page_health",
+    "query_app_knowledge",
+    "visual_check",
+    "detect_popup",
+    "detect_overlay",
+}
+
+
+def _replay_business_popup_present(ctx: Any) -> bool:
+    """单发业务弹窗检测（无重试，供闸门用）：UI 树中存在含弹窗关键词的可点击按钮。"""
+    try:
+        if not ctx or not getattr(ctx, "device", None):
+            return False
+        import xml.etree.ElementTree as _ET
+
+        from tools.perceive_tools import _POPUP_KEYWORDS
+
+        root = _ET.fromstring(ctx.device.dump_hierarchy())
+        for node in root.iter():
+            if node.get("clickable") != "true":
+                continue
+            for cand in (
+                (node.get("text") or "").strip(),
+                (node.get("content-desc") or "").strip(),
+            ):
+                if cand and any(kw in cand for kw in _POPUP_KEYWORDS):
+                    return True
+        return False
+    except Exception:
+        return False
+
+
+def _replay_popup_blocks_next(
+    ctx: Any, actions: list[dict[str, Any]], idx: int, after_activity: str
+) -> bool:
+    """同宿主弹窗补盲：当前步骤判全过时调用。仅当检测到业务弹窗、且下一步
+    脚本动作期望的 Activity 不是当前页（弹窗在阻挡前进路径）时返回 True。
+    弹窗流程（下一步仍在本页操作滚轮/输入框）不触发，避免误杀脚本内弹窗。"""
+    try:
+        nxt = actions[idx + 1] if idx + 1 < len(actions) else None
+        if not isinstance(nxt, dict):
+            return False
+        nxt_pre = str(((nxt.get("precondition") or {}).get("expected_activity")) or "")
+        if not nxt_pre or (after_activity and nxt_pre in after_activity):
+            return False
+        return _replay_business_popup_present(ctx)
+    except Exception:
+        return False
+
+
+def _build_replay_verification_args(
+    action: dict[str, Any],
+    actions: list[dict[str, Any]],
+    tool_log: list[dict[str, Any]],
+    goal: dict[str, Any],
+) -> dict[str, Any]:
+    """直执 assert_verification 的诚信策略：结果不照抄历史结论，由本次运行中
+    已执行的、与该验证项关联的确定性断言（assert_page_contains/element_exists）
+    驱动；无关联客观证据时报 unknown（需人工复核），不猜测为 passed。"""
+    key = str(action.get("verify_key") or "")
+    items = [str(x or "") for x in (goal.get("verification") or [])]
+    v_idx = int(key[1:]) if key.startswith("v") and key[1:].isdigit() else -1
+    condition = items[v_idx] if 0 <= v_idx < len(items) else (key or "验证项")
+    linked_idx = {
+        i
+        for i, a in enumerate(actions)
+        if str(a.get("verify") or "") == key
+        and a.get("tool") in {"assert_page_contains", "assert_element_exists"}
+    }
+    results: list[str] = []
+    for e in tool_log or []:
+        if not isinstance(e, dict):
+            continue
+        ri = e.get("replay_step_idx", -1)
+        if isinstance(ri, int) and ri in linked_idx:
+            results.append(str(e.get("status_code", "") or ""))
+    if results and all(r == "PASS" for r in results):
+        verdict = "passed"
+    elif any(r == "FAIL" for r in results):
+        verdict = "failed"
+    else:
+        verdict = "unknown"
+    detail = f"回放直执自动上报：依据本次运行关联断言结果 {results or ['无关联断言']}"
+    return {
+        "condition": condition,
+        "result": verdict,
+        "detail": detail,
+        "verification_key": key,
+    }
+
 
 PLANNER_TEMPLATE = ChatPromptTemplate.from_messages(
     [
@@ -305,7 +605,9 @@ def _render_replay_evidence_block(goal_desc: dict[str, Any]) -> str:
     entry = effective.get("entry")
     if isinstance(entry, dict) and isinstance(entry.get("launch_app_args"), dict):
         args = entry["launch_app_args"]
-        lines.append(f"Entry reference: launch_app(package={args.get('package', '')!r}, activity={args.get('activity', '')!r}).")
+        lines.append(
+            f"Entry reference: launch_app(package={args.get('package', '')!r}, activity={args.get('activity', '')!r})."
+        )
     for index, action in enumerate(effective.get("key_actions") or [], 1):
         if not isinstance(action, dict):
             continue
@@ -314,9 +616,15 @@ def _render_replay_evidence_block(goal_desc: dict[str, Any]) -> str:
         if action.get("tool") == "click":
             locator = action.get("preferred_locator") or {}
             observed = action.get("observed_index")
-            lines.append(f"{index}. click reference locator={locator!r}; observed_index={observed!r}; precondition_activity={pre_text!r}.")
+            lines.append(
+                f"{index}. click reference locator={locator!r}; observed_index={observed!r}; precondition_activity={pre_text!r}."
+            )
         else:
-            lines.append(f"{index}. {action.get('tool', 'action')} reference; precondition_activity={pre_text!r}.")
+            tool_name = action.get("tool", "action")
+            tool_input = action.get("tool_input") or action.get("args") or {}
+            lines.append(
+                f"{index}. {tool_name} params={tool_input!r}; precondition_activity={pre_text!r}."
+            )
     return "\n".join(lines)
 
 
@@ -363,6 +671,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     # Page info（ctx 已在函数顶部获取，stop 检查在更早）
     page_info = "unknown"
     pid = ""
+    page_activity_short = ""
+    page_text_snapshot = ""
     current_app_key = ""
     n_clickable = 0
     t0 = 0
@@ -374,6 +684,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             u = ctx.perceiver.perceive()
             dt = _time.time() - t0
             act = u.activity.split(".")[-1] if u.activity else "?"
+            page_activity_short = act
             title = u.page_title or ""
             pid = act + "「" + title + "」" if title else act
             pkg = (
@@ -385,6 +696,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             # 契约：全局 [n] 与 click(index=n) 覆盖所有真实可点击元素，
             # 无文本课程格等元素不能因 label 为空而从候选池消失。
             clickable_elements = [e for e in u.elements if e.clickable]
+            page_text_snapshot = " ".join(
+                str(getattr(e, "label", "") or "").strip()
+                for e in u.elements
+                if str(getattr(e, "label", "") or "").strip()
+            )
             n_clickable = len(clickable_elements)
             n_labeled_clickable = sum(
                 bool((e.label or "").strip()) for e in clickable_elements
@@ -434,9 +750,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                     if name == "right_content" and unlabeled:
                         example = unlabeled[0]
                         example_index = clickable_elements.index(example)
-                        example_class = (
-                            (example.class_name or "").split(".")[-1] or "?"
-                        )
+                        example_class = (example.class_name or "").split(".")[-1] or "?"
                         example_path = example.context_path or "?"
                         lines.append(
                             f"  ! 右侧存在 {len(unlabeled)} 个无文本可点击元素；"
@@ -528,18 +842,182 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         if passed_items:
             hist_str += "\n\n已通过验证: " + "; ".join(passed_items)
 
+    replay_actions = _effective_replay_actions(goal)
+    replay_enabled = str(state.get("_run_type", "") or "") == "rerun" and bool(
+        replay_actions
+    )
+    replay_step_idx_raw = int(state.get("_replay_step_idx", 0) or 0)
+    replay_finished = bool(replay_actions) and replay_step_idx_raw >= len(
+        replay_actions
+    )
+    replay_step_idx = (
+        max(0, min(replay_step_idx_raw, max(len(replay_actions) - 1, 0)))
+        if replay_actions
+        else 0
+    )
+    replay_mode = str(state.get("_replay_mode", "") or "")
+    if replay_enabled and replay_mode not in {"script", "recovery"}:
+        replay_mode = "script"
+    if replay_finished:
+        replay_mode = ""
+    replay_input_actuals = dict(state.get("_replay_input_actuals", {}) or {})
+    replay_recovery_used = int(state.get("_replay_recovery_used", 0) or 0)
+    replay_recovery_budget = int(goal.get("replay_recovery_budget", 3) or 3)
+    replay_recovery_budget = max(1, replay_recovery_budget)
+    replay_instruction = ""
+    replay_action_for_turn: dict[str, Any] | None = None
+    entry_align_active = False
+    entry_align_activity = ""
+    entry_align_package = ""
+    if replay_enabled and replay_actions and not replay_finished:
+        # entry 对齐：脚本第 0 步前先确认当前页面已在入口 Activity。
+        # 首帧感知抖动或 App 恢复到非入口页时，若直接比对第 0 步 precondition
+        # 会误判 recovery，先确定性地 launch_app 对齐入口。
+        if replay_step_idx == 0:
+            _plan = _effective_replay_plan(goal) or {}
+            _entry = _plan.get("entry") if isinstance(_plan, dict) else None
+            _launch_args = (
+                _entry.get("launch_app_args") if isinstance(_entry, dict) else None
+            )
+            if isinstance(_launch_args, dict) and _launch_args.get("package"):
+                _entry_act = _extract_activity_name(
+                    str(_launch_args.get("activity", "") or "")
+                )
+                _entry_pkg = str(_launch_args.get("package", "") or "")
+                _cur_pkg = (
+                    current_app_key.split(":")[0] if ":" in current_app_key else ""
+                )
+                if _entry_act:
+                    _need_align = bool(
+                        page_activity_short
+                        and page_activity_short != "?"
+                        and _entry_act != page_activity_short
+                    )
+                else:
+                    # 录制时未记 activity（launch_app 未传）：退化为包名比对，
+                    # 仅当前前台不是目标 App 时才对齐，避免误重开
+                    _need_align = bool(_entry_pkg and _cur_pkg and _entry_pkg != _cur_pkg)
+                if _need_align:
+                    entry_align_active = True
+                    entry_align_activity = _entry_act
+                    entry_align_package = _entry_pkg
+                    replay_instruction = (
+                        f"## REPLAY_SCRIPT_STEP [entry 对齐/{len(replay_actions)}]\n"
+                        f"当前页面={page_activity_short}，脚本入口={_entry_act or _entry_pkg}。\n"
+                        "严格按以下操作执行，不要自由探索：\n"
+                        "- tool: launch_app\n"
+                        f"- instruction: launch_app(package={_launch_args.get('package')!r}, activity={_launch_args.get('activity')!r})\n"
+                        "执行后等待系统判定是否对齐到脚本入口。"
+                    )
+        if not entry_align_active:
+            replay_action_for_turn = _resolve_action_texts(
+                replay_actions[replay_step_idx], replay_input_actuals
+            )
+            if replay_action_for_turn.get(
+                "tool"
+            ) == "type_input" and replay_action_for_turn.get("inject_random_suffix"):
+                original_text = str(
+                    ((replay_action_for_turn.get("tool_input") or {}).get("text") or "")
+                )
+                if original_text:
+                    actual_text = _get_actual_text(original_text, replay_input_actuals)
+                    replay_action_for_turn = _resolve_action_texts(
+                        replay_actions[replay_step_idx], replay_input_actuals
+                    )
+                    replay_action_for_turn.setdefault("tool_input", {})[
+                        "text"
+                    ] = actual_text
+            pre = replay_action_for_turn.get("precondition") or {}
+            expected_activity = str(pre.get("expected_activity", "") or "")
+            precondition_match = bool(
+                expected_activity
+                and page_activity_short
+                and expected_activity in page_activity_short
+            )
+            # 尊重上一 turn 留下的 recovery 状态。若上一 turn 因 postcondition 失败进入
+            # recovery，本 turn 的 precondition 可能仍匹配当前页面；若此时无条件覆写为
+            # script，会再次以相同 direct action 执行同一失败步骤，形成死循环。
+            replay_mode = _resolve_replay_mode(replay_mode, precondition_match)
+            replay_instruction = _build_replay_system_instruction(
+                action=replay_action_for_turn,
+                idx=replay_step_idx,
+                total=len(replay_actions),
+                current_activity=page_activity_short,
+                mode=replay_mode,
+                recovery_used=replay_recovery_used,
+                recovery_budget=replay_recovery_budget,
+            )
+
+    # ── G: replay 直执计划（executor=direct 且 script 模式时，跳过主 LLM）──
+    direct_tool_name = ""
+    direct_tool_args: dict[str, Any] = {}
+    if (
+        replay_enabled
+        and str(getattr(cfg, "replay_executor", "llm") or "llm").lower() == "direct"
+        and replay_mode == "script"
+        and not replay_finished
+    ):
+        if entry_align_active:
+            _plan = _effective_replay_plan(goal) or {}
+            _entry = _plan.get("entry") if isinstance(_plan, dict) else None
+            _launch = (
+                _entry.get("launch_app_args") if isinstance(_entry, dict) else None
+            ) or {}
+            direct_tool_name = "launch_app"
+            direct_tool_args = {
+                "package": str(_launch.get("package", "") or ""),
+                "activity": str(_launch.get("activity", "") or ""),
+            }
+        elif replay_action_for_turn is not None:
+            direct_tool_name = str(replay_action_for_turn.get("tool") or "")
+            if direct_tool_name == "click":
+                direct_tool_args = _build_direct_click_args(
+                    replay_action_for_turn.get("preferred_locator"),
+                    replay_action_for_turn.get("tool_input"),
+                )
+            elif direct_tool_name == "assert_verification":
+                direct_tool_args = _build_replay_verification_args(
+                    replay_action_for_turn,
+                    replay_actions,
+                    state.get("_tool_calls_log", []) or [],
+                    goal,
+                )
+            else:
+                direct_tool_args = dict(
+                    replay_action_for_turn.get("tool_input")
+                    or replay_action_for_turn.get("args")
+                    or {}
+                )
+                if direct_tool_name == "vision_tap":
+                    _post = replay_action_for_turn.get("postcondition") or {}
+                    _ev = str(_post.get("expected_value", "") or "")
+                    if (
+                        str(
+                            replay_action_for_turn.get("postcondition_channel", "") or ""
+                        )
+                        == "vision_verify"
+                        and _ev
+                    ):
+                        direct_tool_args.setdefault(
+                            "verify", f"当前页面是否显示 {_ev}"
+                        )
+
     # Messages — always include goal + page for context
     msgs = list(state.get("messages", []))
     if not msgs:
-        msgs = [SystemMessage(content=AGENT_SYSTEM)]
+        msgs = [SystemMessage(content=_select_agent_system(state))]
         replay_block = _render_replay_evidence_block(state.get("goal_description", {}))
         if replay_block:
             msgs.append(SystemMessage(content=replay_block))
+    if replay_instruction:
+        msgs.append(SystemMessage(content=replay_instruction))
     used_tool_calls_before = len(state.get("_tool_calls_log", []) or [])
     remaining_tool_budget = budget["max_tool_calls_total"] - used_tool_calls_before
     finalization_hint_injected = bool(state.get("_finalization_hint_injected", False))
-    force_query_hint = _should_force_query_app_knowledge(
-        state, include_rag, rag_summary
+    force_query_hint = (
+        False
+        if replay_enabled
+        else _should_force_query_app_knowledge(state, include_rag, rag_summary)
     )
     knowledge_query_hint_injected = bool(
         state.get("_knowledge_query_hint_injected", False)
@@ -613,7 +1091,12 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "",
             )
         )
-    if current_app_key and current_app_key != last_page_app_key and last_page_app_key:
+    if (
+        (not replay_enabled)
+        and current_app_key
+        and current_app_key != last_page_app_key
+        and last_page_app_key
+    ):
         _as = (
             f"已进入新应用上下文（{current_app_key}），如不确定下一步，优先调用 "
             f'query_app_knowledge(query="当前页面下一步", app_package="{effective_app_package}")。'
@@ -653,23 +1136,59 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             + (
                 "\n\nKnowledge Policy:\n默认不预置场景知识。若不确定下一步，"
                 "优先调用 query_app_knowledge(query, app_package) 获取当前场景知识。"
-                if not include_rag
+                if (not include_rag and not replay_enabled)
                 else ""
             )
             + ("\n\nRAG:\n" + rag_summary if rag_summary else "")
         )
     )
 
-    result, tool_calls_log, loop_meta = _run_agent(
-        msgs,
-        AGENT_TOOLS,
-        llm["provider"],
-        llm["model"],
-        llm["api_key"],
-        llm["base_url"],
-        max_turns=budget["max_turns_per_iteration"],
-        run_id=config.get("configurable", {}).get("thread_id", "unknown"),
-    )
+    _direct_entry: dict[str, Any] | None = None
+    if direct_tool_name and direct_tool_name in _REPLAY_DIRECT_TOOLS:
+        # G: 确定性直执——脚本步骤参数完整，无需主 LLM 复述
+        _tool_obj = next((t for t in AGENT_TOOLS if t.name == direct_tool_name), None)
+        result, _direct_entry = _execute_replay_tool(
+            _tool_obj,
+            direct_tool_name,
+            direct_tool_args,
+            run_id=config.get("configurable", {}).get("thread_id", "unknown"),
+            tool_seq=used_tool_calls_before + 1,
+        )
+        if direct_tool_name == "report_done":
+            _st = str(direct_tool_args.get("status", "done") or "done").lower()
+            _summary = str(direct_tool_args.get("summary", "") or "")
+            result = f"DONE: {_summary}" if _st == "done" else f"ABORT: {_summary}"
+        tool_calls_log = [_direct_entry]
+        loop_meta = {
+            "llm_call_count": 0,
+            "tool_call_400_count": 0,
+            "loop_detected": False,
+            "loop_pattern": "",
+            "loop_break_action": "",
+        }
+        logger.info(
+            "[replay direct] %s(%s) → %s",
+            direct_tool_name,
+            direct_tool_args,
+            str(result)[:120],
+        )
+    else:
+        if direct_tool_name:
+            logger.info(
+                "[replay direct] tool %s 不在直执白名单，降级 LLM 路径", direct_tool_name
+            )
+        result, tool_calls_log, loop_meta = _run_agent(
+            msgs,
+            AGENT_TOOLS,
+            llm["provider"],
+            llm["model"],
+            llm["api_key"],
+            llm["base_url"],
+            max_turns=budget["max_turns_per_iteration"],
+            run_id=config.get("configurable", {}).get("thread_id", "unknown"),
+            # 回放模式：工具执行一次即返回主图，由 agent_node 逐步驱动状态机
+            one_step=replay_enabled,
+        )
     prev_llm_call_count = int(state.get("llm_call_count", 0) or 0)
     prev_tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
     iter_llm_call_count = int(loop_meta.get("llm_call_count", 0) or 0)
@@ -723,6 +1242,10 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 _args = _last.get("args", {}) or {}
                 _tool_target = _build_tool_target(_tn, _args)
             break
+    if _direct_entry is not None:
+        # 直执路径没有 LLM 的 tool_calls 消息，步骤记录从直执 entry 取
+        _tool_name = str(_direct_entry.get("name", "") or "agent")
+        _tool_target = str(_direct_entry.get("target", "") or "")
     # 尝试捕获 page_to（本步骤之后下一次感知的页面）
     try:
         if ctx and ctx.perceiver and (done or abort or si == 1):
@@ -737,6 +1260,144 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         _step_duration_ms = int((_time.time() - t0) * 1000) if t0 else 0
     except NameError:
         _step_duration_ms = 0
+
+    replay_step_idx_next = replay_step_idx
+    replay_mode_next = replay_mode if replay_enabled else ""
+    replay_input_actuals_next = dict(replay_input_actuals)
+    replay_recovery_used_next = replay_recovery_used
+    replay_nav_streak_next = int(state.get("_replay_nav_streak", 0) or 0)
+    replay_source = replay_mode if replay_enabled else ""
+
+    tool_calls_log_tagged: list[dict[str, Any]] = []
+    for item in tool_calls_log:
+        if not isinstance(item, dict):
+            continue
+        tagged = dict(item)
+        tagged["replay_source"] = replay_source
+        tagged["replay_step_idx"] = replay_step_idx if replay_enabled else -1
+        tool_calls_log_tagged.append(tagged)
+
+    last_exec = None
+    for entry in reversed(tool_calls_log_tagged):
+        if entry.get("name") not in _REPLAY_READ_ONLY_TOOLS:
+            last_exec = entry
+            break
+
+    if replay_enabled and entry_align_active and not (done or abort):
+        # entry 对齐回合：launch_app 执行且落到入口 Activity → 保持 idx=0 继续 script；
+        # 否则计 recovery（消耗预算，避免入口不可达时无限对齐）
+        launch_ok = str((last_exec or {}).get("name", "") or "") == "launch_app"
+        after_activity = (
+            _extract_activity_name(
+                str((last_exec or {}).get("page_after_activity", "") or "")
+            )
+            or page_activity_short
+        )
+        if launch_ok:
+            if entry_align_activity:
+                _aligned = entry_align_activity in after_activity
+            else:
+                # 录制时无 activity：按包名判定对齐
+                _after_pkg = str((last_exec or {}).get("page_after_package", "") or "")
+                _aligned = bool(entry_align_package) and entry_align_package == _after_pkg
+        else:
+            _aligned = False
+        if _aligned:
+            replay_mode_next = "script"
+            replay_recovery_used_next = 0
+        else:
+            replay_mode_next = "recovery"
+            replay_recovery_used_next += 1
+        if replay_recovery_used_next > replay_recovery_budget:
+            abort = True
+            done = False
+            result = (
+                result.rstrip()
+                + f"\nABORT: REPLAY_RECOVERY_EXHAUSTED ({replay_recovery_used_next}/{replay_recovery_budget})"
+            )
+    elif replay_enabled and replay_action_for_turn and not (done or abort):
+        if last_exec is None and replay_mode == "script":
+            # 只读/导航轮次：本轮未执行任何业务工具（如 LLM 先 get_screen_info
+            # 复核页面）。原地重注同一步，最多容忍 2 次；超过才计 recovery，
+            # 防止把"谨慎感知"误判为偏离而误烧 recovery 预算。
+            replay_nav_streak_next += 1
+            if replay_nav_streak_next > 2:
+                replay_mode_next = "recovery"
+                replay_recovery_used_next += 1
+                replay_nav_streak_next = 0
+        else:
+            replay_nav_streak_next = 0
+            post = replay_action_for_turn.get("postcondition") or {}
+            expected_activity = str(post.get("expected_activity", "") or "")
+            after_activity = (
+                _extract_activity_name(
+                    str((last_exec or {}).get("page_after_activity", "") or "")
+                )
+                or page_activity_short
+            )
+            activity_match = (
+                bool(expected_activity)
+                and bool(after_activity)
+                and expected_activity in after_activity
+            )
+            expected_tool = str(replay_action_for_turn.get("tool", "") or "")
+            tool_match = (
+                bool(last_exec) and str(last_exec.get("name", "") or "") == expected_tool
+            )
+            expected_value = str(post.get("expected_value", "") or "")
+            channel = str(
+                replay_action_for_turn.get("postcondition_channel", "ui_text") or "ui_text"
+            )
+            value_match = True
+            if expected_value:
+                if channel == "vision_verify":
+                    value_match = (
+                        str(
+                            (last_exec or {})
+                            .get("result_evidence", {})
+                            .get("verify_decision", "")
+                        ).lower()
+                        == "yes"
+                    )
+                elif channel == "deferred_assert":
+                    value_match = True
+                else:
+                    # postcondition 语义是"动作之后"，page_text_snapshot 是动作前快照，
+                    # 必须用动作后的重新感知判定，否则 type_input 等步骤恒 false → 假 recovery
+                    post_text = _perceive_page_text(ctx) or page_text_snapshot
+                    value_match = expected_value in post_text
+
+            if replay_mode == "script":
+                if tool_match and activity_match and value_match:
+                    # 同宿主弹窗补盲：判全过但检测到阻挡前进路径的意外弹窗 → recovery
+                    if _replay_popup_blocks_next(
+                        ctx, replay_actions, replay_step_idx, after_activity
+                    ):
+                        replay_mode_next = "recovery"
+                        replay_recovery_used_next += 1
+                    else:
+                        replay_step_idx_next = replay_step_idx + 1
+                        replay_mode_next = "script"
+                        replay_recovery_used_next = 0
+                else:
+                    replay_mode_next = "recovery"
+                    replay_recovery_used_next += 1
+            else:
+                pre = replay_action_for_turn.get("precondition") or {}
+                pre_activity = str(pre.get("expected_activity", "") or "")
+                if pre_activity and after_activity and pre_activity in after_activity:
+                    replay_mode_next = "script"
+                else:
+                    replay_mode_next = "recovery"
+                    replay_recovery_used_next += 1
+
+        if replay_recovery_used_next > replay_recovery_budget:
+            abort = True
+            done = False
+            result = (
+                result.rstrip()
+                + f"\nABORT: REPLAY_RECOVERY_EXHAUSTED ({replay_recovery_used_next}/{replay_recovery_budget})"
+            )
 
     nh = list(history) + [
         {
@@ -755,11 +1416,13 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "loop_detected": bool(loop_meta.get("loop_detected")),
             "loop_pattern": str(loop_meta.get("loop_pattern", "")),
             "loop_break_action": str(loop_meta.get("loop_break_action", "")),
+            "replay_source": replay_source,
+            "replay_step_idx": replay_step_idx if replay_enabled else -1,
         }
     ]
     um: list[Any] = list(state.get("messages", []))
     if not um:
-        um = [SystemMessage(content=AGENT_SYSTEM)]
+        um = [SystemMessage(content=_select_agent_system(state))]
     um.append(AIMessage(content=result))
 
     # ═══ 操作后回呈确定性结果事实（契约：动作的事实原样回呈，不限于开关）═══
@@ -805,9 +1468,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                         _facts.append(f"匹配模式={_ev.get('match_mode', '')}(回退)")
                     if _facts:
                         post_check += "操作结果: " + "；".join(_facts) + "\n"
-                post_check += (
-                    '如果页面状态已满足验证条件，请立即调用 report_done(status="done") 报告结果。'
-                )
+                post_check += '如果页面状态已满足验证条件，请立即调用 report_done(status="done") 报告结果。'
                 post_check, violated = _clip_to_token_budget(post_check, 160)
                 if violated:
                     budget_violation_count += 1
@@ -848,7 +1509,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     # Phase 1.4: 裁剪时保留 system prompt + 带 Goal 的消息 + 最近消息
     # O2: 折叠历史 get_screen_info 大输出（config 可关闭）
     _prune_messages(
-        um, summarize_stale_screens=getattr(cfg, "context_summarize_stale_screens", True)
+        um,
+        summarize_stale_screens=getattr(cfg, "context_summarize_stale_screens", True),
     )
 
     if done or abort:
@@ -874,7 +1536,12 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "tool_call_400_count": tool_call_400_count,
                 "tool_call_400_rate": tool_call_400_rate,
                 "_tool_calls_log": list(state.get("_tool_calls_log", []))
-                + tool_calls_log,
+                + tool_calls_log_tagged,
+                "_replay_step_idx": replay_step_idx_next,
+                "_replay_mode": replay_mode_next,
+                "_replay_input_actuals": replay_input_actuals_next,
+                "_replay_recovery_used": replay_recovery_used_next,
+                "_replay_nav_streak": replay_nav_streak_next,
             }
         )
     return Command(
@@ -896,7 +1563,13 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "llm_call_count": llm_call_count,
             "tool_call_400_count": tool_call_400_count,
             "tool_call_400_rate": tool_call_400_rate,
-            "_tool_calls_log": list(state.get("_tool_calls_log", [])) + tool_calls_log,
+            "_tool_calls_log": list(state.get("_tool_calls_log", []))
+            + tool_calls_log_tagged,
+            "_replay_step_idx": replay_step_idx_next,
+            "_replay_mode": replay_mode_next,
+            "_replay_input_actuals": replay_input_actuals_next,
+            "_replay_recovery_used": replay_recovery_used_next,
+            "_replay_nav_streak": replay_nav_streak_next,
         }
     )
 
@@ -1009,6 +1682,24 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     rag_same_app_ratio = round(_rag_same_app / max(rag_total_resolved, 1), 4)
     rag_empty_hit_rate = round(_rag_empty / max(rag_total_resolved, 1), 4)
 
+    replay_entries = [
+        e
+        for e in _tool_log
+        if isinstance(e, dict)
+        and str(e.get("replay_source", "") or "") in {"script", "recovery"}
+    ]
+    script_steps = [e for e in replay_entries if e.get("replay_source") == "script"]
+    recovery_steps = [e for e in replay_entries if e.get("replay_source") == "recovery"]
+    script_hit_rate = round(len(script_steps) / max(len(replay_entries), 1), 4)
+    recovery_count = len(recovery_steps)
+    recovery_success_count = 0
+    for i, item in enumerate(replay_entries[:-1]):
+        if item.get("replay_source") != "recovery":
+            continue
+        if replay_entries[i + 1].get("replay_source") == "script":
+            recovery_success_count += 1
+    recovery_success_rate = round(recovery_success_count / max(recovery_count, 1), 4)
+
     # O1: 单次运行 token 消耗（纯观测）
     token_usage = dict(getattr(ctx, "_token_usage", {}) or {})
 
@@ -1054,7 +1745,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 run_type=state.get("_run_type", "normal"),
                 source_run_id=state.get("_source_run_id"),
                 source_case_id=state.get("_source_case_id"),
-                execution_plan_revision=int(state.get("_execution_plan_revision", 0) or 0),
+                execution_plan_revision=int(
+                    state.get("_execution_plan_revision", 0) or 0
+                ),
             )
         except Exception:
             logger.exception(
@@ -1067,7 +1760,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     fc = sum(1 for s in dd if s.get("status") == "fail")
     cc = sum(1 for s in dd if s.get("status") == "continue")
     logger.info(
-        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f click=%d exact=%d fuzzy=%d ambiguous=%d rag_q=%d rag_same=%.2f tokens(in=%d out=%d total=%d cached=%d calls=%d) conclusion=%s",
+        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f click=%d exact=%d fuzzy=%d ambiguous=%d rag_q=%d rag_same=%.2f replay(script_hit=%.2f recovery=%d recovery_success=%.2f) tokens(in=%d out=%d total=%d cached=%d calls=%d) conclusion=%s",
         execution_status,
         test_verdict,
         len(dd),
@@ -1085,6 +1778,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         ambiguous_count,
         rag_query_count,
         rag_same_app_ratio,
+        script_hit_rate,
+        recovery_count,
+        recovery_success_rate,
         int(token_usage.get("input_tokens", 0) or 0),
         int(token_usage.get("output_tokens", 0) or 0),
         int(token_usage.get("total_tokens", 0) or 0),
@@ -1119,6 +1815,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                     "rag_query_count": rag_query_count,
                     "rag_same_app_ratio": rag_same_app_ratio,
                     "rag_empty_hit_rate": rag_empty_hit_rate,
+                    "script_hit_rate": script_hit_rate,
+                    "recovery_count": recovery_count,
+                    "recovery_success_rate": recovery_success_rate,
                 },
             )
             _trace_path = write_run_trace(_trace)
@@ -1169,8 +1868,12 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
         # 在原计划基础上覆盖用户编辑的字段，保留 execution_plan 等其余字段
         edited = dict(goal)
         edited["goal"] = result.get("goal", goal.get("goal", ""))
-        edited["target_pages"] = result.get("target_pages", goal.get("target_pages", []))
-        edited["verification"] = result.get("verification", goal.get("verification", []))
+        edited["target_pages"] = result.get(
+            "target_pages", goal.get("target_pages", [])
+        )
+        edited["verification"] = result.get(
+            "verification", goal.get("verification", [])
+        )
         edited["hints"] = result.get("hints", goal.get("hints", []))
         logger.info("Plan review: user edited goal")
         return Command(update={"goal_description": edited})
@@ -1194,9 +1897,7 @@ def _summarize_stale_screen_dumps(um: list[Any]) -> None:
     与 AIMessage tool_calls 的配对（OpenAI 协议要求）。就地替换，绝不抛异常。"""
     try:
         idxs = [
-            i
-            for i, m in enumerate(um)
-            if getattr(m, "name", "") in _STALE_SCREEN_TOOLS
+            i for i, m in enumerate(um) if getattr(m, "name", "") in _STALE_SCREEN_TOOLS
         ]
         for i in idxs[:-1]:  # 保留最后一份全量
             m = um[i]

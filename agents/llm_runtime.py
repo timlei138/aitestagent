@@ -193,6 +193,132 @@ def _accumulate_token_usage(ctx, msg) -> None:
         )
 
 
+def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str = "", tool_seq: int = 0) -> tuple[str, dict[str, Any]]:
+    """回放 script 模式的确定性直接执行（不调主 LLM）。
+
+    复用 _tools_node 的核心管道：stop 检查 / 前后应用与页面签名 / 结构化
+    evidence 与 status_code 解析 / 关键操作截图 / ws 事件。刻意不含 loop
+    guard / cooldown —— 脚本步骤是确定的，防循环由 recovery 预算负责。
+    返回 (output_text, log_entry)，log_entry 字段与 _tools_node 产出一致。
+    """
+    # 延迟 import：读取 graph 的可变全局当前值（set_ws_emit_callback 会更新它）
+    from agents.graph import _ws_emit_callback
+
+    try:
+        ctx = get_tool_context()
+    except Exception:
+        ctx = None
+    if ctx and _ws_emit_callback:
+        ctx._ws_emit = _ws_emit_callback
+
+    # 用户手动停止：与 _tools_node 行为一致，立即终止
+    if ctx is not None:
+        _ev = getattr(ctx, "_stop_event", None)
+        if _ev is not None and _ev.is_set():
+            output = "ABORT: USER_STOPPED — 用户手动停止当前运行"
+            return output, {
+                "name": name,
+                "target": _build_tool_target(name, args),
+                "intent_text": "replay direct",
+                "observation": output,
+                "screenshot_path": "",
+                "tool_seq": tool_seq,
+                "tool_input": dict(args or {}),
+                "status_code": "ERROR",
+                "result_evidence": {},
+                "page_before_signature": "",
+                "page_after_signature": "",
+                "page_before_activity": "",
+                "page_after_activity": "",
+                "page_before_package": "",
+                "page_after_package": "",
+            }
+
+    page_sig_before = _build_page_signature(ctx)
+    try:
+        before_app = (
+            ctx.device.current_app() or {}
+            if ctx is not None and getattr(ctx, "device", None) is not None
+            else {}
+        )
+    except Exception:
+        before_app = {}
+    if name not in _SKIP_EMIT and ctx and getattr(ctx, "_ws_emit", None):
+        try:
+            ctx._ws_emit(
+                "tool_start",
+                {"name": name, "input": {"label": _build_tool_target(name, args)}, "intent_text": "replay direct"},
+            )
+        except Exception:
+            pass
+    try:
+        output = str(tool.invoke(args)) if tool else f"UNKNOWN_TOOL: {name}"
+    except Exception as e:
+        output = f"ERROR: {e}"
+    page_sig_after = _build_page_signature(ctx)
+    try:
+        after_app = (
+            ctx.device.current_app() or {}
+            if ctx is not None and getattr(ctx, "device", None) is not None
+            else {}
+        )
+    except Exception:
+        after_app = {}
+    # 设备断开快速终止
+    try:
+        if get_tool_context().device is None:
+            output = "ERROR: 设备已断开连接"
+    except Exception:
+        pass
+    if name not in _SKIP_EMIT and ctx and getattr(ctx, "_ws_emit", None):
+        try:
+            ctx._ws_emit("tool_end", {"name": name, "output": output[:200]})
+        except Exception:
+            pass
+    screenshot_path = ""
+    if name in _SCREENSHOT_ACTIONS and ctx and getattr(ctx, "device", None):
+        try:
+            screenshot_path = _take_step_screenshot(ctx, run_id, tool_seq)
+        except Exception:
+            screenshot_path = ""
+    result_evidence = _parse_evidence(output)
+    status_code = _extract_status_code(output)
+    if name == "report_done":
+        status_code = "OK"
+        result_evidence.setdefault(
+            "terminal_status", (args.get("status", "") or "done").lower()
+        )
+    entry: dict[str, Any] = {
+        "name": name,
+        "target": _build_tool_target(name, args),
+        "intent_text": "replay direct",
+        "observation": output[:200],
+        "screenshot_path": screenshot_path,
+        "tool_seq": tool_seq,
+        "tool_input": dict(args or {}),
+        "status_code": status_code,
+        "result_evidence": result_evidence,
+        "page_before_signature": page_sig_before,
+        "page_after_signature": page_sig_after,
+        "page_before_activity": str(before_app.get("activity", "") or ""),
+        "page_after_activity": str(after_app.get("activity", "") or ""),
+        "page_before_package": str(before_app.get("package", "") or ""),
+        "page_after_package": str(after_app.get("package", "") or ""),
+    }
+    if name == "click":
+        entry["match_mode"] = _resolve_click_match_mode(name, args, output)
+        entry["fallback_used"] = _resolve_click_fallback(output)
+        entry["fuzzy_match"] = bool(result_evidence.get("fuzzy_match", False))
+        entry["resolved_target"] = {
+            "label": result_evidence.get("resolved_label", ""),
+            "role": result_evidence.get("resolved_role", ""),
+            "rid": result_evidence.get("resolved_rid", ""),
+            "class_name": result_evidence.get("resolved_class", ""),
+            "path": result_evidence.get("resolved_path", ""),
+        }
+    return output, entry
+
+
 def _run_agent(
     messages,
     tools,
@@ -202,6 +328,7 @@ def _run_agent(
     base_url,
     max_turns=20,
     run_id: str = "",
+    one_step: bool = False,
 ) -> tuple[str, list, dict[str, Any]]:
     # 延迟 import：读取 graph 的可变全局当前值（set_ws_emit_callback 会更新它）
     from agents.graph import _ws_emit_callback
@@ -610,7 +737,11 @@ def _run_agent(
         return END if r == "tools" and s.get("_turn_count", 0) >= max_turns else r
 
     def _after_tools(s: _SubState) -> str:
-        return END if s.get("_loop_break_reason") else "llm"
+        # one_step（回放模式）：工具执行一次即返回主图，由 agent_node 逐步驱动，
+        # 不再回到 llm —— 避免多跑一轮 LLM 并触发 MAX_TURNS_EXHAUSTED 误 abort
+        if s.get("_loop_break_reason") or one_step:
+            return END
+        return "llm"
 
     g = StateGraph(_SubState)
     g.add_node("llm", llm_node)

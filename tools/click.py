@@ -476,7 +476,9 @@ def _maybe_auto_handle_permission(
         # ── intent 路径：3s 轮询监听（P0: 0.6→3.0，接住 ZUI 等慢弹窗设备）──
         # 多弹窗轮询：一次 click 后可能连续弹出多个 GrantPermissionsActivity，
         # 循环处理直到无弹窗或达上限（3 次），确保初始化阶段一串弹窗全部接住。
-        _PERMISSION_CHAIN_SAFETY_CEILING = 10  # 熔断上限，非功能上限；循环退出靠 if not info: break
+        _PERMISSION_CHAIN_SAFETY_CEILING = (
+            10  # 熔断上限，非功能上限；循环退出靠 if not info: break
+        )
         _last_result = None
         for _popup_i in range(_PERMISSION_CHAIN_SAFETY_CEILING):
             info = _detect_permission_popup(ctx, timeout=3.0)
@@ -516,7 +518,9 @@ def _maybe_auto_handle_permission(
                 time.sleep(0.3)
             except Exception:
                 logger.warning(
-                    "click: auto-click permission failed | intent=%s chain=%d", action, _popup_i + 1
+                    "click: auto-click permission failed | intent=%s chain=%d",
+                    action,
+                    _popup_i + 1,
                 )
                 return {
                     **_permission_evidence(activity, controls),
@@ -767,7 +771,11 @@ def click(
                     _format_click_log(desc, el, strategy="bounds") + tail,
                 )
             return True, _format_click_log(desc, el, strategy="bounds")
-        if rid_is_unique and rid and (exact_mode or (not _should_skip_rid_fastpath(el, desc))):
+        if (
+            rid_is_unique
+            and rid
+            and (exact_mode or (not _should_skip_rid_fastpath(el, desc)))
+        ):
             label_assoc_hit = any(
                 w and (w in label_text or w in assoc_text) for w in score_words
             )
@@ -832,19 +840,21 @@ def click(
         # A2: 开关/复选框点击后回写确定性勾选态（不让 LLM 靠截图猜）。
         _click_role = getattr(clicked_el, "role", "") if clicked_el is not None else ""
         if _click_role in ("switch", "switch_row", "checkbox", "checkbox_row"):
-            _m = re.search(r"(?:开关|勾选)状态:\s*(开启|关闭|已勾选|未勾选)", message or "")
+            _m = re.search(
+                r"(?:开关|勾选)状态:\s*(开启|关闭|已勾选|未勾选)", message or ""
+            )
             if _m:
                 evidence["checked"] = _m.group(1) in ("开启", "已勾选")
         # C: 模糊匹配（搜索词≠实际标签的语义命中）是独立事实，透传供指标统计。
         if clicked_el is not None:
             _el_label = (getattr(clicked_el, "label", "") or "").strip().lower()
             _q = (label or "").strip().lower()
-            evidence["fuzzy_match"] = bool(_el_label) and _q != _el_label and (
-                _q not in _el_label or len(_q) < len(_el_label) * 0.5
+            evidence["fuzzy_match"] = (
+                bool(_el_label)
+                and _q != _el_label
+                and (_q not in _el_label or len(_q) < len(_el_label) * 0.5)
             )
-        permission_fields = _maybe_auto_handle_permission(
-            ctx, permission_hint, label
-        )
+        permission_fields = _maybe_auto_handle_permission(ctx, permission_hint, label)
         if permission_fields:
             evidence.update(permission_fields)
         return make_result("OK", " | ".join(parts), evidence)
@@ -1004,7 +1014,7 @@ def click(
                 f"未找到可点击元素: {label}，但权限弹窗已自动处理",
                 _perm,
             )
-    # 误判防护（对应 agent.txt 第二层 #2）：NOT_FOUND 时若系统权限弹窗
+    # 误判防护（对应 agent_common/agent_replay 的权限契约）：NOT_FOUND 时若系统权限弹窗
     # 仍在（GrantPermissionsActivity 可见），把真实按钮回写给 LLM，避免它
     # 把"点空"误判成"弹窗超时"去烧 adb 兜底。
     try:
@@ -1180,7 +1190,8 @@ def _capture_page_id(ctx: Any) -> str:
                     # 内联 _is_volatile_label 逻辑
                     len(str(e.label or "").strip()) < 12
                     and any(
-                        p.search(str(e.label or "").strip()) for p in _VOLATILE_LABEL_PATTERNS
+                        p.search(str(e.label or "").strip())
+                        for p in _VOLATILE_LABEL_PATTERNS
                     )
                 )
             )

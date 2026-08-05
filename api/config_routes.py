@@ -33,6 +33,8 @@ _EDITABLE_FIELDS = (
     "vision_timeout",
     # ── 上下文历史步数 ──
     "context_history_steps",
+    # ── 回放执行器 ──
+    "replay_executor",
 )
 
 _SECRET_FIELDS = ("api_key", "embedding_api_key", "vision_api_key")
@@ -91,6 +93,7 @@ class ConfigUpdateRequest(BaseModel):
     vision_base_url: str | None = None
     vision_timeout: int | None = None
     context_history_steps: int | None = None
+    replay_executor: str | None = None
 
 
 @router.put("")

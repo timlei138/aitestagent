@@ -7,6 +7,8 @@ embedding_base_url: null
 perception_mode: ui_tree
 safety_level: strict
 click_mode: legacy
+# 回放执行器: llm=由 LLM 按脚本指令执行; direct=代码确定性直执行(默认)
+replay_executor: direct
 context_history_steps: 5
 vision_provider: openai
 vision_model: qwen3.7-plus
