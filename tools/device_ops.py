@@ -293,8 +293,13 @@ def _settle_after_action(
 def launch_app(
     package: str,
     activity: str = "",
+    force_fresh: bool = False,
 ) -> str:
-    """启动指定包名的 App 并返回已核实的到达证据。"""
+    """启动指定包名的 App 并返回已核实的到达证据。
+
+    force_fresh: 启动前先 force-stop 应用，确保从主 Activity 冷启动，
+    而非把已有 task 带到前台。回放 entry 对齐时建议为 True。
+    """
     # 延迟 import 避免加载期循环依赖（click 相关 helper 仍在 tools/__init__.py）
     from tools import _capture_page_id, _record_page_transition
     from tools.results import ERROR, OK, make_result
@@ -313,6 +318,14 @@ def launch_app(
         )
 
     _pre_page = _capture_page_id(ctx)
+    # force_fresh: 先强制停止应用，再启动，确保从主 Activity 冷启动
+    if force_fresh:
+        try:
+            ctx.device.app_stop(requested_package)
+            import time as _t
+            _t.sleep(0.3)  # 等待进程完全退出
+        except Exception:
+            pass
     try:
         if target_activity:
             ctx.device.app_start(requested_package, activity=target_activity)

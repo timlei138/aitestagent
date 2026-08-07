@@ -1079,6 +1079,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             direct_tool_args = {
                 "package": str(_launch.get("package", "") or ""),
                 "activity": str(_launch.get("activity", "") or ""),
+                "force_fresh": True,  # 强制冷启动，确保从主 Activity 开始
             }
         elif replay_action_for_turn is not None:
             direct_tool_name = str(replay_action_for_turn.get("tool") or "")
