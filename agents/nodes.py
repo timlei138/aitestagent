@@ -372,6 +372,8 @@ def _build_replay_system_instruction(
         f"当前页面={current_activity or 'unknown'}，脚本期望页面={expected_activity or 'unknown'}，"
         f"当前目标步骤={idx + 1}/{total}。\n"
         f"已使用 recovery 步数={recovery_used}/{recovery_budget}。\n"
+        "如果当前页面存在与脚本无关的弹窗/覆盖层（如导入弹窗、广告等），"
+        "优先使用 press_key(\"back\") 关闭它，然后重试脚本步骤。\n"
         "请优先使用确定性工具恢复路径（click 带 rid 或 index、get_screen_info）。"
     )
 
@@ -445,19 +447,73 @@ def _replay_popup_blocks_next(
         return False
 
 
+def _parse_vision_decision(observation: str) -> str:
+    """Task 10: 从 click_and_check / visual_check 的 observation 中提取 decision。
+
+    支持格式:
+    - click_and_check: '...[yes/no]...'
+    - visual_check JSON: '{"decision": "yes/no", ...}'
+    - verify_decision= 格式: 'verify_decision=yes/no'
+
+    返回: 'yes' / 'no' / '' (无法解析)
+    """
+    obs = str(observation or "").strip()
+    if not obs:
+        return ""
+    # click_and_check 格式: 匹配 [yes] 或 [no]
+    m = re.search(r'\[(yes|no)\]', obs, re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    # visual_check 格式: JSON 中 decision 字段
+    if obs.startswith('{'):
+        try:
+            data = json.loads(obs)
+            decision = str(data.get("decision", "") or "").lower()
+            if decision in ("yes", "no"):
+                return decision
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # verify_decision= 格式
+    m2 = re.search(r'verify_decision\s*=\s*(yes|no)', obs, re.IGNORECASE)
+    if m2:
+        return m2.group(1).lower()
+    return ""
+
+
+# Task 10: 回溯扫描范围（最近 N 个 tool_log 条目）
+# 设为 10 以覆盖 vision_tap 操作 + 多次确认弹窗的典型序列
+_VERIFICATION_LOOKBACK = 10
+# Task 10: 可提供证据的工具
+_VISION_EVIDENCE_TOOLS = ("click_and_check", "visual_check", "vision_tap")
+
+# Task 10: verify key 格式校验（^v\d+$），避免自然语言 verify 被误当 key
+# 例如 vision_tap 的 tool_input.verify = "结束分钟列当前选中值是否为53" 不应被当作 key
+_VERIFY_KEY_RE = re.compile(r"^v\d+$")
+
+
 def _build_replay_verification_args(
     action: dict[str, Any],
     actions: list[dict[str, Any]],
     tool_log: list[dict[str, Any]],
     goal: dict[str, Any],
 ) -> dict[str, Any]:
-    """直执 assert_verification 的诚信策略：结果不照抄历史结论，由本次运行中
-    已执行的、与该验证项关联的确定性断言（assert_page_contains/element_exists）
-    驱动；无关联客观证据时报 unknown（需人工复核），不猜测为 passed。"""
+    """直执 assert_verification 的诚信策略 + Task 10 证据回溯：
+
+    1. 先查关联的 assert_page_contains / assert_element_exists（结构化断言）
+    2. 若无关联断言，向前扫描最近 _VERIFICATION_LOOKBACK 步的
+       click_and_check / visual_check / vision_tap 结果，提取 decision 作为证据
+       - 2a: 优先按 verify key 精确关联（避免跨 verification 误读）
+       - 2b: 无 key 时退化为位置扫描（跳过已关联其他 key 的 action）
+    3. 仍无证据时报 unknown（需人工复核），不猜测为 passed
+
+    返回的 dict 额外包含 _evidence_source 字段，供 run_trace 指标采集。
+    """
     key = str(action.get("verify_key") or "")
     items = [str(x or "") for x in (goal.get("verification") or [])]
     v_idx = int(key[1:]) if key.startswith("v") and key[1:].isdigit() else -1
     condition = items[v_idx] if 0 <= v_idx < len(items) else (key or "验证项")
+
+    # ── 第 1 层：关联断言（assert_page_contains / assert_element_exists）──
     linked_idx = {
         i
         for i, a in enumerate(actions)
@@ -473,16 +529,67 @@ def _build_replay_verification_args(
             results.append(str(e.get("status_code", "") or ""))
     if results and all(r == "PASS" for r in results):
         verdict = "passed"
+        evidence_source = "assert"
     elif any(r == "FAIL" for r in results):
         verdict = "failed"
+        evidence_source = "assert"
     else:
         verdict = "unknown"
-    detail = f"回放直执自动上报：依据本次运行关联断言结果 {results or ['无关联断言']}"
+        evidence_source = "none"
+
+    # ── 第 2 层（Task 10）：向前扫描 click_and_check / visual_check / vision_tap ──
+    # 2a: 优先按 verify key 精确关联（避免跨 verification 误读）
+    # 2b: 无 key 时退化为最近 _VERIFICATION_LOOKBACK 步位置扫描
+    #     （跳过已关联其他 verify key 的 action，降低误关联风险）
+    if verdict == "unknown" and tool_log:
+        found_by_key = False
+        for back_entry in reversed(tool_log[-_VERIFICATION_LOOKBACK:]):
+            if not isinstance(back_entry, dict):
+                continue
+            back_name = str(back_entry.get("name", "") or "")
+            if back_name not in _VISION_EVIDENCE_TOOLS:
+                continue
+            # 通过 replay_step_idx 查找对应 action 的 verify 字段
+            back_rsi = back_entry.get("replay_step_idx", -1)
+            back_verify = ""
+            if isinstance(back_rsi, int) and 0 <= back_rsi < len(actions):
+                back_verify = str(
+                    actions[back_rsi].get("verify", "") or ""
+                )
+            # 防御性：只有 ^v\d+$ 格式才当作 verify key
+            # 自然语言 verify（如 vision_tap 的 "结束分钟列当前选中值是否为53"）不作为 key
+            is_key = bool(back_verify and _VERIFY_KEY_RE.match(back_verify))
+            # 2a: verify key 匹配 → 精确关联
+            if is_key and back_verify == key:
+                back_obs = str(back_entry.get("observation", "") or "")
+                decision = _parse_vision_decision(back_obs)
+                if decision in ("yes", "no"):
+                    verdict = "passed" if decision == "yes" else "failed"
+                    evidence_source = back_name
+                    found_by_key = True
+                    break
+            # 跳过已关联其他 verify key 的条目
+            elif is_key and back_verify != key:
+                continue
+            # 2b: 无 verify key（或非 key 格式）→ 退化为位置扫描
+            if not is_key and not found_by_key:
+                back_obs = str(back_entry.get("observation", "") or "")
+                decision = _parse_vision_decision(back_obs)
+                if decision in ("yes", "no"):
+                    verdict = "passed" if decision == "yes" else "failed"
+                    evidence_source = back_name
+                    break
+
+    detail = (
+        f"回放直执自动上报：依据本次运行"
+        f"{('关联断言结果 ' + str(results)) if evidence_source == 'assert' else (evidence_source + ' decision') if evidence_source != 'none' else '无关联证据'}"
+    )
     return {
         "condition": condition,
         "result": verdict,
         "detail": detail,
         "verification_key": key,
+        "_evidence_source": evidence_source,
     }
 
 
@@ -862,8 +969,13 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         replay_mode = ""
     replay_input_actuals = dict(state.get("_replay_input_actuals", {}) or {})
     replay_recovery_used = int(state.get("_replay_recovery_used", 0) or 0)
-    replay_recovery_budget = int(goal.get("replay_recovery_budget", 3) or 3)
-    replay_recovery_budget = max(1, replay_recovery_budget)
+    _configured_budget = int(goal.get("replay_recovery_budget", 0) or 0)
+    if _configured_budget > 0:
+        replay_recovery_budget = _configured_budget
+    elif replay_actions:
+        replay_recovery_budget = max(3, len(replay_actions) // 4)
+    else:
+        replay_recovery_budget = 3
     replay_instruction = ""
     replay_action_for_turn: dict[str, Any] | None = None
     entry_align_active = False
@@ -1153,6 +1265,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             direct_tool_args,
             run_id=config.get("configurable", {}).get("thread_id", "unknown"),
             tool_seq=used_tool_calls_before + 1,
+            replay_mode=replay_mode,
         )
         if direct_tool_name == "report_done":
             _st = str(direct_tool_args.get("status", "done") or "done").lower()
@@ -1647,6 +1760,49 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             execution_status,
         )
         execution_status = "completed"
+    # Task 8: 回放防幻觉安全闸门 —— 脚本未走完时，阻止假 passed
+    _replay_actions_guard = _effective_replay_actions(goal)
+    _replay_enabled_guard = (
+        str(state.get("_run_type", "") or "") == "rerun" and bool(_replay_actions_guard)
+    )
+    _replay_step_guard = int(state.get("_replay_step_idx", 0) or 0)
+    # 检测 report_done 是否已执行（report_done 触发 done=True 导致
+    # replay_step_idx 不会 +1，所以单靠 step_idx >= len 会误判脚本未完成）
+    _report_done_executed = any(
+        isinstance(e, dict) and str(e.get("name", "")) == "report_done"
+        for e in state.get("_tool_calls_log", [])
+    )
+    _replay_finished_guard = (
+        bool(_replay_actions_guard)
+        and (_replay_step_guard >= len(_replay_actions_guard) or _report_done_executed)
+    )
+    _guard_triggered = False
+    _guard_reason = ""
+    _strict_completion = bool(goal.get("strict_replay_completion", True))
+    if _strict_completion and _replay_enabled_guard and not _replay_finished_guard:
+        if test_verdict == "passed":
+            # 收集已执行的验证 key
+            _tool_log_guard = state.get("_tool_calls_log", [])
+            _collected_vkeys = {
+                str(e.get("result_evidence", {}).get("verification_key", ""))
+                for e in _tool_log_guard
+                if isinstance(e, dict) and str(e.get("name", "")) == "assert_verification"
+            }
+            # 检查必需的验证项
+            _goal_ver_keys = {f"v{i}" for i in range(len(_goal_v_items))} if _goal_v_items else set()
+            _missing_vkeys = _goal_ver_keys - _collected_vkeys if _goal_ver_keys else set()
+            _missing_detail = f"，缺少验证: {_missing_vkeys}" if _missing_vkeys else ""
+            _guard_reason = f"script_incomplete,step={_replay_step_guard}/{len(_replay_actions_guard)}"
+            if _missing_vkeys:
+                _guard_reason += f",missing_verifications={sorted(_missing_vkeys)}"
+            logger.warning(
+                "Reporter: replay script incomplete (step %d/%d%s) but verdict=passed → force fail",
+                _replay_step_guard,
+                len(_replay_actions_guard),
+                _missing_detail,
+            )
+            test_verdict = "failed"
+            _guard_triggered = True
     if execution_status not in ("completed",):
         test_verdict = "inconclusive"
     # 向后兼容 status
@@ -1702,6 +1858,20 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
 
     # O1: 单次运行 token 消耗（纯观测）
     token_usage = dict(getattr(ctx, "_token_usage", {}) or {})
+
+    # Task 10: 验证证据来源统计
+    _verification_evidence_sources: dict[str, int] = {}
+    for _ev_entry in _tool_log:
+        if (
+            isinstance(_ev_entry, dict)
+            and str(_ev_entry.get("name", "")) == "assert_verification"
+        ):
+            _ev_src = str(
+                _ev_entry.get("result_evidence", {}).get("_evidence_source", "") or "unknown"
+            )
+            _verification_evidence_sources[_ev_src] = (
+                _verification_evidence_sources.get(_ev_src, 0) + 1
+            )
 
     # 延迟 import：读取 graph 的可变全局当前值（set_relational_db 会更新它）
     from agents.graph import _relational_db
@@ -1818,6 +1988,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                     "script_hit_rate": script_hit_rate,
                     "recovery_count": recovery_count,
                     "recovery_success_rate": recovery_success_rate,
+                    "replay_guard_triggered": _guard_triggered,
+                    "replay_guard_reason": _guard_reason,
+                    "verification_evidence_sources": _verification_evidence_sources,
                 },
             )
             _trace_path = write_run_trace(_trace)

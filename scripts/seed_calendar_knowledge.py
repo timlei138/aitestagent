@@ -152,6 +152,32 @@ def main() -> None:
     )
     logger.info("已写入联想日历专属规则 (scope=app) #6: Toast 捕获策略")
 
+    # ── 条目七：课程表导航路径（TimetableActivity → TimetableListActivity）──
+    kb.save_curated_rule(
+        app_package="com.zui.calendar",
+        content=(
+            "课程表创建/管理的导航路径：\n"
+            "1) 从 AllInOneActivity（日历主页）进入课程表：\n"
+            "   点击 iv_more（右上角更多按钮）展开菜单 → 点击「课程表」→ 进入 TimetableActivity\n"
+            "\n"
+            "2) 从 TimetableActivity 进入课程表列表（TimetableListActivity）：\n"
+            "   点击「课程表设置」按钮 → TimetableListActivity\n"
+            "   注意：点击工具栏标题（toolbar_title）会弹出「切换课表」对话框，不是列表页\n"
+            "\n"
+            "3) 在 TimetableListActivity 中：\n"
+            "   「添加课程表」按钮用于新建课程表 → 进入 EditTimetableActivity（编辑页）\n"
+            "   已有课程表以列表形式展示，点击可进入对应课程表\n"
+            "\n"
+            "4) 工具栏「+」加号按钮（toolbar 标题旁）是「导入课程表」功能，\n"
+            "   点击后弹出「拍照导入课程表 / 图库导入课程表」面板，不是新建入口"
+        ),
+        scope="app",
+        domain="ui_interaction",
+        scenario="navigation",
+        reviewed_by="dev",
+    )
+    logger.info("已写入联想日历专属规则 (scope=app) #7: 课程表导航路径")
+
     logger.info("RAG 知识写入完成。重启服务后规则将在首轮/App 切换时自动注入 agent prompt。")
 
 

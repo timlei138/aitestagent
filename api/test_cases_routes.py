@@ -446,6 +446,105 @@ def _infer_expected_value(steps: list[dict[str, Any]], start_index: int) -> str:
     return ""
 
 
+# Task 6.1: dismiss 关键词（只匹配关闭/取消类，不匹配确认类）
+# 注意：“取消”同时覆盖“确认→取消”撤销模式（确定/保存 → 取消）
+_DISMISS_KEYWORDS = ("取消", "关闭", "Close", "返回")
+
+
+def _tag_cancellation_loops(
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Task 6.1: 取消闭环标记（仅标记，不剔除）。
+
+    检测 click/vision_tap → 点击取消/关闭类按钮且 Activity 未变化的探索闭环，
+    给相关 action 打 outcome=exploration 标签。保留完整 actions 供回放引擎使用。
+
+    已识别的模式：
+    - 打开→关闭：点击某按钮打开弹窗 → 点击取消/关闭退出
+    - 确认→取消：点击确定/保存 → 点击取消撤销（“取消”已在 _DISMISS_KEYWORDS 中）
+
+    同时检查 preferred_locator.label 和 last_observation 中的 dismiss 关键词。
+    """
+    if len(actions) < 2:
+        return actions
+    i = 0
+    while i < len(actions) - 1:
+        a1 = actions[i]
+        a2 = actions[i + 1]
+        if a1.get("tool") not in ("click", "vision_tap") or a2.get("tool") != "click":
+            i += 1
+            continue
+        # 检查 a2 是否点击了 dismiss 类按钮（label 维度 + observation 维度）
+        a2_label = str(
+            (a2.get("preferred_locator") or {}).get("label", "") or ""
+        )
+        a2_obs = str(a2.get("last_observation", "") or "")
+        _label_dismiss = any(kw in a2_label for kw in _DISMISS_KEYWORDS)
+        _obs_dismiss = any(kw in a2_obs for kw in _DISMISS_KEYWORDS)
+        a2_is_dismiss = _label_dismiss or _obs_dismiss
+
+        if not a2_is_dismiss:
+            i += 1
+            continue
+        # 检查 Activity 是否未变化
+        a1_post_activity = str(
+            (a1.get("postcondition") or {}).get("expected_activity", "") or ""
+        )
+        a2_post_activity = str(
+            (a2.get("postcondition") or {}).get("expected_activity", "") or ""
+        )
+        if a1_post_activity and a2_post_activity and a1_post_activity == a2_post_activity:
+            # 模式 1: 打开→关闭（a2 是 dismiss）
+            # 模式 2: 确认→取消（a1 是 confirm 且 a2 是 dismiss）
+            a1["outcome"] = "exploration"
+            a2["outcome"] = "exploration"
+            i += 2
+        else:
+            i += 1
+    return actions
+
+
+def _tag_dead_ends(
+    actions: list[dict[str, Any]], steps: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Task 6.2: 死胡同动作标记（仅标记，不剔除）。
+    检测 vision_tap/click 后紧跟 press_key(back) 且 Activity 未变化的模式，
+    说明该动作打开了错误弹层，属于探索性死胡同，打 outcome=dead_end 标签。
+    通过 _source_step_idx 精确关联 action 与 raw step，避免 observation 前缀误匹配。
+    """
+    if not actions or not steps:
+        return actions
+    raw_types = [str(s.get("action_type", "")) for s in steps]
+    raw_args = [s.get("tool_input") or {} for s in steps]
+    for ai, action in enumerate(actions):
+        if action.get("tool") not in ("vision_tap", "click"):
+            continue
+        si = action.get("_source_step_idx")
+        if si is None or si >= len(raw_types):
+            continue
+        # 精确匹配：校验 source step 的 tool 类型
+        if raw_types[si] != action.get("tool"):
+            continue
+        # 检查后续是否有 press_key(back)
+        for look in range(si + 1, min(si + 4, len(raw_types))):
+            if raw_types[look] == "press_key":
+                key = str(raw_args[look].get("key", "") or "").lower()
+                if key == "back":
+                    step_post = str(
+                        (action.get("postcondition") or {}).get("expected_activity", "") or ""
+                    )
+                    back_step = steps[look]
+                    back_post_activity = str(
+                        (back_step.get("page_after_activity") or "")
+                    )
+                    if step_post and back_post_activity and step_post in back_post_activity:
+                        action["outcome"] = "dead_end"
+                break
+            elif raw_types[look] in _REPLAY_BUSINESS_TOOLS:
+                break
+    return actions
+
+
 def _extract_replay_evidence(run: dict[str, Any]) -> dict[str, Any] | None:
     """Extract immutable base evidence only from a completed, passing structured run."""
     if (
@@ -598,6 +697,7 @@ def _extract_replay_evidence(run: dict[str, Any]) -> dict[str, Any] | None:
                     "verify": (
                         f"v{verify_index}" if verify_index < len(verification) else None
                     ),
+                    "_source_step_idx": idx,
                 }
             )
         elif tool in {
@@ -619,6 +719,7 @@ def _extract_replay_evidence(run: dict[str, Any]) -> dict[str, Any] | None:
                 "postcondition": post,
                 "last_observation": observation[:200],
                 "last_result": status,
+                "_source_step_idx": idx,
             }
             if tool == "type_input" and str(args.get("text") or "").strip():
                 action["inject_random_suffix"] = True
@@ -637,6 +738,9 @@ def _extract_replay_evidence(run: dict[str, Any]) -> dict[str, Any] | None:
                 action["postcondition_channel"] = "vision_verify"
             elif tool == "click_and_check":
                 action["postcondition_channel"] = "deferred_assert"
+                # Task 10: 关联下一个 verify key，供回放时精确匹配证据
+                if verify_index < len(verification):
+                    action["verify"] = f"v{verify_index}"
             elif same_activity and not expected_value:
                 action["postcondition_channel"] = "deferred_assert"
             actions.append(action)
@@ -652,6 +756,7 @@ def _extract_replay_evidence(run: dict[str, Any]) -> dict[str, Any] | None:
                     "last_result": (step.get("result_evidence") or {}).get(
                         "reported_result", "passed"
                     ),
+                    "_source_step_idx": idx,
                 }
             )
             verify_index += 1
@@ -670,6 +775,7 @@ def _extract_replay_evidence(run: dict[str, Any]) -> dict[str, Any] | None:
                     "verify": (
                         f"v{verify_index}" if verify_index < len(verification) else None
                     ),
+                    "_source_step_idx": idx,
                 }
             )
         elif tool == "report_done":
@@ -688,8 +794,12 @@ def _extract_replay_evidence(run: dict[str, Any]) -> dict[str, Any] | None:
                     "last_result": (step.get("result_evidence") or {}).get(
                         "terminal_status", "done"
                     ),
+                    "_source_step_idx": idx,
                 }
             )
+    # Task 6.1 + 6.2: 后处理标记 —— 给探索性动作打 outcome 标签（不剔除）
+    actions = _tag_cancellation_loops(actions)
+    actions = _tag_dead_ends(actions, steps)
     if not actions:
         return None
     base = {

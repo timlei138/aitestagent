@@ -684,7 +684,7 @@ def _select_agent_system(state: dict) -> str:
 - `resolve_report_rerun_entry` 补注 evidence 对旧报告无副作用（`_extract_replay_evidence` 对非 passed run 返回 None）
 
 **前置依赖**：
-- SoM 格子定位代码（`_draw_som_grid` / `_parse_cell_response`）当前在工作区未提交，实施前应先提交并回归 `tests/test_som_grid.py`，否则回放端对 vision_tap 步骤的"确定性执行"无从谈起
+- SoM 格子定位代码（`_draw_som_grid` / `_parse_cell_response`）已提交并通过 `tests/test_som_grid.py`，确保 vision_tap 步骤的确定性执行基础可用
 
 ## 5. 实施优先级
 
@@ -709,8 +709,397 @@ def _select_agent_system(state: dict) -> str:
 
 | 维度 | 改进前 | 改进后 |
 |---|---|---|
-| 回放成功率 | rerun 靠 Agent 自由探索碰运气 | ≥ 首次 run（脚本命中步骤确定性执行） |
-| token 消耗 | 与首次 run 持平（每步 LLM 推理 + 108 行探索 prompt） | 显著下降（脚本命中步骤 LLM 只确认参数；prompt 拆分后回放不携带探索规则，每步省 ~45 行 prompt token） |
-| 乱点率 | 高（Agent 自由探索） | 接近零（脚本步骤严格按 locator 执行） |
-| 恢复能力 | 无（全靠自由探索） | 有（recovery 模式 + 可配置步数限制） |
+| 回放通过率 | rerun 靠 Agent 自由探索碰运气 | 显著高于无 evidence 的自由 rerun |
+| token 消耗 | 与首次 run 持平 | rerun / 首次 run input_tokens < 0.5 |
+| 乱点率（script 模式） | 高（Agent 自由探索） | < 5%（严格按 locator 执行） |
+| 乱点率（recovery 模式） | 高 | 受 recovery budget 约束，可度量 |
+| 恢复能力 | 无（全靠自由探索） | 有（recovery 模式 + 可配置 budget） |
 | 证据链完整性 | 报告 rerun 无 evidence | 两条路径均有 evidence（Task 0 兜底） |
+
+## 7. 基于 test-20260805_135924 复跑实践的补充优化
+
+> 日期：2026-08-05
+> 本节记录 P0/P1/P2 代码修复后的实际 rerun 表现，以及针对"录制脚本含探索噪声"这一新问题的补充 Task。
+
+### 7.1 问题：代码修复已生效，但录制的脚本本身包含探索噪声
+
+#### 7.1.1 已验证的 P0/P1/P2 修复
+
+| 修复点 | 复跑表现 |
+|---|---|
+| **P1 — `iv_more` 保留** | Step 3 成功点击 `rid=com.zui.calendar:id/iv_more`，没有因无 `label` 被丢弃 |
+| **P2 — direct 模式不用 index** | Step 4 点击"课程表"使用 `label+class_name+path_contains`，成功命中；Step 3 `iv_more` 使用 rid，没有带上原始 index |
+| **P0 — recovery 不被覆写** | Step 11 "课程表设置" `NOT_FOUND` 后，后续出现 `replay_source=recovery` 的 `get_screen_info`，说明确实进入了 recovery，没有再死循环回 script |
+
+结论：**P0/P1/P2 三个代码修复均已在 test-20260805_135924 复跑中生效。**
+
+#### 7.1.2 复跑仍 `inconclusive` 的根因
+
+复跑失败不是因为回放执行层 bug，而是**录制下来的脚本本身包含了一段探索性/绕路的操作序列**，复跑时机械执行就撞上了状态不匹配：
+
+1. **Step 5–8 在"测试课程表"和"取消"之间空转两轮**  
+   首次运行时 agent 点标题只是"想看看切换课表弹窗里有没有新建入口"，然后取消。这段探索被当作关键动作录进了脚本。复跑时它忠实地重复了两遍"点标题 → 取消"，但并没推进任务。
+
+2. **Step 10 点击顶部"+"按钮打开了导入弹层**  
+   首次运行 agent 在这里发现"+"其实是"拍照导入课程表 / 图库导入课程表"，不是新建课程表。复跑直接 vision_tap 了这个"+"，于是页面被导入弹层挡住。
+
+3. **Step 11 "课程表设置" `NOT_FOUND`**  
+   因为导入弹层没关，页面上找不到"课程表设置"。这里触发了 recovery（P0 生效的证明），但 recovery 预算只有 3 次，且弹层状态下的恢复没有成功。
+
+4. **最终 `report_done` 的结论是假的**  
+   Step 16 的 `report_done` 声称三项验证都通过了，但实际上复跑根本没走到验证步骤。这是 LLM 在 recovery 耗尽后产生的幻觉式收尾，导致 verdict 是 `inconclusive` 而非 `fail`。
+
+简言之：**代码层面的 replay 引擎 bug 已修，但录到的"首次运行路径"本身不是一条干净的可回放路径。**
+
+### 7.2 Task 6：提取层脚本净化（Exploration Filtering）
+
+**目标**：让 replay plan 不再是"首次运行的动作切片"，而是"目标达成的最小充分路径"。
+
+首次 run 是探索式成功：agent 绕路、试错、最终找到正确入口。 replay 的价值在于 **用确定性动作复现验证**，不是复刻 agent 的思考过程。所以录制时应做 **"逆向剪枝"**：
+
+```
+原始 steps:  [A → B → 探索X → 撤销X → 探索Y → 撤销Y → C → D → 验证V]
+replay plan: [A → B → C → D → 验证V]
+```
+
+#### 7.2.1 取消闭环过滤（Cancellation Loop Filter）
+
+检测 **"打开弹窗/菜单 → 关闭弹窗/菜单"** 且中间没有 page activity 变化、没有验证推进的闭环，直接剔除。
+
+例如首次运行中的：
+- click `测试课程表` → get_screen_info → click `取消` → get_screen_info
+- 又 click `测试课程表` → get_screen_info → 又 click `取消` → get_screen_info
+
+**注意**：弹窗本身在 steps_json 里通常不可见（弹窗不是独立 Activity），trace 里只有两次 `get_screen_info` 都显示同一个 Activity。因此不能依赖"弹窗是否打开"这种 UI 树判断。
+
+**识别规则**（基于 observation 信号）：
+```python
+# dismiss keywords 只匹配关闭/取消类按钮，不匹配"确定"/"OK"等确认类按钮
+DISMISS_KEYWORDS = ("取消", "关闭", "Close", "返回")
+
+if action1 is click/vision_tap and action2 is click/press_key
+   and action2.observation contains any dismiss keyword
+   and action1.page_after == action2.page_after
+   and no verification reported between action1 and action2:
+       action1.outcome = "exploration"
+       action2.outcome = "exploration"
+```
+
+这样更鲁棒：不判断“弹窗是否打开”，只利用关闭/取消类动作的 observation 语义和 Activity 未变化两个稳定信号。
+
+**第一阶段实施策略（已更新）**：
+- **仅标记，不剔除**：给匹配的 action 打 `outcome=exploration` 标签，保留完整 actions
+- 回放引擎当前不读 `outcome` 字段，标记不影响回放行为
+- 通过离线分析 ≥10 条历史 run 验证标记准确率 ≥ 90% 后，方可进入自动剔除阶段
+- 实现函数：`_tag_cancellation_loops(actions)`（`api/test_cases_routes.py`）
+
+#### 7.2.2 死胡同动作过滤（Dead-end Filter）
+
+如果某个动作在首次运行中 **导致 NOT_FOUND、ERROR、或打开了一个后续必须手动关闭的错误弹层**，则不应进入 replay plan。
+
+例如：
+- `vision_tap(+按钮)` 打开了"拍照导入课程表"弹层 → 首次运行后续不得不 `press_key(back)` 关闭
+- 这种"打开错误弹层"的动作应标记为 `exploratory_dead_end`，不录制
+
+实现方式：给每个 step 打标签：
+```python
+step_outcome = "progress" | "exploration" | "dead_end" | "recovery"
+```
+
+**第一阶段实施策略（已更新）**：
+- **仅标记，不剔除**：给匹配的 action 打 `outcome=dead_end` 标签，保留完整 actions
+- `press_key(back)` 判断死胡同有风险（正常导航也常用 back），因此第一阶段只做标记
+- 通过离线分析验证标记准确率后再决定是否自动剔除
+- 实现函数：`_tag_dead_ends(actions, steps)`（`api/test_cases_routes.py`），通过 `_source_step_idx` 精确关联 action 与 raw step
+
+#### 7.2.3 重复动作合并（Deduplication）
+
+连续多次相同动作（如连续 3 次点 `取消`）合并为一次，或只保留最后一次有 page 变化的那次。
+
+#### 7.2.4 Activity 变迁图剪枝
+
+构建首次运行的 Activity 序列，检测 **回退动作**：如果某个动作让 Activity 回到已访问过的状态，且中间没有产生任何 verification 证据，则标记为 `exploration`。
+
+**通用规则**（不硬编码 Activity 列表，跨 App 可用）：
+```python
+visited_activities = []
+for action in steps:
+    after = action.page_after_activity
+    if after in visited_activities and no_verification_since(after):
+        action.outcome = "exploration"
+    visited_activities.append(after)
+```
+
+这比硬编码 `critical_path` 更通用，也能正确识别"从 `TimetableActivity` 进入 `TimetableListActivity` 又退回 `TimetableActivity`"这类探索回退。
+
+> 原文此处曾使用硬编码 `critical_path`，是反模式。已修正为通用 visited_activities 规则。
+
+#### 7.2.5 验证回溯关联（保守实现）
+
+给每个 `key_action` 关联它要支撑的 verification：
+```python
+key_action["verifies"] = ["v0"]  # 该动作是 v0 的前置或证据
+```
+
+提取时做逆向回溯，从 `assert_verification` / `assert_page_contains` 倒推，标记直接贡献验证的动作。
+
+**注意**：导航步骤（`launch_app`、点菜单进入子页面等）本身不产生 verification，但对验证是必需的。如果直接剔除"未关联 verification"的动作，会误杀导航链。因此实现上要保守：
+
+1. **只标记，不剔除**：把 `verifies` 作为可信度信号，回放时优先执行有验证关联的步骤
+2. **如需剔除，先做 forward reachability**：对被标记的步骤，检查其前置 precondition 依赖的页面是否在剩余步骤中可达；不可达时保留必要的导航步骤
+
+> 不建议在 Task 6 第一阶段就启用自动剔除，避免过度剪枝风险。先完成"标记"即可。
+
+### 7.3 Task 7：回放层弹层容错与恢复增强
+
+即使 plan 还不够干净，回放时也应更能容错。
+
+#### 7.3.1 弹层后置消解
+
+不依赖前置的"弹层检测"（定义什么是弹窗在通用场景很难），而是在 **direct click 返回 NOT_FOUND 后** 做后置消解：
+
+```python
+result = direct_click(locator)
+if result.status == "NOT_FOUND" and replay_mode == "script":
+    popup_elements = detect_overlay_or_dialog_elements()
+    if popup_elements:
+        dismiss_popup(popup_elements)  # press_key("back") 或 click 取消/关闭
+        result = retry_direct_click(locator)
+```
+
+后置消解更可靠：
+- `NOT_FOUND` 是明确信号——目标元素不在预期的无障碍树位置
+- 此时再尝试消解弹层，比提前猜测"有没有弹层"更稳
+- 对 `test-20260805_135924` 的场景，Step 11 "课程表设置" NOT_FOUND 时可以先关闭导入弹层，再重试一次
+
+#### 7.3.2 Recovery 预算动态化
+
+当前固定 3 次太紧。可按脚本长度动态：
+```python
+recovery_budget = max(3, len(key_actions) // 4)
+```
+
+#### 7.3.3 Recovery 指令增强
+
+trace 中 recovery LLM 已经有能力调用 `press_key("back")`，但它选择了 `get_screen_info`。问题不在工具库，而在于 recovery prompt 没有明确告诉它"优先关闭意外弹层"。
+
+在 recovery 指令中增加一条：
+```
+如果当前页面存在与脚本无关的弹窗/覆盖层（如"拍照导入"/"图库导入"），
+优先使用 press_key("back") 关闭它，然后重试脚本步骤。
+```
+
+这比"扩展 recovery 动作库"更直接有效，改动也更小。
+
+### 7.4 Task 8：结果层防幻觉安全闸门（P0）
+
+这是当前最严重的问题之一：脚本还没走完，agent 就 `report_done(passed)`。
+
+#### 7.4.1 实现方案
+
+在 `reporter_node` 中增加精确检查（所有回放路径最终都经过 reporter_node）：
+
+```python
+_strict = bool(goal.get("strict_replay_completion", True))
+if _strict and replay_enabled and replay_step_idx < len(key_actions):
+    # 脚本还没走完就 verdict=passed —— 一定是幻觉收尾
+    collected_vkeys = {
+        e.get("result_evidence", {}).get("verification_key", "")
+        for e in tool_calls_log
+        if e.get("name") == "assert_verification"
+    }
+    required = {f"v{i}" for i in range(len(verification_items))}
+    missing = required - collected_vkeys
+    _guard_reason = f"script_incomplete,step={step}/{total}"
+    if missing:
+        _guard_reason += f",missing_verifications={sorted(missing)}"
+    test_verdict = "failed"
+```
+
+要点：
+- verdict 统一设为 `failed`（而非 abort），附带明确原因
+- `strict_replay_completion` 配置（默认 True，可关闭）避免不干净 plan 导致全部 fail
+- verification completeness 检查：收集已执行的 verification_key 与 goal 中必需项对比
+- guard 触发原因结构化到 `run_trace.metrics`（`replay_guard_triggered` + `replay_guard_reason`）
+
+**注入点说明**：
+- 放在 `reporter_node`（而非 `_after_tools`），因为 reporter_node 是所有回放路径的最终汇合点
+- direct 模式和 LLM 模式都经过 reporter_node，一处拦截即可
+
+#### 7.4.2 效果
+
+- 直接杜绝 `inconclusive` 变假 `passed`
+- recovery 耗尽后 LLM 无法再 hallucinate 一个成功收尾
+- verdict 正确落为 `failed`，附带结构化原因
+- 用户可通过 `strict_replay_completion: false` 在用例级别关闭闸门
+
+### 7.5 实施优先级调整（基于 Review 反馈修订）
+
+> **实施顺序修订理由**：原顺序 Task 6 在 Task 2/3 之前，但 Task 6（脚本净化）依赖 Task 2/3（回放引擎）才能验证净化效果。修订为 Milestone 制，每个 Milestone 都有可度量的产出。
+
+| Milestone | 包含 Task | 产出目标 | 依赖 |
+|---|---|---|---|
+| **M1：数据正确性** | Task 0 + Task 1 | 报告 rerun 路径有完整 execution_plan；非 click 工具生成 key_action | 无 |
+| **M2：最小状态机 + 验证层** | Task 2 + Task 3 + Task 8 + Task 10 | 回放有逐步引导、步骤推进、防幻觉闸门、验证证据回溯 | M1 |
+| **M3：脚本净化 + 容错** | Task 6（**仅标记**） + Task 7 | 探索性动作打标签（不剔除）；弹层容错 + recovery 增强 | M2 |
+| **M4：优化 + 可观测** | Task 4（prompt 拆分，P2）+ Task 5（统计可观测） | prompt 分离、回放效果可量化 | M3 |
+
+**建议实施顺序**：M1 (Task 0 + 1) → M2 (Task 2 + 3 + 8 + 10) → M3 (Task 6 + 7) → M4 (Task 4 + 5)
+
+| 优先级 | Task | 预期收益 | 复杂度 | 状态 |
+|---|---|---|---|---|
+| **P0** | Task 0（打通证据链） | 不打通则所有回放优化空转 | 低 | ✅ 已实现 |
+| P0 | Task 1（修复提取层丢弃非 click 工具 + value 断言） | 不修则核心操作不在脚本里 | 低 | ✅ 已实现 |
+| **P0** | **Task 8（结果层防幻觉安全闸门）** | 杜绝假 passed，ROI 最高 | 低 | ✅ 已实现（含 `strict_replay_completion` 配置开关） |
+| P0 | Task 2（渲染补全 + 逐步脚本引导） | 解决 P2/P3b，每步都有回放指导 | 中 | ✅ 已实现 |
+| P0 | Task 3（步骤推进 + 偏离检测 + entry 对齐） | 回放有明确的步骤状态机 | 中 | ✅ 已实现 |
+| P0 | Task 6（提取层脚本净化：6.1 + 6.2） | 解决“点标题→取消”空转和死胡同动作 | 低 | ✅ 已实现（**仅标记，不剔除**） |
+| P1 | Task 7（回放层弹层容错 7.1 + recovery 预算 7.2 + 指令增强 7.3） | 提升对不完美 plan 的容错 | 中 | ✅ 已实现 |
+| P1 | Task 4a（prompt 三层拆分 + 选择器） | prompt 分离，省 token + 约束力 | 中 | ✅ 已完成 |
+| P1 | Task 4b（replay prompt 内容编写） | Agent 行为更可控 | 低 | ✅ 已完成 |
+| P2 | Task 6.4（Activity 变迁图通用剪枝） | 需要更多验证通用规则稳定性 | 中 | ❗ 待实施 |
+| P2 | Task 5（统计可观测） | 回放效果可量化 | 低 | ✅ 已实现（含 `replay_guard_triggered` + `verification_evidence_sources` 指标） |
+| **P0** | **Task 10（验证层证据回溯）** | 让直执 assert_verification 能读取 click_and_check/visual_check 的结构化 evidence | 低 | ✅ 已实现 |
+| P2 | Task 9（conditional_action） | 处理非确定性步骤（权限弹窗/网络弹层） | 中 | ❗ 未来增强 |
+
+调整理由：
+- **Task 8 提前到 P0**：实现简单，收益最高，直接杜绝假 passed
+- **Task 6 仅标记不剔除**：先打 `outcome` 标签，通过离线分析验证标记准确率后再决定是否自动剔除。准出标准：≥10 条历史 run 上标记准确率 ≥ 90%
+- **Task 8 加 `strict_replay_completion` 配置**：默认 True 可关闭，避免不干净 plan 导致全部 fail
+- **Task 1 value 断言简化**：`vision_verify` 通道降级使用简单 verify 提示（如"当前页面是否显示 {expected_value}"），不稳定时由后续 `assert_verification` 兜底，避免 vision 模型对细微文本变化的判定抖动
+- **Task 10 加入 M2**：验证层是回放通过率的直接瓶颈，实现轻量（向前扫描 tool_log），与 Task 8（防幻觉闸门）互补
+
+## 7.6 Task 10：验证层证据回溯（直执模式 assert_verification 读取 vision 证据）
+
+### 7.6.1 问题定位
+
+回放执行层已完美工作，但验证层无法自动判定，导致 rerun 拿不到 passed。根因：
+- `assert_verification` 在直执模式下只查找关联的 `assert_page_contains` / `assert_element_exists` 结果
+- 当脚本使用 `click_and_check` / `visual_check` 进行验证（而非显式 assert），直执模式的 `assert_verification` 找不到关联证据，返回 `unknown`
+
+### 7.6.2 实现方案
+
+在 `_build_replay_verification_args` 中增加两层回溯：
+
+```python
+# 第 1 层：关联断言（已有）
+linked_idx = {assert_page_contains / assert_element_exists 关联项}
+if 全部 PASS → passed
+if 任一 FAIL → failed
+
+# 第 2 层（Task 10）：向前扫描 vision 工具
+if verdict == "unknown":
+    for entry in reversed(tool_log[-5:]):  # 最近 5 步
+        if entry.name in ("click_and_check", "visual_check"):
+            decision = _parse_vision_decision(entry.observation)
+            if decision == "yes" → passed
+            if decision == "no" → failed
+```
+
+证据解析：
+- `click_and_check` 返回 `OK: 已点击.. [yes] ...` → 正则匹配 `[yes/no]`
+- `visual_check` 返回 `{"decision": "yes", ...}` → JSON 解析 decision 字段
+
+### 7.6.3 可信度映射
+
+| click_and_check / visual_check 结果 | assert_verification 返回 |
+|---|---|
+| `verify=[yes]` / `decision=yes` | `passed` |
+| `verify=[no]` / `decision=no` | `failed` |
+| 无 verify 字段 / unknown / 无法解析 | `unknown` |
+
+### 7.6.4 可观测性
+
+- 每个 assert_verification 的 tool_log entry 包含 `_evidence_source` 字段
+- 取值：`"assert"` / `"click_and_check"` / `"visual_check"` / `"none"`
+- reporter_node 汇总为 `verification_evidence_sources` 指标写入 run_trace
+
+### 7.6.5 边界处理
+
+- **关联优先级**：assert_page_contains / assert_element_exists 优先于 vision 证据
+- **扫描范围**：只扫描当前 verification 之前的最近 5 步（`_VERIFICATION_LOOKBACK = 5`）
+- **内部字段隔离**：`_evidence_source` 等 `_` 前缀字段在 `tool.invoke()` 前被剥离，不影响工具执行
+
+## 8. 实验设计
+
+### 8.1 目标定义
+
+回放场景下的成功标准不应是“≥ 首次 run”，而是可量化的相对提升：
+
+| 指标 | 定义 | 目标 |
+|---|---|---|
+| 回放通过率 | rerun verdict=passed 的占比 | 显著高于无 evidence 的自由 rerun |
+| script_hit_rate | 回放脚本步骤占比（基于工具调用数） | ≥ 70% |
+| recovery 成功率 | recovery 后回到 script 的占比 | ≥ 50% |
+| token 节省比 | rerun input_tokens / 首次 run input_tokens | < 0.5 |
+| 乱点率（script 模式） | script 步骤中 NOT_FOUND 的比例 | < 5% |
+| 乱点率（recovery 模式） | recovery 步骤中 NOT_FOUND 的比例 | 受 budget 约束 |
+
+### 8.2 失败分类
+
+回放失败应归因为以下四类之一：
+
+| 分类 | 判定条件 | 示例 |
+|---|---|---|
+| **脚本缺陷** | plan 本身不包含必需步骤 | 提取层丢弃了 type_input |
+| **环境漂移** | 页面结构与录制时不同 | Activity 变更、元素 rid 变化 |
+| **恢复失败** | recovery 预算耗尽未能回到脚本 | 弹层无法关闭、recovery budget=0 |
+| **幻觉收尾** | guard 触发，verdict 被强制为 failed | 脚本未完成时 LLM 假 report_done |
+
+### 8.3 对照组设计
+
+| 组 | 配置 | 目的 |
+|---|---|---|
+| A：无 evidence 自由 rerun | 不注入 execution_plan | 基线：自由探索的成功率 |
+| B：仅 M1（Task 0+1） | 注入完整 key_actions，无状态机 | 验证数据正确性的收益 |
+| C：M1+M2（Task 0/1/2/3/8） | 完整状态机 + 闸门 | 验证状态机的收益 |
+| D：完整方案（M1+M2+M3） | 状态机 + 标记 + 容错 | 验证容错的收益 |
+
+### 8.4 评估用例集
+
+建议至少 10-20 条不同场景的用例：
+- 简单场景：2-3 步（如“打开设置”）
+- 中等场景：5-10 步（如“创建课程表”）
+- 复杂场景：15+ 步（如“创建多门课程表”）
+- 包含弹层的场景：权限弹窗、导入弹窗
+- 包含同 Activity 步骤的场景：vision_tap 滚轮、type_input
+
+### 8.5 指标计算方式
+
+- `script_hit_rate` = script 工具调用数 / 总回放工具调用数（基于 `replay_source` 字段）
+- `recovery_success_rate` = recovery 后回到 script 的次数 / recovery 总次数（基于相邻 `replay_source` 变化）
+- `replay_guard_triggered` = guard 触发的次数 / 总 rerun 次数（基于 `run_trace.metrics`）
+
+## 9. Task 9：conditional_action（未来增强）
+
+录制步骤中有很多非确定性：
+- 权限弹窗：首次出现 vs 不再出现
+- 网络请求：加载时间、Toast 提示
+- 用户数据状态：课程表是否已存在、弹层是否首次展示
+
+当前方案靠 Task 7.1（弹层后置消解）和 recovery 模式处理，但每次都需要 LLM 调用，增加 token 消耗。
+
+### 9.1 conditional_action 设计
+
+给 action 增加 `condition` 字段，回放时由 direct executor 判断：
+
+```json
+{
+  "tool": "click",
+  "locator": {"label": "允许"},
+  "condition": {"if_element_exists": "允许"},
+  "timeout_ms": 5000
+}
+```
+
+回放时：
+1. 检查 `condition.if_element_exists` 指定的元素是否存在
+2. 存在 → 执行 action
+3. 不存在 → 跳过，推进到下一步
+4. 超时后仍未出现 → 跳过
+
+这样权限弹窗、导入弹窗等非确定性步骤可以在不进入 recovery 的情况下自动处理，减少 LLM 调用。
+
+### 9.2 实施时机
+
+待 M3（Task 6+7）完成且在实际复跑中验证效果后，再评估是否需要 conditional_action。如果 M3 的弹层容错已经足够处理大部分场景，此 Task 可延后。

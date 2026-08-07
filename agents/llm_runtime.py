@@ -193,7 +193,7 @@ def _accumulate_token_usage(ctx, msg) -> None:
         )
 
 
-def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str = "", tool_seq: int = 0) -> tuple[str, dict[str, Any]]:
+def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str = "", tool_seq: int = 0, replay_mode: str = "") -> tuple[str, dict[str, Any]]:
     """回放 script 模式的确定性直接执行（不调主 LLM）。
 
     复用 _tools_node 的核心管道：stop 检查 / 前后应用与页面签名 / 结构化
@@ -251,10 +251,30 @@ def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str
             )
         except Exception:
             pass
+    # Task 10: 剥离内部元数据字段（_ 前缀），避免传给 tool.invoke
+    _internal_meta = {k: v for k, v in (args or {}).items() if k.startswith("_")}
+    _invoke_args = {k: v for k, v in (args or {}).items() if not k.startswith("_")} if _internal_meta else dict(args or {})
     try:
-        output = str(tool.invoke(args)) if tool else f"UNKNOWN_TOOL: {name}"
+        output = str(tool.invoke(_invoke_args)) if tool else f"UNKNOWN_TOOL: {name}"
     except Exception as e:
         output = f"ERROR: {e}"
+    # Task 7.1: 弹层后置消解 —— 仅回放 script 模式下 click NOT_FOUND 时尝试 dismiss + retry
+    if (
+        name == "click"
+        and output.startswith("NOT_FOUND")
+        and replay_mode == "script"
+        and ctx is not None
+        and getattr(ctx, "device", None) is not None
+    ):
+        try:
+            logger.info("[replay popup guard] click NOT_FOUND → press_key(back) + retry")
+            from tools import press_key as _pk_tool
+            _pk_tool.invoke({"key": "back"})
+            import time as _t
+            _t.sleep(0.5)
+            output = str(tool.invoke(_invoke_args)) if tool else output
+        except Exception as _dismiss_exc:
+            logger.warning("[replay popup guard] dismiss failed: %s", _dismiss_exc)
     page_sig_after = _build_page_signature(ctx)
     try:
         after_app = (
@@ -288,6 +308,10 @@ def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str
         result_evidence.setdefault(
             "terminal_status", (args.get("status", "") or "done").lower()
         )
+    # Task 10: 透传内部元数据到 result_evidence（供 run_trace 指标采集）
+    if _internal_meta:
+        for _mk, _mv in _internal_meta.items():
+            result_evidence[_mk] = _mv
     entry: dict[str, Any] = {
         "name": name,
         "target": _build_tool_target(name, args),

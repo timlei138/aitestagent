@@ -95,6 +95,24 @@ def set_ws_emit_callback(callback) -> None:
     _ws_emit_callback = callback
 
 
+def _replay_script_incomplete(state: dict) -> bool:
+    """回放模式下脚本是否尚未走完（含尾部 cleanup / report_done）。"""
+    if str(state.get("_run_type", "") or "") != "rerun":
+        return False
+    goal = state.get("goal_description", {}) or {}
+    plan = goal.get("execution_plan") if isinstance(goal, dict) else None
+    if not isinstance(plan, dict):
+        return False
+    effective = plan.get("effective") if plan.get("schema_version") == 4 else plan
+    if not isinstance(effective, dict):
+        return False
+    actions = effective.get("key_actions") or []
+    if not actions:
+        return False
+    step_idx = int(state.get("_replay_step_idx", 0) or 0)
+    return step_idx < len(actions)
+
+
 def route_after_agent(state: TestState) -> str:
     try:
         ctx = get_tool_context()
@@ -106,8 +124,11 @@ def route_after_agent(state: TestState) -> str:
         getattr(ctx, "_verifications", []) if ctx else [],
     )
     if merged and all(str(item.get("result", "") or "") == "passed" for item in merged):
-        logger.info("Route: reporter (all verifications passed)")
-        return "reporter"
+        if not _replay_script_incomplete(state if isinstance(state, dict) else {}):
+            logger.info("Route: reporter (all verifications passed)")
+            return "reporter"
+        # 回放模式：脚本未走完（还有 cleanup / report_done），继续执行
+        logger.info("Route: agent (all passed but replay script incomplete)")
     n = len(state.get("step_history", []))
     budget = _calc_budget_from_state(state)
     if state.get("status") in ("success", "fail", "stopped"):
