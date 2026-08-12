@@ -266,3 +266,9 @@
   padding-bottom: 8px;
   border-bottom: 1px solid var(--line-light);
 }
+.settings-group .el-form-item {
+  margin-bottom: 12px;
+}
+.settings-group .el-form-item:last-child {
+  margin-bottom: 0;
+}

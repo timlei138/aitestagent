@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 
+from config import resolve_vision_credentials
 from llm.multimodal import multimodal_vision_call
 from tools.context import ToolContext, get_tool_context, set_tool_context
 from tools.text_utils import (
@@ -120,17 +121,20 @@ def _run_multimodal_from_context(
     timeout_sec: int = 30,
 ) -> dict[str, Any]:
     ctx = get_tool_context()
-    # 视觉优先用独立配置，不配则回退主模型
-    provider = ctx.vision_provider or ctx.llm_provider
-    model    = ctx.vision_model    or ctx.llm_model
-    api_key  = ctx.vision_api_key  or ctx.llm_api_key
-    base_url = ctx.vision_base_url or ctx.llm_base_url
+    # 视觉优先用独立配置；vision_base_url 与主模型不一致时视为独立端点。
+    model, api_key, base_url = resolve_vision_credentials(
+        llm_model=ctx.llm_model,
+        llm_api_key=ctx.llm_api_key,
+        llm_base_url=ctx.llm_base_url,
+        vision_model=ctx.vision_model,
+        vision_api_key=ctx.vision_api_key,
+        vision_base_url=ctx.vision_base_url,
+    )
     return multimodal_vision_call(
         prompt=prompt,
         image_base64=image_base64,
         purpose=purpose,
         strict_json=strict_json,
-        provider=provider,
         model=model,
         api_key=api_key,
         base_url=base_url,

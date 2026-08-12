@@ -1,4 +1,3 @@
-llm_provider: openai
 model: deepseek-v4-flash
 base_url: https://api.deepseek.com
 embedding_provider: huggingface
@@ -10,7 +9,8 @@ click_mode: legacy
 # 回放执行器: llm=由 LLM 按脚本指令执行; direct=代码确定性直执行(默认)
 replay_executor: direct
 context_history_steps: 5
-vision_provider: openai
+llm_vision_capable: false
+# 视觉备用模型（当主模型不是多模态时启用）
 vision_model: qwen3.7-plus
 vision_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 vision_timeout: 60

@@ -196,7 +196,6 @@ def supports_structured_output(provider: str, base_url: str | None = None) -> bo
 # ── 工厂 ──
 
 def create_llm_client(
-    provider: str,
     model: str,
     api_key: str | None,
     base_url: str | None = None,
@@ -204,18 +203,5 @@ def create_llm_client(
 ) -> LLMClient | None:
     if not api_key:
         return None
-    # 统一走 OpenAI 兼容接入：zhipu 等 provider 通过 base_url 指向其 OpenAI 兼容端点。
+    # 统一走 OpenAI 兼容接入：各厂商通过 base_url 指向其 OpenAI 兼容端点。
     return OpenAITextClient(model=model, api_key=api_key, base_url=base_url, temperature=temperature)
-
-
-def create_vlm_client(
-    provider: str,
-    model: str,
-    api_key: str | None,
-    base_url: str | None = None,
-    temperature: float = 0.1,
-) -> VLMClient | None:
-    if not api_key:
-        return None
-    # 统一走 OpenAI 兼容接入：zhipu / 多模态 provider 通过 base_url 指向其 OpenAI 兼容端点。
-    return OpenAIVisionClient(model=model, api_key=api_key, base_url=base_url, temperature=temperature)

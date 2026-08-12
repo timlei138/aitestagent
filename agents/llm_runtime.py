@@ -430,7 +430,7 @@ def _run_agent(
                 tool_call_400_count += 1
                 current_call_has_tool_400 = True
 
-        r = _call_retry("openai", lc.invoke, s["messages"], on_error=_on_llm_error)
+        r = _call_retry(lc.invoke, s["messages"], on_error=_on_llm_error)
         # O1：累计本次 LLM 调用的 token 消耗（run 级，存 ToolContext）
         _accumulate_token_usage(_ctx, r)
         return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
@@ -930,16 +930,16 @@ def _ensure_device_alive(max_retries: int = 2, wait_sec: float = 5.0) -> bool:
     return False
 
 
-def _call_retry(provider, fn, *a, on_error=None, **kw):
+def _call_retry(fn, *a, on_error=None, **kw):
     return _call_with_retry(
-        lambda e: _call_retry_should_retry(provider, e, on_error),
+        lambda e: _call_retry_should_retry(e, on_error),
         fn,
         *a,
         **kw,
     )
 
 
-def _call_retry_should_retry(provider: str, exc: Exception, on_error=None) -> bool:
+def _call_retry_should_retry(exc: Exception, on_error=None) -> bool:
     if on_error:
         try:
             on_error(exc)
@@ -953,7 +953,6 @@ def _call_retry_should_retry(provider: str, exc: Exception, on_error=None) -> bo
 
 def _llm_cfg(cfg: TestConfig):
     return {
-        "provider": cfg.llm_provider,
         "model": cfg.model,
         "api_key": cfg.api_key,
         "base_url": cfg.base_url,

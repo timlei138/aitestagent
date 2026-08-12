@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from config import TestConfig as AppTestConfig
 from agents import graph
 from agents import nodes
+from agents.llm_runtime import _call_retry_should_retry
 import tools as tools_module
 
 
@@ -201,7 +202,7 @@ def test_agent_node_accumulates_llm_call_metrics(monkeypatch):
 def test_call_retry_should_retry_triggers_on_error_callback():
     captured = []
     err = ValueError("An assistant message with 'tool_calls' must be followed by tool messages")
-    should_retry = graph._call_retry_should_retry("openai", err, on_error=lambda e: captured.append(str(e)))  # type: ignore[attr-defined]
+    should_retry = _call_retry_should_retry(err, on_error=lambda e: captured.append(str(e)))
     assert should_retry is True
     assert len(captured) == 1
 

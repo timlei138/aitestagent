@@ -4,7 +4,7 @@ import argparse
 import json
 import logging
 
-from config import TestConfig, resolve_perception_mode
+from config import TestConfig, resolve_perception_mode, resolve_vision_credentials
 from data import create_vector_store, create_relational_db
 from agents.graph import set_relational_db
 from agents.orchestrator import TestOrchestrator
@@ -65,15 +65,20 @@ def _init_tool_context(config: TestConfig) -> None:
         mode, auto_switch = resolve_perception_mode(config)
         ctx_holder: dict[str, ToolContext | None] = {"ctx": None}
 
-        # 视觉优先用独立配置，不配则回退主模型
-        v_provider = config.vision_provider or config.llm_provider
-        v_model    = config.vision_model    or config.model
-        v_api_key  = config.vision_api_key  or config.api_key
-        v_base_url = config.vision_base_url or config.base_url
+        # 视觉优先用独立配置；vision_base_url 与主模型不一致时视为独立端点，
+        # 禁止回退主模型凭证，避免把 key 发错端点。
+        v_model, v_api_key, v_base_url = resolve_vision_credentials(
+            llm_model=config.model,
+            llm_api_key=config.api_key,
+            llm_base_url=config.base_url,
+            vision_model=config.vision_model,
+            vision_api_key=config.vision_api_key,
+            vision_base_url=config.vision_base_url,
+        )
 
         logging.getLogger(__name__).info(
-            "[vision-build] provider=%s model=%s base_url=%s enabled=%s",
-            v_provider, v_model, v_base_url, bool(config.vision_model),
+            "[vision-build] model=%s base_url=%s enabled=%s",
+            v_model, v_base_url, config.vision_enabled,
         )
 
         def _vision_call(
@@ -84,11 +89,10 @@ def _init_tool_context(config: TestConfig) -> None:
                 image_base64=image_base64,
                 purpose=purpose,
                 strict_json=strict_json,
-                provider=v_provider,
                 model=v_model,
                 api_key=v_api_key,
                 base_url=v_base_url,
-                vision_enabled=bool(config.vision_model),
+                vision_enabled=config.vision_enabled,
                 timeout_sec=30,
             )
 
@@ -113,12 +117,10 @@ def _init_tool_context(config: TestConfig) -> None:
             perceiver=perceiver,
             knowledge_base=kb,
             safety_level=config.safety_level,
-            llm_provider=config.llm_provider,
             llm_model=config.model,
             llm_api_key=config.api_key,
             llm_base_url=config.base_url,
-            llm_vision_enabled=bool(config.vision_model),
-            vision_provider=config.vision_provider,
+            llm_vision_enabled=config.vision_enabled,
             vision_model=config.vision_model,
             vision_api_key=config.vision_api_key,
             vision_base_url=config.vision_base_url,

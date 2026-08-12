@@ -15,7 +15,6 @@ router = APIRouter(prefix="/api/config", tags=["config"])
 
 # 可通过前端修改的字段白名单
 _EDITABLE_FIELDS = (
-    "llm_provider",
     "model",
     "api_key",
     "base_url",
@@ -26,11 +25,11 @@ _EDITABLE_FIELDS = (
     "perception_mode",
     "safety_level",
     # ── 视觉备用模型 ──
-    "vision_provider",
     "vision_model",
     "vision_api_key",
     "vision_base_url",
     "vision_timeout",
+    "llm_vision_capable",
     # ── 上下文历史步数 ──
     "context_history_steps",
     # ── 回放执行器 ──
@@ -77,7 +76,6 @@ async def get_config():
 
 
 class ConfigUpdateRequest(BaseModel):
-    llm_provider: str | None = None
     model: str | None = None
     api_key: str | None = None
     base_url: str | None = None
@@ -87,11 +85,11 @@ class ConfigUpdateRequest(BaseModel):
     embedding_base_url: str | None = None
     perception_mode: str | None = None
     safety_level: str | None = None
-    vision_provider: str | None = None
     vision_model: str | None = None
     vision_api_key: str | None = None
     vision_base_url: str | None = None
     vision_timeout: int | None = None
+    llm_vision_capable: bool | None = None
     context_history_steps: int | None = None
     replay_executor: str | None = None
 
@@ -125,14 +123,13 @@ async def update_config(req: ConfigUpdateRequest):
         # perception_mode 或主 LLM / 视觉 凭证变更需要重建 perceiver/context
         if field in (
             "perception_mode",
-            "llm_provider",
             "model",
             "api_key",
             "base_url",
-            "vision_provider",
             "vision_model",
             "vision_api_key",
             "vision_base_url",
+            "llm_vision_capable",
         ):
             need_rebuild_perceiver = True
 

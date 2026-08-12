@@ -68,11 +68,9 @@ def _is_payload_format_error(message: str) -> bool:
 
 def _is_unsupported_error(
     message: str,
-    provider: str | None = None,
     model: str | None = None,
 ) -> bool:
     msg = (message or "").lower()
-    name = (provider or "").lower()
     model_name = (model or "").lower()
 
     keys = (
@@ -87,11 +85,9 @@ def _is_unsupported_error(
         'expected "text"',
         "failed to deserialize the json body",
     )
-    # Provider/model specific signatures for OpenAI-compatible backends (e.g. DeepSeek).
+    # Model specific signatures for OpenAI-compatible backends (e.g. DeepSeek).
     if "deepseek" in model_name or "deepseek" in msg:
         keys = keys + ("image_url", "unknown variant 'image_url'")
-    if name == "zhipu":
-        keys = keys + ("unknown variant 'image_url'",)
     return any(k in msg for k in keys)
 
 
@@ -189,7 +185,6 @@ def _invoke_openai_multimodal(
 
 
 def _invoke_multimodal(
-    provider: str,
     model: str,
     api_key: str,
     base_url: str | None,
@@ -197,7 +192,7 @@ def _invoke_multimodal(
     image_base64: str,
     timeout_sec: int,
 ) -> str:
-    # 统一走 OpenAI 兼容多模态接口（zhipu 等通过 base_url 指向其 OpenAI 兼容端点）。
+    # 统一走 OpenAI 兼容多模态接口（各厂商通过 base_url 指向其 OpenAI 兼容端点）。
     return _invoke_openai_multimodal(
         model, api_key, base_url, prompt, image_base64, timeout_sec
     )
@@ -208,7 +203,6 @@ def multimodal_vision_call(
     image_base64: str,
     purpose: str,
     strict_json: bool = True,
-    provider: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
@@ -220,9 +214,9 @@ def multimodal_vision_call(
     cap_error = cap["error"]
 
     logger.info(
-        "[vision-call] purpose=%s provider=%s model=%s base_url=%s state=%s "
+        "[vision-call] purpose=%s model=%s base_url=%s state=%s "
         "image_size=%d enabled=%s timeout_sec=%d",
-        purpose, provider, model, base_url, cap_state,
+        purpose, model, base_url, cap_state,
         len(image_base64 or ""), vision_enabled, timeout_sec,
     )
 
@@ -266,7 +260,6 @@ def multimodal_vision_call(
         probe_prompt = '请只返回 JSON: {"decision":"yes","reason":"ok"}'
         try:
             probe_text = _invoke_multimodal(
-                provider or "openai",
                 model,
                 api_key,
                 base_url,
@@ -286,7 +279,7 @@ def multimodal_vision_call(
                 cap_state = cap["state"]
         except Exception as exc:
             msg = str(exc)
-            if _is_unsupported_error(msg, provider, model):
+            if _is_unsupported_error(msg, model):
                 with _CAP_LOCK:
                     cap["state"] = "unsupported"
                     cap["error"] = msg

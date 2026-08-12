@@ -18,14 +18,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TestConfig:
     # ── LLM ──
-    llm_provider: str = "openai"
     model: str = "gpt-4o"
     api_key: str | None = None
     base_url: str | None = None
-
-    # ── 非 OpenAI 兼容提供方（如智谱）──
-    zhipu_api_key: str | None = None
-    zhipu_base_url: str | None = None
 
     # ── Embedding ──
     embedding_provider: str = "huggingface"
@@ -47,18 +42,24 @@ class TestConfig:
     langchain_debug: bool = True
 
     # ── 视觉备用模型（可选）──
-    # 配了 → 主模型不支持多模态时自动走这个模型做视觉分析
-    # 不配 → 行为与当前一致（用主模型尝试，不支持就放弃视觉）
-    # 后期多模态降价 → 注释掉 vision_* + model 改为多模态即可
+    # 当主模型不是多模态时，配置此处可让视觉能力走独立模型；
+    # 若主模型本身支持视觉，可开启下方的 llm_vision_capable。
     # ⚠️ 若将 vision_api_key 加入 config_routes._EDITABLE_FIELDS，
     #    必须同时加入 _SECRET_FIELDS，否则密钥会写入 config.yaml（已 git 跟踪）
-    vision_provider: str | None = None
     vision_model: str | None = None
     vision_api_key: str | None = None
     vision_base_url: str | None = None
+    # 主模型本身是否支持多模态/视觉。开启后即使不配置 vision_model，
+    # 也会尝试用主模型处理图片；关闭则必须配置 vision_model 才启用视觉。
+    llm_vision_capable: bool = False
     # 视觉调用超时秒数（visual_check / detect_overlay / vision_tap）
     # DashScope qwen3.7-flash 实测响应 5-20s，偶发排队超 30s，默认 60s 留余量。
     vision_timeout: int = 60
+
+    @property
+    def vision_enabled(self) -> bool:
+        """视觉是否启用：配置了独立视觉模型，或主模型本身支持视觉。"""
+        return bool(self.vision_model or self.llm_vision_capable)
 
     # ── 上下文历史步数（摘要层）──
     # agent 每轮注入的 step_history 摘要条数（原硬编码 10）
@@ -136,18 +137,9 @@ class TestConfig:
         config.api_key = config.api_key or os.getenv("OPENAI_API_KEY")
         config.base_url = config.base_url or os.getenv("OPENAI_BASE_URL")
 
-        config.zhipu_api_key = config.zhipu_api_key or os.getenv("ZHIPU_API_KEY")
-        config.zhipu_base_url = config.zhipu_base_url or os.getenv("ZHIPU_BASE_URL")
-
         # ── 视觉模型凭证回退链 ──
         config.vision_api_key = config.vision_api_key or os.getenv("VISION_API_KEY")
         config.vision_base_url = config.vision_base_url or os.getenv("VISION_BASE_URL")
-
-        # 默认 LLM → zhipu
-        if config.llm_provider.lower() == "zhipu" and not config.api_key:
-            config.api_key = config.zhipu_api_key
-        if config.llm_provider.lower() == "zhipu":
-            config.base_url = config.base_url or config.zhipu_base_url
 
         config.langchain_debug = str(
             os.getenv("LANGCHAIN_DEBUG", str(config.langchain_debug))
@@ -191,19 +183,25 @@ class TestConfig:
     @classmethod
     def _log_provider_summary(cls, config: "TestConfig") -> None:
         logger.info(
-            "[llm] provider=%s model=%s base_url=%s api_key=%s",
-            config.llm_provider,
+            "[llm] model=%s base_url=%s api_key=%s",
             config.model,
             config.base_url or "<default>",
             cls._mask_secret(config.api_key),
         )
-        if config.vision_model:
+        if config.vision_model or config.llm_vision_capable:
+            v_model, v_api_key, v_base_url = resolve_vision_credentials(
+                llm_model=config.model,
+                llm_api_key=config.api_key,
+                llm_base_url=config.base_url,
+                vision_model=config.vision_model,
+                vision_api_key=config.vision_api_key,
+                vision_base_url=config.vision_base_url,
+            )
             logger.info(
-                "[vision] provider=%s model=%s base_url=%s api_key=%s",
-                config.vision_provider or config.llm_provider,
-                config.vision_model,
-                config.vision_base_url or "<default>",
-                cls._mask_secret(config.vision_api_key),
+                "[vision] model=%s base_url=%s api_key=%s",
+                v_model,
+                v_base_url or "<default>",
+                cls._mask_secret(v_api_key),
             )
 
     @classmethod
@@ -232,6 +230,38 @@ class TestConfig:
         )
         root.addHandler(fh)
         logger.info("Service log file: %s", app_paths.SERVICE_LOG)
+
+
+def resolve_vision_credentials(
+    *,
+    llm_model: str | None,
+    llm_api_key: str | None,
+    llm_base_url: str | None,
+    vision_model: str | None,
+    vision_api_key: str | None,
+    vision_base_url: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """解析视觉调用真正要使用的 model/api_key/base_url。
+
+    规则：
+    - model：vision_model 优先，否则回退主模型 model。
+    - api_key / base_url：
+      - 如果 vision_base_url 显式设置且与 llm_base_url 不同，视为独立视觉端点，
+        仅使用 vision_api_key / vision_base_url，不回退主模型凭证。
+      - 否则视为同一端点，vision_api_key / vision_base_url 可回退到主模型。
+    """
+    effective_model = vision_model or llm_model
+
+    separate_endpoint = bool(vision_base_url and vision_base_url != llm_base_url)
+
+    if separate_endpoint:
+        effective_api_key = vision_api_key
+        effective_base_url = vision_base_url
+    else:
+        effective_api_key = vision_api_key or llm_api_key
+        effective_base_url = vision_base_url or llm_base_url
+
+    return effective_model, effective_api_key, effective_base_url
 
 
 def resolve_perception_mode(config: TestConfig) -> tuple[str, bool]:

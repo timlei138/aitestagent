@@ -15,14 +15,12 @@ class ToolContext:
     knowledge_base: Any | None = None
     relational_db: Any = None  # V2: 注入已有的 SqliteBackend 实例，避免重复创建连接
     safety_level: str = "strict"
-    llm_provider: str = ""
     llm_model: str = ""
     llm_api_key: str | None = None
     llm_base_url: str | None = None
     llm_vision_enabled: bool = True
     verification_auto_vision: bool = True
     # ── 视觉备用模型（可选，不配则回退主模型）──
-    vision_provider: str | None = None
     vision_model: str | None = None
     vision_api_key: str | None = None
     vision_base_url: str | None = None

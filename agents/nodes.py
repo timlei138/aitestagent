@@ -634,7 +634,6 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
         rag_context=rag,
     )
     cl = create_llm_client(
-        provider=llm["provider"],
         model=llm["model"],
         api_key=llm["api_key"],
         base_url=llm["base_url"],
@@ -642,7 +641,7 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     import time as _time
 
     _t0 = _time.time()
-    raw = _call_retry(llm["provider"], cl.invoke, msgs) if cl else None
+    raw = _call_retry(cl.invoke, msgs) if cl else None
     logger.info("Planner LLM: %.1fs", _time.time() - _t0)
     if raw is None:
         goal = {

@@ -33,7 +33,7 @@ from api.test_cases_routes import (
 )
 from api.knowledge_routes import set_knowledge_base as _set_kb_for_routes
 from api.websocket_manager import WebSocketManager
-from config import TestConfig, resolve_perception_mode
+from config import TestConfig, resolve_perception_mode, resolve_vision_credentials
 from data import create_vector_store, create_relational_db
 from device.controller import DeviceController, DeviceUnavailableError
 from agents.graph import set_relational_db, set_ws_emit_callback
@@ -125,15 +125,20 @@ _ctx: ToolContext | None = None
 
 
 def _build_vision_call(cfg: TestConfig):
-    # 视觉优先用独立配置，不配则回退主模型
-    v_provider = cfg.vision_provider or cfg.llm_provider
-    v_model    = cfg.vision_model    or cfg.model
-    v_api_key  = cfg.vision_api_key  or cfg.api_key
-    v_base_url = cfg.vision_base_url or cfg.base_url
+    # 视觉优先用独立配置；vision_base_url 与主模型不一致时视为独立端点，
+    # 禁止回退主模型凭证，避免把 key 发错端点。
+    v_model, v_api_key, v_base_url = resolve_vision_credentials(
+        llm_model=cfg.model,
+        llm_api_key=cfg.api_key,
+        llm_base_url=cfg.base_url,
+        vision_model=cfg.vision_model,
+        vision_api_key=cfg.vision_api_key,
+        vision_base_url=cfg.vision_base_url,
+    )
 
     logging.getLogger(__name__).info(
-        "[vision-build] provider=%s model=%s base_url=%s enabled=%s",
-        v_provider, v_model, v_base_url, bool(cfg.vision_model),
+        "[vision-build] model=%s base_url=%s enabled=%s",
+        v_model, v_base_url, cfg.vision_enabled,
     )
 
     def _vision_call(prompt: str, image_base64: str, purpose: str, strict_json: bool):
@@ -142,11 +147,10 @@ def _build_vision_call(cfg: TestConfig):
             image_base64=image_base64,
             purpose=purpose,
             strict_json=strict_json,
-            provider=v_provider,
             model=v_model,
             api_key=v_api_key,
             base_url=v_base_url,
-            vision_enabled=bool(cfg.vision_model),
+            vision_enabled=cfg.vision_enabled,
             timeout_sec=30,
         )
 
@@ -222,12 +226,10 @@ _ctx = ToolContext(
     perceiver=_perceiver,
     knowledge_base=_kb,
     safety_level=config.safety_level,
-    llm_provider=config.llm_provider,
     llm_model=config.model,
     llm_api_key=config.api_key,
     llm_base_url=config.base_url,
-    llm_vision_enabled=bool(config.vision_model),
-    vision_provider=config.vision_provider,
+    llm_vision_enabled=config.vision_enabled,
     vision_model=config.vision_model,
     vision_api_key=config.vision_api_key,
     vision_base_url=config.vision_base_url,
@@ -284,12 +286,10 @@ def _rebuild_tool_context() -> None:
         perceiver=_perceiver,
         knowledge_base=_kb,
         safety_level=config.safety_level,
-        llm_provider=config.llm_provider,
         llm_model=config.model,
         llm_api_key=config.api_key,
         llm_base_url=config.base_url,
-        llm_vision_enabled=bool(config.vision_model),
-        vision_provider=config.vision_provider,
+        llm_vision_enabled=config.vision_enabled,
         vision_model=config.vision_model,
         vision_api_key=config.vision_api_key,
         vision_base_url=config.vision_base_url,

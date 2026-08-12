@@ -214,12 +214,7 @@
             <!-- LLM 配置 -->
             <div class="settings-group">
               <h4 class="settings-group-title">LLM 模型</h4>
-              <el-form label-width="110px" size="default">
-                <el-form-item label="Provider">
-                  <el-select v-model="configData.llm_provider" style="width:100%">
-                    <el-option label="OpenAI (兼容)" value="openai" />
-                  </el-select>
-                </el-form-item>
+              <el-form label-position="top" size="default">
                 <el-form-item label="模型名称">
                   <el-input v-model="configData.model" placeholder="如: deepseek-v4-pro, gpt-4o" />
                 </el-form-item>
@@ -229,22 +224,25 @@
                 <el-form-item label="Base URL">
                   <el-input v-model="configData.base_url" placeholder="如: https://api.deepseek.com" />
                 </el-form-item>
+                <el-form-item>
+                  <el-checkbox v-model="configData.llm_vision_capable">
+                    主模型支持多模态/视觉
+                    <el-tooltip content="开启后，即使不配置下方视觉备用模型，也会尝试用主模型处理图片（如 gpt-4o）；关闭时则必须配置视觉备用模型才启用视觉能力" placement="top">
+                      <span style="font-size:12px;color:var(--text-muted);cursor:help;margin-left:4px">ℹ️</span>
+                    </el-tooltip>
+                  </el-checkbox>
+                </el-form-item>
               </el-form>
             </div>
 
             <!-- 视觉备用模型 -->
             <div class="settings-group">
               <h4 class="settings-group-title">视觉备用模型
-                <el-tooltip content="主模型不支持多模态时自动走此模型，不填则回退主模型" placement="top">
+                <el-tooltip content="当主模型不是多模态模型（如 DeepSeek）时，需配置此处才能使用视觉能力；若上方已勾选「主模型支持多模态/视觉」，此处可不填" placement="top">
                   <span style="font-size:12px;color:var(--text-muted);cursor:help;margin-left:4px">ℹ️</span>
                 </el-tooltip>
               </h4>
-              <el-form label-width="110px" size="default">
-                <el-form-item label="Provider">
-                  <el-select v-model="configData.vision_provider" style="width:100%" clearable placeholder="不填则复用主模型">
-                    <el-option label="OpenAI (兼容)" value="openai" />
-                  </el-select>
-                </el-form-item>
+              <el-form label-position="top" size="default">
                 <el-form-item label="模型名称">
                   <el-input v-model="configData.vision_model" placeholder="如: qwen-vl-max, glm-4v-flash" clearable />
                 </el-form-item>
@@ -264,7 +262,7 @@
             <!-- Embedding -->
             <div class="settings-group">
               <h4 class="settings-group-title">Embedding（RAG 向量化）</h4>
-              <el-form label-width="110px" size="default">
+              <el-form label-position="top" size="default">
                 <el-form-item label="Provider">
                   <el-select v-model="configData.embedding_provider" style="width:100%">
                     <el-option label="HuggingFace (本地)" value="huggingface" />
@@ -280,7 +278,7 @@
             <!-- 感知模式 & 安全等级 -->
             <div class="settings-group">
               <h4 class="settings-group-title">运行参数</h4>
-              <el-form label-width="110px" size="default">
+              <el-form label-position="top" size="default">
                 <el-form-item label="感知模式">
                   <el-select v-model="configData.perception_mode" style="width:100%">
                     <el-option label="UI Tree（最快）" value="ui_tree" />
