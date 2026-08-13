@@ -47,7 +47,9 @@ def _get_onnx_model_status() -> dict[str, object]:
     """返回固定 ONNX 模型目录的就绪状态，供设置页展示。"""
     model_dir = app_paths.ONNX_MODEL_DIR
     required_files = ("model.onnx", "tokenizer.json")
-    missing_files = [name for name in required_files if not (model_dir / name).is_file()]
+    missing_files = [
+        name for name in required_files if not (model_dir / name).is_file()
+    ]
     return {
         "ready": not missing_files,
         "path": str(model_dir),
@@ -121,7 +123,9 @@ async def test_model_connection(req: ModelTestRequest):
         content = str(getattr(response, "content", "") or "").strip()
         return {"status": "success", "message": content[:200] or "模型已响应"}
     except Exception as exc:
-        logger.info("Model connection test failed for model=%s: %s", model, type(exc).__name__)
+        logger.info(
+            "Model connection test failed for model=%s: %s", model, type(exc).__name__
+        )
         raise HTTPException(
             status_code=400,
             detail=_safe_error_message(exc, api_key),
@@ -175,7 +179,9 @@ async def update_config(req: ConfigUpdateRequest):
             ctx = get_tool_context()
             if ctx is not None:
                 ctx.vision_timeout = changed_values["vision_timeout"]
-                logger.info("vision_timeout hot-updated to %s", changed_values["vision_timeout"])
+                logger.info(
+                    "vision_timeout hot-updated to %s", changed_values["vision_timeout"]
+                )
         except Exception as exc:
             logger.warning("Failed to hot-update vision_timeout on ctx: %s", exc)
 
@@ -227,7 +233,9 @@ def _save_yaml(updates: dict) -> None:
                 default_flow_style=False,
                 sort_keys=False,
             )
-        logger.info("config.yaml saved to %s: %s", write_path, list(public_updates.keys()))
+        logger.info(
+            "config.yaml saved to %s: %s", write_path, list(public_updates.keys())
+        )
 
     # ── 敏感 → config.local.yaml ──
     if local_updates:
@@ -249,4 +257,6 @@ def _save_yaml(updates: dict) -> None:
                 default_flow_style=False,
                 sort_keys=False,
             )
-        logger.info("config.local.yaml saved to %s: %s", write_local, list(local_updates.keys()))
+        logger.info(
+            "config.local.yaml saved to %s: %s", write_local, list(local_updates.keys())
+        )

@@ -73,6 +73,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ── Auth 中间件：验证 Cookie Token，拦截未授权请求 ──
 class _AuthMiddleware:
     """纯 ASGI 中间件，兼容 SSE 流式响应和静态文件。"""
@@ -138,7 +139,9 @@ def _build_vision_call(cfg: TestConfig):
 
     logging.getLogger(__name__).info(
         "[vision-build] model=%s base_url=%s enabled=%s",
-        v_model, v_base_url, cfg.vision_enabled,
+        v_model,
+        v_base_url,
+        cfg.vision_enabled,
     )
 
     def _vision_call(prompt: str, image_base64: str, purpose: str, strict_json: bool):
@@ -395,6 +398,7 @@ def shutdown_adb() -> None:
 
     # 3) Windows: taskkill 强杀所有 adb.exe
     import sys as _sys
+
     if _sys.platform == "win32":
         try:
             subprocess.Popen(  # fire-and-forget，不等结果
@@ -578,9 +582,7 @@ async def stop_run(request: StopRunRequest):
     if not request.thread_id:
         return {"status": "error", "message": "缺少 thread_id"}
     ok = orchestrator.request_stop(request.thread_id, reason="http_stop")
-    logging.getLogger(__name__).info(
-        "[stop-debug] HTTP /api/run/stop -> ok=%s", ok
-    )
+    logging.getLogger(__name__).info("[stop-debug] HTTP /api/run/stop -> ok=%s", ok)
     return {
         "status": "ok" if ok else "noop",
         "thread_id": request.thread_id,
@@ -740,12 +742,17 @@ async def websocket_chat(websocket: WebSocket):
                 run_id = data.get("run_id", "")
                 run = _db.get_test_run(run_id) if _db and run_id else None
                 if not run:
-                    await ws_manager.send(websocket, {"type": "error", "content": f"报告不存在: {run_id}"})
+                    await ws_manager.send(
+                        websocket, {"type": "error", "content": f"报告不存在: {run_id}"}
+                    )
                     continue
                 try:
                     entry = resolve_report_rerun_entry(run)
                 except ValueError as exc:
-                    await ws_manager.send(websocket, {"type": "error", "content": f"报告计划数据损坏: {exc}"})
+                    await ws_manager.send(
+                        websocket,
+                        {"type": "error", "content": f"报告计划数据损坏: {exc}"},
+                    )
                     continue
                 result = await asyncio.to_thread(
                     orchestrator.start,
@@ -760,7 +767,9 @@ async def websocket_chat(websocket: WebSocket):
                     execution_plan_revision=entry["execution_plan_revision"],
                 )
                 try:
-                    await ws_manager.send(websocket, {"type": "result", "content": result})
+                    await ws_manager.send(
+                        websocket, {"type": "result", "content": result}
+                    )
                 except RuntimeError:
                     pass
 
@@ -768,12 +777,18 @@ async def websocket_chat(websocket: WebSocket):
                 case_id = data.get("case_id", "")
                 case = _db.get_test_case(case_id) if _db and case_id else None
                 if not case:
-                    await ws_manager.send(websocket, {"type": "error", "content": f"用例不存在: {case_id}"})
+                    await ws_manager.send(
+                        websocket,
+                        {"type": "error", "content": f"用例不存在: {case_id}"},
+                    )
                     continue
                 try:
                     entry = _resolve_run_entry(case)
                 except ValueError as exc:
-                    await ws_manager.send(websocket, {"type": "error", "content": f"用例计划数据损坏: {exc}"})
+                    await ws_manager.send(
+                        websocket,
+                        {"type": "error", "content": f"用例计划数据损坏: {exc}"},
+                    )
                     continue
                 result = await asyncio.to_thread(
                     orchestrator.start,
@@ -790,9 +805,13 @@ async def websocket_chat(websocket: WebSocket):
                 if result.get("status") != "busy":
                     st = result.get("execution_status", "error")
                     vd = result.get("test_verdict", "inconclusive")
-                    _db.record_case_run(case_id, f"{st}/{vd}", datetime.now().isoformat())
+                    _db.record_case_run(
+                        case_id, f"{st}/{vd}", datetime.now().isoformat()
+                    )
                 try:
-                    await ws_manager.send(websocket, {"type": "result", "content": result})
+                    await ws_manager.send(
+                        websocket, {"type": "result", "content": result}
+                    )
                 except RuntimeError:
                     pass
 

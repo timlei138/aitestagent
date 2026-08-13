@@ -15,6 +15,7 @@ import time
 
 # ── console=False 时 sys.stdout/stderr 为 None，需重定向避免崩溃 ──
 import os as _os
+
 if sys.stdout is None:
     sys.stdout = open(_os.devnull, "w")
 if sys.stderr is None:
@@ -28,7 +29,9 @@ if sys.platform == "win32":
     class _SilentPopen(_orig_Popen):
         def __init__(self, *args, **kwargs):
             if kwargs.get("creationflags", 0) & _CREATE_NO_WINDOW == 0:
-                kwargs["creationflags"] = kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
+                kwargs["creationflags"] = (
+                    kwargs.get("creationflags", 0) | _CREATE_NO_WINDOW
+                )
             super().__init__(*args, **kwargs)
 
     subprocess.Popen = _SilentPopen
@@ -155,6 +158,7 @@ _LOADING_HTML = r"""
 def _start_server():
     """在子线程中启动 FastAPI 服务。"""
     import uvicorn
+
     logger.info("正在导入 server 模块…")
     try:
         from api.server import app
@@ -176,7 +180,7 @@ def _make_poll_server():
     import urllib.request
     import webview as _wv
 
-    MAX_RETRIES = 400       # 400 × 0.3s ≈ 120s
+    MAX_RETRIES = 400  # 400 × 0.3s ≈ 120s
     INTERVAL = 0.3
 
     def _poll():
@@ -192,7 +196,7 @@ def _make_poll_server():
 
             # 非线性进度：平方根曲线，前期快后期慢，感知更流畅
             ratio = (i + 1) / MAX_RETRIES
-            pct = int(min(95, ratio ** 0.35 * 100))
+            pct = int(min(95, ratio**0.35 * 100))
             try:
                 _wv.windows[0].evaluate_js(
                     f'document.getElementById("bar").style.width="{pct}%";'
@@ -226,6 +230,7 @@ def main():
     except ImportError:
         logger.warning("pywebview 未安装，自动打开浏览器")
         import webbrowser
+
         webbrowser.open(APP_URL)
         try:
             while True:
@@ -257,16 +262,21 @@ def main():
 
         try:
             from api.server import shutdown_adb
+
             shutdown_adb()
         except Exception:
             logger.exception("shutdown_adb 失败")
 
         _t2 = time.time()
-        logger.info("[shutdown] 清理完成 (耗时 %.1fs, 总计 %.1fs)", _t2 - _t1, _t2 - _t0)
+        logger.info(
+            "[shutdown] 清理完成 (耗时 %.1fs, 总计 %.1fs)", _t2 - _t1, _t2 - _t0
+        )
     except Exception:
         logger.exception("窗口启动失败")
 
-    logger.info("[shutdown] main() 即将返回 (%.1fs since window close)", time.time() - _t0)
+    logger.info(
+        "[shutdown] main() 即将返回 (%.1fs since window close)", time.time() - _t0
+    )
     # 强制刷盘
     for _h in logging.getLogger().handlers:
         try:
@@ -285,10 +295,13 @@ if __name__ == "__main__":
         logger.info("[shutdown] main() 已返回 (耗时 %.1fs)", _main_t1 - _main_t0)
     except Exception:
         import traceback
+
         logger.exception("Fatal error in main")
         # 也写入文件
         try:
-            with open(str(app_paths.LOG_DIR / "app_entry_crash.log"), "w", encoding="utf-8") as f:
+            with open(
+                str(app_paths.LOG_DIR / "app_entry_crash.log"), "w", encoding="utf-8"
+            ) as f:
                 traceback.print_exc(file=f)
         except Exception:
             pass

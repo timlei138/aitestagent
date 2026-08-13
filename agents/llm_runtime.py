@@ -193,7 +193,14 @@ def _accumulate_token_usage(ctx, msg) -> None:
         )
 
 
-def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str = "", tool_seq: int = 0, replay_mode: str = "") -> tuple[str, dict[str, Any]]:
+def _execute_replay_tool(
+    tool: Any,
+    name: str,
+    args: dict[str, Any],
+    run_id: str = "",
+    tool_seq: int = 0,
+    replay_mode: str = "",
+) -> tuple[str, dict[str, Any]]:
     """回放 script 模式的确定性直接执行（不调主 LLM）。
 
     复用 _tools_node 的核心管道：stop 检查 / 前后应用与页面签名 / 结构化
@@ -247,13 +254,21 @@ def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str
         try:
             ctx._ws_emit(
                 "tool_start",
-                {"name": name, "input": {"label": _build_tool_target(name, args)}, "intent_text": "replay direct"},
+                {
+                    "name": name,
+                    "input": {"label": _build_tool_target(name, args)},
+                    "intent_text": "replay direct",
+                },
             )
         except Exception:
             pass
     # Task 10: 剥离内部元数据字段（_ 前缀），避免传给 tool.invoke
     _internal_meta = {k: v for k, v in (args or {}).items() if k.startswith("_")}
-    _invoke_args = {k: v for k, v in (args or {}).items() if not k.startswith("_")} if _internal_meta else dict(args or {})
+    _invoke_args = (
+        {k: v for k, v in (args or {}).items() if not k.startswith("_")}
+        if _internal_meta
+        else dict(args or {})
+    )
     try:
         output = str(tool.invoke(_invoke_args)) if tool else f"UNKNOWN_TOOL: {name}"
     except Exception as e:
@@ -267,10 +282,14 @@ def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str
         and getattr(ctx, "device", None) is not None
     ):
         try:
-            logger.info("[replay popup guard] click NOT_FOUND → press_key(back) + retry")
+            logger.info(
+                "[replay popup guard] click NOT_FOUND → press_key(back) + retry"
+            )
             from tools import press_key as _pk_tool
+
             _pk_tool.invoke({"key": "back"})
             import time as _t
+
             _t.sleep(0.5)
             output = str(tool.invoke(_invoke_args)) if tool else output
         except Exception as _dismiss_exc:
@@ -479,7 +498,10 @@ def _run_agent(
                 # 同一 package 的 launch 调用累计达阈值，即视为病态反复重开
                 # （无论中间是否被切走），直接 COOLDOWN_SKIP 拦截，逼 LLM
                 # 转向 assert_verification / report_done。
-                if _req_pkg and int(_lc.get(_req_pkg, 0) or 0) >= _LAUNCH_REDUNDANT_LIMIT:
+                if (
+                    _req_pkg
+                    and int(_lc.get(_req_pkg, 0) or 0) >= _LAUNCH_REDUNDANT_LIMIT
+                ):
                     outputs.append(
                         ToolMessage(
                             content=(
@@ -575,8 +597,8 @@ def _run_agent(
                 if _live_ctx.device is None:
                     output = "ERROR: 设备已断开连接"
                     outputs.append(
-                ToolMessage(content=output, name=name, tool_call_id=tc["id"])
-            )
+                        ToolMessage(content=output, name=name, tool_call_id=tc["id"])
+                    )
                     # 为剩余未执行的 tool_calls 补占位 ToolMessage，避免 LangChain 报错
                     _remaining = last_ai.tool_calls or []
                     _idx = _remaining.index(tc) + 1 if tc in _remaining else -1

@@ -46,7 +46,9 @@ def main():
 
         host = args.host
         port = args.port
-        url = f"http://{'127.0.0.1' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
+        url = (
+            f"http://{'127.0.0.1' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
+        )
 
         print(f"服务启动中，请在浏览器打开: {url}")
         uvicorn.run(app, host=host, port=port, reload=False)
@@ -92,7 +94,9 @@ def _init_tool_context(config: TestConfig) -> None:
 
         logging.getLogger(__name__).info(
             "[vision-build] model=%s base_url=%s enabled=%s",
-            v_model, v_base_url, config.vision_enabled,
+            v_model,
+            v_base_url,
+            config.vision_enabled,
         )
 
         def _vision_call(
@@ -123,9 +127,7 @@ def _init_tool_context(config: TestConfig) -> None:
         )
         kb = KnowledgeBase(create_vector_store(config))
         # 经验推断挂载：按 rid 查知识库给无标签图标补 rag_hint（不污染 label）
-        perceiver.attach_knowledge(
-            kb, lambda: device.current_app().get("package", "")
-        )
+        perceiver.attach_knowledge(kb, lambda: device.current_app().get("package", ""))
         ctx = ToolContext(
             device=device,
             perceiver=perceiver,

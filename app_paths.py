@@ -38,7 +38,9 @@ KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 DB_PATH = DATA_DIR / "test_history.db"
 APPS_YAML = DATA_DIR / "apps.yaml"
 # ONNX embedding 模型独立存放在用户目录，不随应用包分发。
-ONNX_MODEL_DIR = Path(os.environ["LOCALAPPDATA"]) / "AiAgentTest" / "models" / "bge-large-zh-onnx"
+ONNX_MODEL_DIR = (
+    Path(os.environ["LOCALAPPDATA"]) / "AiAgentTest" / "models" / "bge-large-zh-onnx"
+)
 
 # ── 日志子目录 ──
 LOG_RUN_DIR = LOG_DIR / "runs"
@@ -55,7 +57,14 @@ PROMPTS_DIR = BUNDLE_DIR / "agents" / "prompts"
 
 def ensure_dirs() -> None:
     """确保所有运行时目录存在。启动时调用一次。"""
-    for d in (DATA_DIR, LOG_DIR, LOG_RUN_DIR, SCREENSHOT_DIR, KNOWLEDGE_DIR, ONNX_MODEL_DIR):
+    for d in (
+        DATA_DIR,
+        LOG_DIR,
+        LOG_RUN_DIR,
+        SCREENSHOT_DIR,
+        KNOWLEDGE_DIR,
+        ONNX_MODEL_DIR,
+    ):
         d.mkdir(parents=True, exist_ok=True)
     if FROZEN:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -122,7 +131,12 @@ def setup_adb_path() -> str | None:
     # 2. 常见位置
     candidates = [
         Path(os.environ.get("LOCALAPPDATA", "")) / "Android" / "Sdk" / "platform-tools",
-        Path(os.environ.get("USERPROFILE", "")) / "AppData" / "Local" / "Android" / "Sdk" / "platform-tools",
+        Path(os.environ.get("USERPROFILE", ""))
+        / "AppData"
+        / "Local"
+        / "Android"
+        / "Sdk"
+        / "platform-tools",
         Path("D:\\AndroidSdk") / "platform-tools",
         Path("C:\\AndroidSdk") / "platform-tools",
         Path("C:\\android-sdk") / "platform-tools",

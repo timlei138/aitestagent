@@ -310,17 +310,11 @@ def _build_direct_click_args(
     只有 locator 完全不稳定时才回退追加 tool_input 中的 index。
     """
     args = {
-        k: v
-        for k, v in (preferred_locator or {}).items()
-        if v not in (None, "", [])
+        k: v for k, v in (preferred_locator or {}).items() if v not in (None, "", [])
     }
     stable = bool(
         args.get("rid")
-        or (
-            args.get("label")
-            and args.get("class_name")
-            and args.get("path_contains")
-        )
+        or (args.get("label") and args.get("class_name") and args.get("path_contains"))
     )
     if not stable:
         _ti = tool_input or {}
@@ -373,7 +367,7 @@ def _build_replay_system_instruction(
         f"当前目标步骤={idx + 1}/{total}。\n"
         f"已使用 recovery 步数={recovery_used}/{recovery_budget}。\n"
         "如果当前页面存在与脚本无关的弹窗/覆盖层（如导入弹窗、广告等），"
-        "优先使用 press_key(\"back\") 关闭它，然后重试脚本步骤。\n"
+        '优先使用 press_key("back") 关闭它，然后重试脚本步骤。\n'
         "请优先使用确定性工具恢复路径（click 带 rid 或 index、get_screen_info）。"
     )
 
@@ -461,11 +455,11 @@ def _parse_vision_decision(observation: str) -> str:
     if not obs:
         return ""
     # click_and_check 格式: 匹配 [yes] 或 [no]
-    m = re.search(r'\[(yes|no)\]', obs, re.IGNORECASE)
+    m = re.search(r"\[(yes|no)\]", obs, re.IGNORECASE)
     if m:
         return m.group(1).lower()
     # visual_check 格式: JSON 中 decision 字段
-    if obs.startswith('{'):
+    if obs.startswith("{"):
         try:
             data = json.loads(obs)
             decision = str(data.get("decision", "") or "").lower()
@@ -474,7 +468,7 @@ def _parse_vision_decision(observation: str) -> str:
         except (json.JSONDecodeError, TypeError):
             pass
     # verify_decision= 格式
-    m2 = re.search(r'verify_decision\s*=\s*(yes|no)', obs, re.IGNORECASE)
+    m2 = re.search(r"verify_decision\s*=\s*(yes|no)", obs, re.IGNORECASE)
     if m2:
         return m2.group(1).lower()
     return ""
@@ -553,9 +547,7 @@ def _build_replay_verification_args(
             back_rsi = back_entry.get("replay_step_idx", -1)
             back_verify = ""
             if isinstance(back_rsi, int) and 0 <= back_rsi < len(actions):
-                back_verify = str(
-                    actions[back_rsi].get("verify", "") or ""
-                )
+                back_verify = str(actions[back_rsi].get("verify", "") or "")
             # 防御性：只有 ^v\d+$ 格式才当作 verify key
             # 自然语言 verify（如 vision_tap 的 "结束分钟列当前选中值是否为53"）不作为 key
             is_key = bool(back_verify and _VERIFY_KEY_RE.match(back_verify))
@@ -1007,7 +999,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 else:
                     # 录制时未记 activity（launch_app 未传）：退化为包名比对，
                     # 仅当前前台不是目标 App 时才对齐，避免误重开
-                    _need_align = bool(_entry_pkg and _cur_pkg and _entry_pkg != _cur_pkg)
+                    _need_align = bool(
+                        _entry_pkg and _cur_pkg and _entry_pkg != _cur_pkg
+                    )
                 if _need_align:
                     entry_align_active = True
                     entry_align_activity = _entry_act
@@ -1105,14 +1099,13 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                     _ev = str(_post.get("expected_value", "") or "")
                     if (
                         str(
-                            replay_action_for_turn.get("postcondition_channel", "") or ""
+                            replay_action_for_turn.get("postcondition_channel", "")
+                            or ""
                         )
                         == "vision_verify"
                         and _ev
                     ):
-                        direct_tool_args.setdefault(
-                            "verify", f"当前页面是否显示 {_ev}"
-                        )
+                        direct_tool_args.setdefault("verify", f"当前页面是否显示 {_ev}")
 
     # Messages — always include goal + page for context
     msgs = list(state.get("messages", []))
@@ -1288,7 +1281,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     else:
         if direct_tool_name:
             logger.info(
-                "[replay direct] tool %s 不在直执白名单，降级 LLM 路径", direct_tool_name
+                "[replay direct] tool %s 不在直执白名单，降级 LLM 路径",
+                direct_tool_name,
             )
         result, tool_calls_log, loop_meta = _run_agent(
             msgs,
@@ -1411,7 +1405,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             else:
                 # 录制时无 activity：按包名判定对齐
                 _after_pkg = str((last_exec or {}).get("page_after_package", "") or "")
-                _aligned = bool(entry_align_package) and entry_align_package == _after_pkg
+                _aligned = (
+                    bool(entry_align_package) and entry_align_package == _after_pkg
+                )
         else:
             _aligned = False
         if _aligned:
@@ -1454,11 +1450,13 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             )
             expected_tool = str(replay_action_for_turn.get("tool", "") or "")
             tool_match = (
-                bool(last_exec) and str(last_exec.get("name", "") or "") == expected_tool
+                bool(last_exec)
+                and str(last_exec.get("name", "") or "") == expected_tool
             )
             expected_value = str(post.get("expected_value", "") or "")
             channel = str(
-                replay_action_for_turn.get("postcondition_channel", "ui_text") or "ui_text"
+                replay_action_for_turn.get("postcondition_channel", "ui_text")
+                or "ui_text"
             )
             value_match = True
             if expected_value:
@@ -1761,8 +1759,8 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         execution_status = "completed"
     # Task 8: 回放防幻觉安全闸门 —— 脚本未走完时，阻止假 passed
     _replay_actions_guard = _effective_replay_actions(goal)
-    _replay_enabled_guard = (
-        str(state.get("_run_type", "") or "") == "rerun" and bool(_replay_actions_guard)
+    _replay_enabled_guard = str(state.get("_run_type", "") or "") == "rerun" and bool(
+        _replay_actions_guard
     )
     _replay_step_guard = int(state.get("_replay_step_idx", 0) or 0)
     # 检测 report_done 是否已执行（report_done 触发 done=True 导致
@@ -1771,9 +1769,8 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         isinstance(e, dict) and str(e.get("name", "")) == "report_done"
         for e in state.get("_tool_calls_log", [])
     )
-    _replay_finished_guard = (
-        bool(_replay_actions_guard)
-        and (_replay_step_guard >= len(_replay_actions_guard) or _report_done_executed)
+    _replay_finished_guard = bool(_replay_actions_guard) and (
+        _replay_step_guard >= len(_replay_actions_guard) or _report_done_executed
     )
     _guard_triggered = False
     _guard_reason = ""
@@ -1785,11 +1782,16 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             _collected_vkeys = {
                 str(e.get("result_evidence", {}).get("verification_key", ""))
                 for e in _tool_log_guard
-                if isinstance(e, dict) and str(e.get("name", "")) == "assert_verification"
+                if isinstance(e, dict)
+                and str(e.get("name", "")) == "assert_verification"
             }
             # 检查必需的验证项
-            _goal_ver_keys = {f"v{i}" for i in range(len(_goal_v_items))} if _goal_v_items else set()
-            _missing_vkeys = _goal_ver_keys - _collected_vkeys if _goal_ver_keys else set()
+            _goal_ver_keys = (
+                {f"v{i}" for i in range(len(_goal_v_items))} if _goal_v_items else set()
+            )
+            _missing_vkeys = (
+                _goal_ver_keys - _collected_vkeys if _goal_ver_keys else set()
+            )
             _missing_detail = f"，缺少验证: {_missing_vkeys}" if _missing_vkeys else ""
             _guard_reason = f"script_incomplete,step={_replay_step_guard}/{len(_replay_actions_guard)}"
             if _missing_vkeys:
@@ -1866,7 +1868,8 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             and str(_ev_entry.get("name", "")) == "assert_verification"
         ):
             _ev_src = str(
-                _ev_entry.get("result_evidence", {}).get("_evidence_source", "") or "unknown"
+                _ev_entry.get("result_evidence", {}).get("_evidence_source", "")
+                or "unknown"
             )
             _verification_evidence_sources[_ev_src] = (
                 _verification_evidence_sources.get(_ev_src, 0) + 1

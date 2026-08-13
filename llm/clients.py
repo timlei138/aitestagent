@@ -16,6 +16,7 @@ _RETRY_WAIT_SECONDS = 5
 
 class LLMFatalError(Exception):
     """LLM 不可重试的致命错误（如欠费、认证失败），调用方应终止并通知用户。"""
+
     pass
 
 
@@ -41,8 +42,13 @@ def _default_should_retry(exc: Exception) -> bool:
         return False
     msg = str(exc).lower()
     fatal_keywords = [
-        "insufficient", "quota", "balance", "invalid api key",
-        "authentication", "unauthorized", "forbidden",
+        "insufficient",
+        "quota",
+        "balance",
+        "invalid api key",
+        "authentication",
+        "unauthorized",
+        "forbidden",
     ]
     if any(kw in msg for kw in fatal_keywords):
         return False
@@ -65,11 +71,16 @@ def _call_with_retry(should_retry_fn, fn, *args, **kwargs):
             if attempt < _MAX_RETRIES:
                 logger.warning(
                     "LLM call failed (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, _MAX_RETRIES, _RETRY_WAIT_SECONDS, exc,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    _RETRY_WAIT_SECONDS,
+                    exc,
                 )
                 time.sleep(_RETRY_WAIT_SECONDS)
                 continue
-            logger.error("LLM call failed after %d retries, degrading: %s", _MAX_RETRIES, exc)
+            logger.error(
+                "LLM call failed after %d retries, degrading: %s", _MAX_RETRIES, exc
+            )
             return None
 
 
@@ -84,9 +95,12 @@ def _msg_role(item: Any) -> str:
     if isinstance(item, dict):
         return str(item.get("role", ""))
     role = getattr(item, "type", None) or getattr(item, "role", None) or ""
-    if role in ("ai", "assistant"): return "assistant"
-    if role == "human": return "user"
-    if role == "system": return "system"
+    if role in ("ai", "assistant"):
+        return "assistant"
+    if role == "human":
+        return "user"
+    if role == "system":
+        return "system"
     return str(role)
 
 
@@ -99,11 +113,17 @@ def _msg_content(item: Any) -> str:
 def _messages_preview(messages: list[Any], limit: int = 3) -> list[dict[str, Any]]:
     preview = []
     for item in (messages or [])[:limit]:
-        preview.append({"role": _msg_role(item), "content": _truncate_text(_msg_content(item), 400)})
+        preview.append(
+            {
+                "role": _msg_role(item),
+                "content": _truncate_text(_msg_content(item), 400),
+            }
+        )
     return preview
 
 
 # ── 抽象接口 ──
+
 
 class LLMClient(ABC):
     """文本模型抽象接口。"""
@@ -119,9 +139,17 @@ class LLMClient(ABC):
 
 # ── OpenAI 实现 ──
 
+
 class OpenAITextClient(LLMClient):
-    def __init__(self, model: str, api_key: str, base_url: str | None = None, temperature: float = 0.1):
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        base_url: str | None = None,
+        temperature: float = 0.1,
+    ):
         from langchain_openai import ChatOpenAI
+
         self._base_url = base_url or ""
         self._client = ChatOpenAI(
             model=model,
@@ -131,7 +159,9 @@ class OpenAITextClient(LLMClient):
         )
 
     def invoke(self, messages: list[Any]) -> str:
-        logger.info("LLM request provider=openai messages=%s", _messages_preview(messages))
+        logger.info(
+            "LLM request provider=openai messages=%s", _messages_preview(messages)
+        )
         response = _call_with_retry(self.should_retry, self._client.invoke, messages)
         if response is None:
             return ""
@@ -139,7 +169,9 @@ class OpenAITextClient(LLMClient):
         logger.info("LLM response provider=openai content=%s", _truncate_text(content))
         return content
 
+
 # ── 工厂 ──
+
 
 def create_llm_client(
     model: str,
@@ -150,4 +182,6 @@ def create_llm_client(
     if not api_key:
         return None
     # 统一走 OpenAI 兼容接入：各厂商通过 base_url 指向其 OpenAI 兼容端点。
-    return OpenAITextClient(model=model, api_key=api_key, base_url=base_url, temperature=temperature)
+    return OpenAITextClient(
+        model=model, api_key=api_key, base_url=base_url, temperature=temperature
+    )
