@@ -5,6 +5,8 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from pydantic import SecretStr
+
 logger = logging.getLogger(__name__)
 
 # ── 重试参数 ──
@@ -114,35 +116,19 @@ class LLMClient(ABC):
         """判断异常是否可重试。默认：大部分错误可重试，认证/欠费等不可重试。子类按需覆盖。"""
         return _default_should_retry(exc)
 
-    def supports_structured_output(self) -> bool:
-        """是否支持 structured output（response_format 参数）。
-        默认 False，子类按需重写。
-        """
-        return False
-
-
-class VLMClient(ABC):
-    """视觉模型抽象接口。"""
-
-    @abstractmethod
-    def describe(self, prompt: str, image_base64: str, context: str = "") -> str:
-        raise NotImplementedError
-
-    def should_retry(self, exc: Exception) -> bool:
-        """判断异常是否可重试。默认：大部分错误可重试，认证/欠费等不可重试。子类按需覆盖。"""
-        return _default_should_retry(exc)
-
 
 # ── OpenAI 实现 ──
 
 class OpenAITextClient(LLMClient):
-    # 已知不支持 response_format 的 OpenAI 兼容 provider
-    _NO_STRUCTURED_OUTPUT_HOSTS = ("deepseek", "together", "groq", "openrouter")
-
     def __init__(self, model: str, api_key: str, base_url: str | None = None, temperature: float = 0.1):
         from langchain_openai import ChatOpenAI
         self._base_url = base_url or ""
-        self._client = ChatOpenAI(model=model, temperature=temperature, api_key=api_key, base_url=base_url)
+        self._client = ChatOpenAI(
+            model=model,
+            temperature=temperature,
+            api_key=SecretStr(api_key),
+            base_url=base_url,
+        )
 
     def invoke(self, messages: list[Any]) -> str:
         logger.info("LLM request provider=openai messages=%s", _messages_preview(messages))
@@ -152,46 +138,6 @@ class OpenAITextClient(LLMClient):
         content = str(response.content)
         logger.info("LLM response provider=openai content=%s", _truncate_text(content))
         return content
-
-    def supports_structured_output(self) -> bool:
-        """OpenAI 原生 API 支持，但 DeepSeek/Together/Groq 等兼容 provider 不支持。"""
-        return not any(h in self._base_url for h in self._NO_STRUCTURED_OUTPUT_HOSTS)
-
-
-class OpenAIVisionClient(VLMClient):
-    def __init__(self, model: str, api_key: str, base_url: str | None = None, temperature: float = 0.1):
-        from langchain_openai import ChatOpenAI
-        self._client = ChatOpenAI(model=model, temperature=temperature, api_key=api_key, base_url=base_url)
-
-    def describe(self, prompt: str, image_base64: str, context: str = "") -> str:
-        image_url = f"data:image/png;base64,{image_base64}"
-        messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": [
-                {"type": "text", "text": context or "请分析该截图"},
-                {"type": "image_url", "image_url": {"url": image_url}},
-            ]},
-        ]
-        logger.info("VLM request provider=openai image_len=%s", len(image_base64 or ""))
-        response = _call_with_retry(self.should_retry, self._client.invoke, messages)
-        if response is None:
-            return ""
-        content = str(response.content)
-        logger.info("VLM response provider=openai content=%s", _truncate_text(content))
-        return content
-
-
-# ── 能力检查（无需实例化）──
-
-def supports_structured_output(provider: str, base_url: str | None = None) -> bool:
-    """检查指定 OpenAI 兼容端点是否支持 structured output (response_format 参数)。
-
-    统一 OpenAI 兼容接入后仅按 base_url 判定：deepseek/groq/together/openrouter
-    等兼容 provider 不支持此功能（provider 名不再参与判断）。
-    """
-    url = (base_url or "").lower()
-    return not any(h in url for h in ("deepseek", "together", "groq", "openrouter"))
-
 
 # ── 工厂 ──
 

@@ -1,8 +1,5 @@
 model: deepseek-v4-flash
 base_url: https://api.deepseek.com
-embedding_provider: huggingface
-embedding_model: BAAI/bge-large-zh-v1.5
-embedding_base_url: null
 perception_mode: ui_tree
 safety_level: strict
 click_mode: legacy

@@ -218,8 +218,13 @@ if _device is not None:
     except Exception as exc:
         logging.getLogger(__name__).warning("SmartPerceiver init failed: %s", exc)
 
-# 3) 知识库（始终可用）
-_kb = KnowledgeBase(create_vector_store(config))
+# 3) 知识库。ONNX 模型首次尚未安装时保留服务可用，
+# 由设置页提示固定模型目录；RAG 功能在模型安装前不可用。
+try:
+    _kb = KnowledgeBase(create_vector_store(config))
+except Exception as exc:
+    _kb = None
+    logging.getLogger(__name__).warning("Knowledge base unavailable: %s", exc)
 
 _ctx = ToolContext(
     device=_device,

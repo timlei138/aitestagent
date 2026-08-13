@@ -266,9 +266,24 @@
   padding-bottom: 8px;
   border-bottom: 1px solid var(--line-light);
 }
-.settings-group .el-form-item {
-  margin-bottom: 12px;
+.settings-readonly {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
 }
-.settings-group .el-form-item:last-child {
-  margin-bottom: 0;
+.settings-readonly-path {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.model-test-row {
+  display: flex;
+  justify-content: flex-end;
+  margin: -2px 0 12px;
+}
+.model-test-result {
+  margin: 0 0 14px;
+  overflow-wrap: anywhere;
 }

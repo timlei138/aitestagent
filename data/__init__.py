@@ -10,25 +10,13 @@ logger = logging.getLogger(__name__)
 
 
 def create_vector_store(config: TestConfig) -> VectorStoreBackend:
-    """工厂：根据配置创建向量存储后端（仅 ChromaDB，强制要求向量数据库）。"""
-    embedding_provider = getattr(config, "embedding_provider", "huggingface")
-    if embedding_provider == "openai" and not (getattr(config, "embedding_api_key", None) or config.api_key):
-        raise RuntimeError(
-            "OpenAI embedding requires api_key. "
-            "请在 config.yaml 中配置 embedding_api_key 或 api_key。"
-        )
+    """创建使用默认本地 ONNX embedding 的 Chroma 向量库。"""
     try:
-        return ChromaBackend(
-            persist_dir=config.rag_persist_dir,
-            embedding_provider=embedding_provider,
-            embedding_model=getattr(config, "embedding_model", "BAAI/bge-large-zh-v1.5"),
-            api_key=getattr(config, "embedding_api_key", None) or config.api_key,
-            base_url=getattr(config, "embedding_base_url", None),
-        )
+        return ChromaBackend(persist_dir=config.rag_persist_dir)
     except Exception as exc:
         raise RuntimeError(
             f"ChromaDB 初始化失败: {exc}. "
-            "Hint: 如使用 huggingface, 请 pip install langchain-huggingface sentence-transformers"
+            "Hint: onnx 模型请放到 %LOCALAPPDATA%\\AiAgentTest\\models\\bge-large-zh-onnx。"
         ) from exc
 
 

@@ -22,12 +22,6 @@ class TestConfig:
     api_key: str | None = None
     base_url: str | None = None
 
-    # ── Embedding ──
-    embedding_provider: str = "huggingface"
-    embedding_model: str = "BAAI/bge-large-zh-v1.5"
-    embedding_api_key: str | None = None
-    embedding_base_url: str | None = None
-
     # ── 感知模式: "hybrid" | "ui_tree" ──
     perception_mode: str = "hybrid"
 

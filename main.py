@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
+import traceback
 
 from config import TestConfig, resolve_perception_mode, resolve_vision_credentials
 from data import create_vector_store, create_relational_db
@@ -32,10 +34,22 @@ def main():
 
     args = parser.parse_args()
 
+    # 无参数时默认启动 server（兼容 PyInstaller 打包后双击运行）
+    if not args.mode:
+        args.mode = "server"
+        args.host = "127.0.0.1"
+        args.port = 8080
+
     if args.mode == "server":
         import uvicorn
+        from api.server import app
 
-        uvicorn.run("api.server:app", host=args.host, port=args.port, reload=False)
+        host = args.host
+        port = args.port
+        url = f"http://{'127.0.0.1' if host in ('127.0.0.1', '0.0.0.0') else host}:{port}"
+
+        print(f"服务启动中，请在浏览器打开: {url}")
+        uvicorn.run(app, host=host, port=port, reload=False)
         return
 
     if args.mode == "run":
@@ -138,4 +152,19 @@ def _quick_resolve_app(text: str) -> tuple[str, str]:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        if getattr(sys, "frozen", False):
+            import app_paths
+
+            app_paths.ensure_dirs()
+            crash_log = app_paths.LOG_DIR / "startup_crash.log"
+            crash_log.write_text(traceback.format_exc(), encoding="utf-8")
+            print(f"\n启动失败日志已写入：{crash_log}")
+            try:
+                input("按 Enter 退出...")
+            except EOFError:
+                pass
+        raise

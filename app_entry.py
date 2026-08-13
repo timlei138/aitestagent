@@ -53,16 +53,6 @@ print(f"[app_paths] APP_DATA={app_paths.APP_DATA}")
 print(f"[app_paths] DATA_DIR={app_paths.DATA_DIR}")
 print(f"[app_paths] LOG_DIR={app_paths.LOG_DIR}")
 
-# 在导入任何 ML 库之前设置离线模式（模型已缓存到 ~/.cache/huggingface）
-import os as _os
-_cache_dir = _os.path.join(
-    _os.path.expanduser("~"), ".cache", "huggingface", "hub",
-    "models--BAAI--bge-large-zh-v1.5"
-)
-if _os.path.isdir(_cache_dir):
-    _os.environ["HF_HUB_OFFLINE"] = "1"
-    _os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
 # 查找 adb 并加入 PATH
 _adb = app_paths.setup_adb_path()
 if _adb:

@@ -5,6 +5,8 @@ import logging
 from threading import Lock
 from typing import Any
 
+from pydantic import SecretStr
+
 logger = logging.getLogger(__name__)
 
 # 按 (model, base_url) 隔离的视觉能力状态，避免主模型和视觉模型的探测结果串扰
@@ -139,7 +141,7 @@ def _invoke_openai_multimodal(
             client = ChatOpenAI(
                 model=model,
                 temperature=0.0,
-                api_key=api_key,
+                api_key=SecretStr(api_key),
                 base_url=base_url,
                 timeout=timeout_sec,
                 max_retries=0,  # 视觉调用不需要 SDK 层重试，超时即失败
@@ -327,7 +329,6 @@ def multimodal_vision_call(
         query_prompt += "\n请严格返回 JSON，且只返回 JSON。"
     try:
         text = _invoke_multimodal(
-            provider or "openai",
             model,
             api_key,
             base_url,
@@ -359,7 +360,7 @@ def multimodal_vision_call(
         )
     except Exception as exc:
         msg = str(exc)
-        if _is_unsupported_error(msg, provider, model):
+        if _is_unsupported_error(msg, model):
             with _CAP_LOCK:
                 cap["state"] = "unsupported"
                 cap["error"] = msg

@@ -1,4 +1,4 @@
-"""LLM 运行时：内层子图执行 (_run_agent) + provider 适配 + 重试 + 设备保活。
+"""LLM 运行时：内层子图执行 (_run_agent) + 统一 OpenAI 兼容调用 + 重试 + 设备保活。
 
 从 agents/graph.py 拆出（重构 G4），仅移动代码、不改逻辑。
 _run_agent 读取 graph 的可变全局 _ws_emit_callback，通过函数内延迟 import 获取当前值。
@@ -346,7 +346,6 @@ def _execute_replay_tool(tool: Any, name: str, args: dict[str, Any], run_id: str
 def _run_agent(
     messages,
     tools,
-    provider,
     model,
     api_key,
     base_url,

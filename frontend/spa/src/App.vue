@@ -219,11 +219,22 @@
                   <el-input v-model="configData.model" placeholder="如: deepseek-v4-pro, gpt-4o" />
                 </el-form-item>
                 <el-form-item label="API Key">
-                  <el-input v-model="configData.api_key" type="password" show-password placeholder="API Key" />
+                  <el-input v-model="configData.api_key" placeholder="API Key" />
                 </el-form-item>
                 <el-form-item label="Base URL">
                   <el-input v-model="configData.base_url" placeholder="如: https://api.deepseek.com" />
                 </el-form-item>
+                <div class="model-test-row">
+                  <el-button size="small" :loading="llmTesting" @click="testModelConnection('llm')">测试连接</el-button>
+                </div>
+                <el-alert
+                  v-if="llmTestResult"
+                  class="model-test-result"
+                  :type="llmTestResult.ok ? 'success' : 'error'"
+                  :closable="false"
+                  show-icon
+                  :title="llmTestResult.ok ? 'LLM 模型连接成功' : 'LLM 模型连接失败'"
+                >{{ llmTestResult.message }}</el-alert>
                 <el-form-item>
                   <el-checkbox v-model="configData.llm_vision_capable">
                     主模型支持多模态/视觉
@@ -247,7 +258,7 @@
                   <el-input v-model="configData.vision_model" placeholder="如: qwen-vl-max, glm-4v-flash" clearable />
                 </el-form-item>
                 <el-form-item label="API Key">
-                  <el-input v-model="configData.vision_api_key" type="password" show-password placeholder="视觉模型 API Key" />
+                  <el-input v-model="configData.vision_api_key" placeholder="视觉模型 API Key" />
                 </el-form-item>
                 <el-form-item label="Base URL">
                   <el-input v-model="configData.vision_base_url" placeholder="如: https://dashscope.aliyuncs.com/compatible-mode" clearable />
@@ -256,23 +267,39 @@
                   <el-input-number v-model="configData.vision_timeout" :min="10" :max="120" :step="5" style="width:140px" />
                   <span style="font-size:12px;color:var(--text-muted);margin-left:8px">视觉调用超时秒数（建议 30-60）</span>
                 </el-form-item>
+                <div class="model-test-row">
+                  <el-button size="small" :loading="visionTesting" @click="testModelConnection('vision')">测试连接</el-button>
+                </div>
+                <el-alert
+                  v-if="visionTestResult"
+                  class="model-test-result"
+                  :type="visionTestResult.ok ? 'success' : 'error'"
+                  :closable="false"
+                  show-icon
+                  :title="visionTestResult.ok ? '视觉备用模型连接成功' : '视觉备用模型连接失败'"
+                >{{ visionTestResult.message }}</el-alert>
               </el-form>
             </div>
 
             <!-- Embedding -->
             <div class="settings-group">
               <h4 class="settings-group-title">Embedding（RAG 向量化）</h4>
-              <el-form label-position="top" size="default">
-                <el-form-item label="Provider">
-                  <el-select v-model="configData.embedding_provider" style="width:100%">
-                    <el-option label="HuggingFace (本地)" value="huggingface" />
-                    <el-option label="OpenAI (兼容)" value="openai" />
-                  </el-select>
-                </el-form-item>
-                <el-form-item label="模型名称">
-                  <el-input v-model="configData.embedding_model" placeholder="如: BAAI/bge-large-zh-v1.5" />
-                </el-form-item>
-              </el-form>
+              <el-alert
+                v-if="onnxModelStatus && !onnxModelStatus.ready"
+                type="warning"
+                :closable="false"
+                show-icon
+                title="缺少默认 ONNX 模型"
+              >
+                <template #default>
+                  请将 <code>{{ onnxModelStatus.missing_files.join('、') }}</code>
+                  放到 <code>{{ onnxModelStatus.path }}</code>
+                </template>
+              </el-alert>
+              <template v-else-if="onnxModelStatus && onnxModelStatus.ready">
+                <div class="settings-readonly">默认本地 ONNX Runtime 模型</div>
+                <div class="settings-readonly-path">{{ onnxModelStatus.path }}</div>
+              </template>
             </div>
 
             <!-- 感知模式 & 安全等级 -->
@@ -549,7 +576,12 @@ const deviceFloatRef = ref(null);
 
 // 配置管理
 const configData = ref(null);
+const onnxModelStatus = ref(null);
 const configSaving = ref(false);
+const llmTesting = ref(false);
+const visionTesting = ref(false);
+const llmTestResult = ref(null);
+const visionTestResult = ref(null);
 
 // 计划审阅
 const planReviewVisible = ref(false);
@@ -1493,7 +1525,10 @@ async function reconnectDevice() {
 async function fetchConfig() {
   try {
     const res = await fetch("/api/config", { cache: "no-store" });
-    configData.value = await res.json();
+    const data = await res.json();
+    onnxModelStatus.value = data.onnx_model_status || null;
+    delete data.onnx_model_status;
+    configData.value = data;
   } catch (e) {
     ElMessage.error("加载配置失败");
   }
@@ -1511,7 +1546,7 @@ async function saveConfig() {
     const data = await res.json();
     if (data.status === "success") {
       ElMessage.success("配置已保存");
-      // 重新加载以获取脱敏后的 API Key
+      // 重新加载以同步最新配置
       await fetchConfig();
     } else {
       ElMessage.error("保存失败");
@@ -1520,6 +1555,39 @@ async function saveConfig() {
     ElMessage.error("保存配置失败");
   } finally {
     configSaving.value = false;
+  }
+}
+
+async function testModelConnection(target) {
+  if (!configData.value) return;
+  const isVision = target === 'vision';
+  const testing = isVision ? visionTesting : llmTesting;
+  const result = isVision ? visionTestResult : llmTestResult;
+  const model = isVision ? configData.value.vision_model : configData.value.model;
+  const apiKey = isVision ? configData.value.vision_api_key : configData.value.api_key;
+  const baseUrl = isVision ? configData.value.vision_base_url : configData.value.base_url;
+
+  if (!model?.trim() || !apiKey?.trim()) {
+    result.value = { ok: false, message: '请先填写模型名称和 API Key。' };
+    return;
+  }
+
+  testing.value = true;
+  result.value = null;
+  try {
+    const res = await fetch('/api/config/test-model', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, api_key: apiKey, base_url: baseUrl || '' }),
+    });
+    const data = await res.json();
+    result.value = res.ok && data.status === 'success'
+      ? { ok: true, message: data.message || '模型已响应。' }
+      : { ok: false, message: data.detail || '连接失败。' };
+  } catch (error) {
+    result.value = { ok: false, message: `请求失败：${error.message || error}` };
+  } finally {
+    testing.value = false;
   }
 }
 

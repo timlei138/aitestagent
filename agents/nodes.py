@@ -1293,7 +1293,6 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         result, tool_calls_log, loop_meta = _run_agent(
             msgs,
             AGENT_TOOLS,
-            llm["provider"],
             llm["model"],
             llm["api_key"],
             llm["base_url"],

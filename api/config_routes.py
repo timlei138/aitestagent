@@ -4,8 +4,8 @@ import logging
 from pathlib import Path
 
 import yaml
-from fastapi import APIRouter
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, SecretStr
 
 import app_paths
 
@@ -18,10 +18,6 @@ _EDITABLE_FIELDS = (
     "model",
     "api_key",
     "base_url",
-    "embedding_provider",
-    "embedding_model",
-    "embedding_api_key",
-    "embedding_base_url",
     "perception_mode",
     "safety_level",
     # ── 视觉备用模型 ──
@@ -36,7 +32,8 @@ _EDITABLE_FIELDS = (
     "replay_executor",
 )
 
-_SECRET_FIELDS = ("api_key", "embedding_api_key", "vision_api_key")
+# 敏感字段保存到 config.local.yaml，避免写入已 git 跟踪的 config.yaml
+_SECRET_FIELDS = ("api_key", "vision_api_key")
 
 
 def _get_config():
@@ -46,14 +43,16 @@ def _get_config():
     return config
 
 
-def _mask(value: str | None) -> str:
-    """脱敏 API Key：保留前4后4，中间用 *** 替代。"""
-    if not value:
-        return ""
-    s = str(value)
-    if len(s) <= 8:
-        return "***"
-    return f"{s[:4]}***{s[-4:]}"
+def _get_onnx_model_status() -> dict[str, object]:
+    """返回固定 ONNX 模型目录的就绪状态，供设置页展示。"""
+    model_dir = app_paths.ONNX_MODEL_DIR
+    required_files = ("model.onnx", "tokenizer.json")
+    missing_files = [name for name in required_files if not (model_dir / name).is_file()]
+    return {
+        "ready": not missing_files,
+        "path": str(model_dir),
+        "missing_files": missing_files,
+    }
 
 
 # ── GET：读取当前配置 ──
@@ -62,14 +61,9 @@ def _mask(value: str | None) -> str:
 @router.get("")
 async def get_config():
     cfg = _get_config()
-    data = {}
-    for field in _EDITABLE_FIELDS:
-        val = getattr(cfg, field, None)
-        if field in _SECRET_FIELDS:
-            data[field] = _mask(val)
-        else:
-            data[field] = val if val is not None else ""
-    return data
+    payload = {field: getattr(cfg, field, None) or "" for field in _EDITABLE_FIELDS}
+    payload["onnx_model_status"] = _get_onnx_model_status()
+    return payload
 
 
 # ── PUT：更新配置 ──
@@ -79,10 +73,6 @@ class ConfigUpdateRequest(BaseModel):
     model: str | None = None
     api_key: str | None = None
     base_url: str | None = None
-    embedding_provider: str | None = None
-    embedding_model: str | None = None
-    embedding_api_key: str | None = None
-    embedding_base_url: str | None = None
     perception_mode: str | None = None
     safety_level: str | None = None
     vision_model: str | None = None
@@ -92,6 +82,50 @@ class ConfigUpdateRequest(BaseModel):
     llm_vision_capable: bool | None = None
     context_history_steps: int | None = None
     replay_executor: str | None = None
+
+
+class ModelTestRequest(BaseModel):
+    model: str = ""
+    api_key: str = ""
+    base_url: str = ""
+
+
+def _safe_error_message(exc: Exception, api_key: str) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    if api_key:
+        message = message.replace(api_key, "***")
+    return message[:500]
+
+
+@router.post("/test-model")
+async def test_model_connection(req: ModelTestRequest):
+    """使用未保存的模型配置发送最小请求，验证连接、鉴权和模型可用性。"""
+    model = req.model.strip()
+    api_key = req.api_key.strip()
+    base_url = req.base_url.strip() or None
+    if not model or not api_key:
+        raise HTTPException(status_code=400, detail="请填写模型名称和 API Key")
+
+    try:
+        from langchain_openai import ChatOpenAI
+
+        client = ChatOpenAI(
+            model=model,
+            api_key=SecretStr(api_key),
+            base_url=base_url,
+            temperature=0,
+            timeout=15,
+            max_retries=0,
+        )
+        response = client.invoke("Reply with OK.")
+        content = str(getattr(response, "content", "") or "").strip()
+        return {"status": "success", "message": content[:200] or "模型已响应"}
+    except Exception as exc:
+        logger.info("Model connection test failed for model=%s: %s", model, type(exc).__name__)
+        raise HTTPException(
+            status_code=400,
+            detail=_safe_error_message(exc, api_key),
+        ) from exc
 
 
 @router.put("")
@@ -105,9 +139,6 @@ async def update_config(req: ConfigUpdateRequest):
 
     for field, new_val in updates.items():
         if field not in _EDITABLE_FIELDS:
-            continue
-        # API key 脱敏值回传 → 保留原值
-        if field in _SECRET_FIELDS and new_val and "***" in new_val:
             continue
 
         normalized_val = new_val

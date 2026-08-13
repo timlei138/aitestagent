@@ -5,19 +5,101 @@ import os as _os
 from abc import ABC, abstractmethod
 from typing import Any
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
-# ═══ 模块加载时检测本地缓存，避免每次启动 ~40 次 HTTP HEAD 验证 ═══
-_cache_dir = _os.path.join(
-    _os.path.expanduser("~"),
-    ".cache",
-    "huggingface",
-    "hub",
-    "models--BAAI--bge-large-zh-v1.5",
-)
-if _os.path.isdir(_cache_dir):
-    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    logger.info("HF model cached locally, network checks disabled")
+# ═══════════════════════════════════════════════════════════════════
+# ONNX Embedding 适配器（不依赖 PyTorch / sentence-transformers）
+# ═══════════════════════════════════════════════════════════════════
+
+
+class ONNXEmbeddings:
+    """基于 ONNX Runtime 的轻量 embedding 适配器。
+
+    完全不调 PyTorch，打包后可减少约 300 MB。
+    需要：
+    - onnxruntime
+    - tokenizers
+    - ONNX 模型文件（由 scripts/export_onnx_model.py 导出）
+    """
+
+    def __init__(self, model_dir: str, normalize: bool = True):
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        self._normalize = normalize
+        model_path = _os.path.join(model_dir, "model.onnx")
+        tokenizer_path = _os.path.join(model_dir, "tokenizer.json")
+
+        if not _os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"ONNX 模型未找到: {model_path}\n"
+                f"请先运行: python scripts/export_onnx_model.py"
+            )
+        if not _os.path.isfile(tokenizer_path):
+            raise FileNotFoundError(f"tokenizer.json 未找到: {tokenizer_path}")
+
+        self._session = ort.InferenceSession(
+            model_path, providers=["CPUExecutionProvider"]
+        )
+        self._tokenizer = Tokenizer.from_file(tokenizer_path)
+        self._tokenizer.enable_padding()
+        self._tokenizer.enable_truncation(max_length=512)
+
+        # 获取模型输入名称
+        self._input_names = [inp.name for inp in self._session.get_inputs()]
+        logger.info(
+            "ONNXEmbeddings loaded: model=%s inputs=%s",
+            model_dir,
+            self._input_names,
+        )
+
+    def _encode_batch(self, texts: list[str]) -> np.ndarray:
+        encodings = self._tokenizer.encode_batch(texts)
+        input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
+        token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
+
+        feed = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if "token_type_ids" in self._input_names:
+            feed["token_type_ids"] = token_type_ids
+
+        outputs = self._session.run(None, feed)
+        # outputs[0] = last_hidden_state (batch, seq, hidden)
+        hidden = outputs[0]
+
+        # Mean pooling (masked)
+        mask = attention_mask[:, :, np.newaxis].astype(np.float32)
+        summed = np.sum(hidden * mask, axis=1)
+        count = np.clip(mask.sum(axis=1), a_min=1e-9, a_max=None)
+        embeddings = summed / count
+
+        if self._normalize:
+            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+            norms = np.clip(norms, a_min=1e-12, a_max=None)
+            embeddings = embeddings / norms
+
+        return embeddings
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        # 分批处理避免内存爆炸（每批 32 条）
+        batch_size = 32
+        all_embeds: list[list[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            vecs = self._encode_batch(batch)
+            all_embeds.extend(vecs.tolist())
+        return all_embeds
+
+    def embed_query(self, text: str) -> list[float]:
+        vec = self._encode_batch([text])
+        return vec[0].tolist()
 
 
 class VectorStoreBackend(ABC):
@@ -59,15 +141,11 @@ class VectorStoreBackend(ABC):
 
 
 class ChromaBackend(VectorStoreBackend):
-    """ChromaDB 向量存储实现。支持 HuggingFace 本地 embedding 和 OpenAI 远程 embedding。"""
+    """使用默认本地 ONNX embedding 的 ChromaDB 向量存储实现。"""
 
     def __init__(
         self,
         persist_dir: str = "",
-        embedding_provider: str = "huggingface",  # huggingface | openai
-        embedding_model: str = "BAAI/bge-large-zh-v1.5",
-        api_key: str | None = None,
-        base_url: str | None = None,
     ):
         import app_paths
 
@@ -75,21 +153,8 @@ class ChromaBackend(VectorStoreBackend):
             persist_dir = app_paths.KNOWLEDGE_DIR_STR
         from langchain_chroma import Chroma
 
-        if embedding_provider == "huggingface":
-            from langchain_huggingface import HuggingFaceEmbeddings
-
-            embeddings = HuggingFaceEmbeddings(
-                model_name=embedding_model,
-                model_kwargs={"device": "cpu"},
-                encode_kwargs={"normalize_embeddings": True},
-            )
-        else:
-            # OpenAI 远程 embedding: 需要 API Key
-            from langchain_openai import OpenAIEmbeddings
-
-            embeddings = OpenAIEmbeddings(
-                model=embedding_model, api_key=api_key, base_url=base_url
-            )
+        # ONNX Runtime 推理（无 PyTorch 依赖，节省约 300 MB）。
+        embeddings = ONNXEmbeddings(model_dir=str(app_paths.ONNX_MODEL_DIR))
 
         self._store = Chroma(
             collection_name="app_knowledge",
