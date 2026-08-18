@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 
 
 def _estimate_tokens(text: str) -> int:
@@ -46,7 +47,7 @@ def _calc_budget(goal: dict) -> dict[str, int]:
     )
     # T9: 提高预算上限。原公式（36 + pages*12 + verifications*10）对多子目标
     # 任务偏紧——例如「设为当前(确定/取消)+删除全部+验证空状态」(3 页/4 验证)
-    # 仅 112 次，agent 在跑完所有验证、还没来得及调用 report_done 收尾时就被
+    # 仅 112 次，agent 在跑完所有验证、evaluator 尚未来得及收敛时就被
     # MAX_TOOL_CALLS 掐断，被判失败。系数整体上调约 1.6x，并放宽两个 cap，
     # 给复杂任务留足收尾余量（T8 已消除禁用按钮空转，放宽不会 reintroduce 死循环）。
     max_tool_calls_total = 48 + pages * 20 + verifications * 18
@@ -61,32 +62,16 @@ def _calc_budget(goal: dict) -> dict[str, int]:
     }
 
 
-def _replay_key_actions(goal: dict) -> list:
-    """取 v4/v3 execution_plan 的 key_actions；无则空列表。"""
-    if not isinstance(goal, dict):
-        return []
-    plan = goal.get("execution_plan")
-    if not isinstance(plan, dict):
-        return []
-    if plan.get("schema_version") == 4:
-        effective = plan.get("effective")
-        actions = (effective or {}).get("key_actions") if isinstance(effective, dict) else []
-    else:
-        actions = plan.get("key_actions")
-    return [a for a in (actions or []) if isinstance(a, dict)]
-
-
-def _calc_budget_from_state(state: dict) -> dict[str, int]:
+def _calc_budget_from_state(state: Mapping[str, object]) -> dict[str, int]:
     goal = state.get("goal_description", {}) or {}
-    budget = _calc_budget(goal)
-    # 回放模式：主图每 iteration 只推进 1 个脚本步骤（one_step / 直执），
-    # 迭代预算必须覆盖脚本长度 + recovery 预算 + entry 对齐/收尾余量，
-    # 否则 26 步脚本会在默认 cap(≤40) 内被 route_after_agent 提前收敛。
-    if str(state.get("_run_type", "") or "") == "rerun":
-        actions = _replay_key_actions(goal)
-        if actions:
-            recovery_budget = int(goal.get("replay_recovery_budget", 3) or 3)
-            budget["max_agent_iterations"] = min(
-                len(actions) + max(1, recovery_budget) + 4, 80
-            )
-    return budget
+    return _calc_budget(goal)
+
+
+def _calc_mode_phase_budget(state: Mapping[str, object], mode: str) -> int:
+    """Return the bounded per-phase iteration allowance for degradable modes."""
+    global_budget = _calc_budget_from_state(state)["max_agent_iterations"]
+    if mode == "guided":
+        return max(3, global_budget // 2)
+    if mode == "direct":
+        return max(2, global_budget // 3)
+    return global_budget

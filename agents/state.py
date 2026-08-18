@@ -1,8 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, TypedDict
+import operator
+from typing import Any, Annotated, TypedDict
 
 from pydantic import BaseModel, Field
+
+
+def _last_value(prev: Any, new: Any) -> Any:
+    """后写覆盖（last-value-wins）：用于派生/标量字段，避免并发写触发 InvalidUpdateError。"""
+    return new
 
 # ═══════════════════════════════════════════
 #  Planner 结构化输出
@@ -16,6 +22,39 @@ class TestGoalOutput(BaseModel):
     target_pages: list[str] = Field(default_factory=list)
     verification: list[str] = Field(default_factory=list)
     hints: list[str] = Field(default_factory=list)
+    parameter_slots: list[dict[str, Any]] = Field(default_factory=list)
+    action_semantics: list[str] = Field(default_factory=list)
+
+
+class ParameterSlot(BaseModel):
+    """Structured parameter slot extracted from user request / goal."""
+
+    name: str = ""
+    type: str = ""  # duration, number, text, time, count, enum
+    unit: str = ""  # minute, hour, px, item, ...
+    value: Any = None
+    original: str = ""  # 原始文本，如 "50分钟"
+    source: str = ""  # "user_request" | "goal" | "verification"
+
+
+# Backward-compatible helper: convert ParameterSlot or plain dict to dict.
+def _slot_to_dict(slot: Any) -> dict[str, Any]:
+    if isinstance(slot, ParameterSlot):
+        return {
+            "name": slot.name,
+            "type": slot.type,
+            "unit": slot.unit,
+            "value": slot.value,
+            "original": slot.original,
+            "source": slot.source,
+        }
+    if isinstance(slot, dict):
+        return dict(slot)
+    return {}
+
+
+def _slots_to_dicts(slots: list[Any]) -> list[dict[str, Any]]:
+    return [_slot_to_dict(s) for s in slots or [] if s]
 
 
 # ═══════════════════════════════════════════
@@ -28,10 +67,15 @@ class TestState(TypedDict, total=False):
     app_package: str
     app_name: str
     goal_description: dict[str, Any]
-    step_history: list[dict[str, Any]]
+    verification_contract: dict[str, Any]
+    clause_state: dict[str, Any]
+    step_history: Annotated[list[dict[str, Any]], operator.add]
     messages: list[dict[str, Any]]
-    conclusion: str
-    status: str
+    # 标量派生字段：多节点（_stop_or_continue / mode_selection 的 goto="reporter" 路径）
+    # 会在同一步与 reporter 一起写 status/conclusion，用 _last_value（后写覆盖）
+    # 避免 LangGraph InvalidUpdateError。
+    conclusion: Annotated[str, _last_value]
+    status: Annotated[str, _last_value]
     started_at: str
     step_times: list[dict[str, Any]]
     # V2: 双维度结果
@@ -40,13 +84,28 @@ class TestState(TypedDict, total=False):
     verification_results: (
         list  # [{"item": "...", "result": "passed|failed|unknown", "screenshot": ""}]
     )
-    budget_violation_count: int  # P0.4: token budget violations in current run
-    llm_call_count: int
-    tool_call_400_count: int
-    tool_call_400_rate: float
+    # 累加型计数器：用 reducer（operator.add）避免多节点同一步写入触发
+    # LangGraph InvalidUpdateError。各节点只上报自身本次增量（delta）。
+    budget_violation_count: Annotated[int, operator.add]  # P0.4: token budget violations
+    llm_call_count: Annotated[int, operator.add]
+    tool_call_400_count: Annotated[int, operator.add]
+    tool_call_400_rate: Annotated[float, _last_value]  # 派生比率，后写覆盖
     token_usage: (
         dict  # O1: 单次运行 token 消耗汇总（input/output/total/cached/llm_calls）
     )
+    execution_mode: str  # direct / guided / explore
+    lifecycle_state: str  # Bootstrapping / Direct / Guided / Explore / Terminal
+    plan_id: str
+    plan_trust: str
+    mode_selection_reason: str
+    selected_plan_actions: list[dict[str, Any]]
+    mode_transition_events: list[dict[str, Any]]
+    actual_environment_key: str
+    environment_compatibility_score: float
+    environment_compatibility_reasons: list[str]
+    _guided_downgrade_count: int
+    _direct_action_cursor: int
+    _direct_downgrade_count: int
     _tool_calls_log: list  # 工具调用实时日志（存入 state，不依赖 ctx）
     _finalization_hint_injected: bool
     _rag_injected_once: bool
@@ -57,12 +116,3 @@ class TestState(TypedDict, total=False):
     # 用户手动停止标志（由 orchestrator.request_stop 置位，节点入口检查）。
     # 命中时让图收敛到 reporter 写 cancelled，不影响其他状态的正常流转。
     _stop_requested: bool
-    _run_type: str
-    _source_run_id: str | None
-    _source_case_id: str | None
-    _execution_plan_revision: int
-    _replay_step_idx: int
-    _replay_mode: str
-    _replay_input_actuals: dict[str, str]
-    _replay_recovery_used: int
-    _replay_nav_streak: int

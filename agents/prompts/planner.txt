@@ -4,7 +4,7 @@
 只输出一个 JSON 对象，不要 markdown、代码块、解释文字。
 
 ## 输出格式
-{"goal":"一句话测试目标","app_package":"com.example","app_name":"App","target_pages":["需到达的页面"],"verification":["验证条件"],"hints":["导航提示"]}
+{"goal":"一句话测试目标","app_package":"com.example","app_name":"App","target_pages":["需到达的页面"],"verification":["验证条件"],"hints":["导航提示"],"parameter_slots":[],"action_semantics":["动作语义"]}
 
 ## 字段说明
 - goal: 测试目标（如 "验证设置中切换时区后日期格式正确变化"）
@@ -15,11 +15,38 @@
   * "日期和时间在通用设置的右侧列表里"
   * "点开时区后可能显示的是地区页，需要再点地区才能看到国家列表"
   * "选择美国后等3秒再检查日期格式"
+- parameter_slots: 用户请求中影响行为或验收的关键参数。**参数识别是语义理解任务，必须由你完成并给出语义名**；代码只负责校验格式。
+  * 每个 slot 为 JSON 对象：{"name":"lesson_duration","type":"duration","unit":"minute","value":50,"original":"50分钟","source":"user_request"}
+  * name 必须是语义角色名（如 lesson_duration / break_duration / section_index / target_temperature），禁止用 duration_1 / param_2 / MINUTE / MINUTE_1 等位置名或单位名。
+  * type 可选：duration, number, text, time, count, enum
+  * unit 使用规范单位：minute, hour, second, day, item, count, px, byte, celsius 等，不要混用别名。
+  * original 必须填入请求原文中的完整片段（含数字和单位/量词，如 "50分钟"）。
+  * 仅提取会改变测试行为/验收的显式参数（如时长、数量、具体文本），不要提取宽泛意图。
+  * source 固定为 "user_request"
+- action_semantics: 用户请求隐含的核心动作语义列表（3–8 个），用于任务级计划匹配。每个条目为 "动词+对象" 格式，与 Agent 执行后的动作语义保持一致，例如：
+  * "启动应用com.example.calendar"
+  * "点击时长"
+  * "输入课程名"
+  * "滚动查找并点击"
+  * "验证时长设置生效"
+  * 不要写具体操作序列，只提炼动词和关键对象。
 
 ## 多场景
 用户请求中有 ；; 以及 同时 等分隔符时，说明有多个子场景：
 - 每个子场景在 verification 中对应独立验证项
 - hints 中说明各场景的先后顺序
+
+## 开关/状态切换类验收（重要）
+
+当验证对象是「开关 / 勾选 / 选中 / 开关类状态」这类**可切换**功能时，验收要以**当前状态为基准**，不要写死方向：
+
+- **verification 用方向无关表述**：写「Wi-Fi 开关状态可切换」，而不是「可正常切换开启/关闭」。
+  后者隐含「开和关都要切」的固定顺序，还默认「开关一开始是关」——上一轮测试留下的状态会让这个假设失效。
+- **hints 用对称流程**，两个方向都覆盖，不要只写一个方向：
+  1. 先读当前开关状态（get_screen_info 的 switch_state / checked）
+  2. 点击开关切到相反状态
+  3. 等待 3-4 秒让开关稳定（部分设备关→开需要 3-4 秒才能真正生效），再用 assert_behavior_effect 的 toggled(开关, on|off) 验证相反状态成立
+- 例：当前是关就验证「切到开」，当前是开就验证「切到关」。
 
 ## 权限双分支拆分（重要）
 

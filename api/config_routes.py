@@ -28,8 +28,6 @@ _EDITABLE_FIELDS = (
     "llm_vision_capable",
     # ── 上下文历史步数 ──
     "context_history_steps",
-    # ── 回放执行器 ──
-    "replay_executor",
 )
 
 # 敏感字段保存到 config.local.yaml，避免写入已 git 跟踪的 config.yaml
@@ -83,7 +81,6 @@ class ConfigUpdateRequest(BaseModel):
     vision_timeout: int | None = None
     llm_vision_capable: bool | None = None
     context_history_steps: int | None = None
-    replay_executor: str | None = None
 
 
 class ModelTestRequest(BaseModel):

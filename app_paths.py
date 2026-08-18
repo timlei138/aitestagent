@@ -35,6 +35,7 @@ CONFIG_DIR = APP_DATA / "config" if FROZEN else APP_DATA
 # ── 数据子目录 ──
 SCREENSHOT_DIR = DATA_DIR / "screenshots"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
+KNOWLEDGE_V2_DIR = DATA_DIR / "knowledge_v2"
 DB_PATH = DATA_DIR / "test_history.db"
 APPS_YAML = DATA_DIR / "apps.yaml"
 # ONNX embedding 模型独立存放在用户目录，不随应用包分发。
@@ -62,7 +63,7 @@ def ensure_dirs() -> None:
         LOG_DIR,
         LOG_RUN_DIR,
         SCREENSHOT_DIR,
-        KNOWLEDGE_DIR,
+        KNOWLEDGE_V2_DIR,
         ONNX_MODEL_DIR,
     ):
         d.mkdir(parents=True, exist_ok=True)
@@ -107,6 +108,7 @@ LOG_DIR_STR = str(LOG_DIR)
 LOG_RUN_DIR_STR = str(LOG_RUN_DIR)
 SCREENSHOT_DIR_STR = str(SCREENSHOT_DIR)
 KNOWLEDGE_DIR_STR = str(KNOWLEDGE_DIR)
+KNOWLEDGE_V2_DIR_STR = str(KNOWLEDGE_V2_DIR)
 DB_PATH_STR = str(DB_PATH)
 
 

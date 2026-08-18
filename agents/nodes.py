@@ -7,14 +7,11 @@ build_graph 也以延迟 import 方式引用本模块，避免加载期循环依
 
 from __future__ import annotations
 
-import base64
-import copy
 import hashlib
 import json
 import logging
 import os
 import re
-import secrets
 from datetime import datetime
 from typing import Any, Annotated
 
@@ -46,30 +43,28 @@ from agents.loop_control import (
 from agents.rag_context import (
     _apply_click_preferences,
     _rag_ctx,
-    _should_force_query_app_knowledge,
+    _should_force_request_knowledge,
     _should_include_rag,
 )
 from agents.verification import (
     _build_verification_key_maps,
-    _collect_verification_results,
     _determine_execution_status,
     _goal_verification_items,
-    _merge_goal_verification_results,
     _normalize_verification_text,
-    _resolve_verification_key,
+    evaluate_verification,
 )
 from agents.llm_runtime import (
     _FINALIZATION_REMAINING_TOOL_BUDGET,
     _build_tool_target,
     _call_retry,
     _ensure_device_alive,
-    _execute_replay_tool,
     _llm_cfg,
     _run_agent,
 )
 from tools import AGENT_TOOLS, get_tool_context, _extract_click_preferences_from_rag
 
 import app_paths
+from agents.run_trace import compute_resolution_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +128,7 @@ def _stop_or_continue(state: TestState, ctx) -> Command | None:
         update={
             "conclusion": conclusion,
             "status": "stopped",
-            "step_history": nh,
+            "step_history": [nh[-1]],
             "_stop_requested": True,
         },
         goto="reporter",
@@ -190,399 +185,10 @@ PLANNER_SYSTEM = _load_prompt("planner.txt")
 AGENT_SYSTEM = (
     _load_prompt("agent_common.txt") + "\n" + _load_prompt("agent_explore.txt")
 )
-REPLAY_AGENT_SYSTEM = (
-    _load_prompt("agent_common.txt") + "\n" + _load_prompt("agent_replay.txt")
-)
-
-
-def _extract_activity_name(activity: str) -> str:
-    text = str(activity or "").strip()
-    return text.split(".")[-1] if text else ""
-
-
-def _effective_replay_plan(goal_desc: dict[str, Any]) -> dict[str, Any] | None:
-    if not isinstance(goal_desc, dict):
-        return None
-    plan = goal_desc.get("execution_plan")
-    if not isinstance(plan, dict):
-        return None
-    if plan.get("schema_version") == 4:
-        effective = plan.get("effective")
-        if isinstance(effective, dict) and effective.get("schema_version") == 4:
-            return effective
-        return None
-    if isinstance(plan.get("key_actions"), list):
-        return plan
-    return None
-
-
-def _effective_replay_actions(goal_desc: dict[str, Any]) -> list[dict[str, Any]]:
-    effective = _effective_replay_plan(goal_desc)
-    if not isinstance(effective, dict):
-        return []
-    actions = effective.get("key_actions") or []
-    if not isinstance(actions, list):
-        return []
-    return [item for item in actions if isinstance(item, dict)]
-
-
-def _has_replay_actions(state: TestState) -> bool:
-    if str(state.get("_run_type", "") or "") != "rerun":
-        return False
-    return bool(_effective_replay_actions(state.get("goal_description", {}) or {}))
 
 
 def _select_agent_system(state: TestState) -> str:
-    return REPLAY_AGENT_SYSTEM if _has_replay_actions(state) else AGENT_SYSTEM
-
-
-def _get_actual_text(original_text: str, actuals: dict[str, str]) -> str:
-    if original_text not in actuals:
-        actuals[original_text] = original_text + "_" + secrets.token_hex(2)
-    return actuals[original_text]
-
-
-def _resolve_action_texts(
-    action: dict[str, Any], actuals: dict[str, str]
-) -> dict[str, Any]:
-    resolved = copy.deepcopy(action)
-    for original, actual in actuals.items():
-        for holder, key in (
-            (resolved.get("tool_input"), "text"),
-            (resolved.get("preferred_locator"), "label"),
-            (resolved.get("postcondition"), "expected_value"),
-            (resolved.get("args"), "text"),
-        ):
-            if isinstance(holder, dict) and holder.get(key) == original:
-                holder[key] = actual
-    return resolved
-
-
-def _replay_tool_instruction(action: dict[str, Any]) -> str:
-    tool = str(action.get("tool") or "")
-    if tool == "click":
-        locator = action.get("preferred_locator") or {}
-        if isinstance(locator, dict):
-            args = ", ".join(
-                f"{k}={v!r}" for k, v in locator.items() if v not in (None, "", [])
-            )
-            return f"click({args})" if args else "click(label='')"
-    tool_input = dict(action.get("tool_input") or action.get("args") or {})
-    if isinstance(tool_input, dict):
-        # vision_verify 通道：canvas 值弹窗期不在 UI 树，执行时把 expected_value
-        # 转成 verify 描述交给 vision 模型判定，结论经 verify_decision evidence 回读
-        post = action.get("postcondition") or {}
-        expected_value = str(post.get("expected_value", "") or "")
-        if (
-            tool == "vision_tap"
-            and str(action.get("postcondition_channel", "") or "") == "vision_verify"
-            and expected_value
-        ):
-            tool_input.setdefault("verify", f"当前页面是否显示 {expected_value}")
-        args = ", ".join(
-            f"{k}={v!r}" for k, v in tool_input.items() if v not in (None, "", [])
-        )
-        return f"{tool}({args})" if args else f"{tool}()"
-    return f"{tool}()"
-
-
-def _resolve_replay_mode(current_mode: str, precondition_match: bool) -> str:
-    """决定本 turn 的 replay_mode。
-
-    若上一 turn 已处于 recovery，则保持 recovery，避免 postcondition 失败后
-    precondition 仍匹配时被无条件覆写回 script 导致死循环。
-    仅在当前为 script 或初始状态时，根据 precondition 是否匹配决定。
-    """
-    if current_mode == "script":
-        return "script" if precondition_match else "recovery"
-    if current_mode == "recovery":
-        return "recovery"
-    return "script" if precondition_match else "recovery"
-
-
-def _build_direct_click_args(
-    preferred_locator: dict[str, Any] | None,
-    tool_input: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """为 replay direct 模式构造 click 的实际入参。
-
-    优先使用 preferred_locator 中的稳定属性（rid / label+class_name+path_contains）；
-    只有 locator 完全不稳定时才回退追加 tool_input 中的 index。
-    """
-    args = {
-        k: v for k, v in (preferred_locator or {}).items() if v not in (None, "", [])
-    }
-    stable = bool(
-        args.get("rid")
-        or (args.get("label") and args.get("class_name") and args.get("path_contains"))
-    )
-    if not stable:
-        _ti = tool_input or {}
-        if isinstance(_ti.get("index"), int) and _ti["index"] >= 0:
-            args["index"] = _ti["index"]
-    return args
-
-
-def _perceive_page_text(ctx: Any) -> str:
-    """感知当前页并拼接元素 label 文本。失败返回 ""（调用方自行降级）。"""
-    try:
-        if not ctx or not getattr(ctx, "perceiver", None):
-            return ""
-        u = ctx.perceiver.perceive()
-        return " ".join(
-            str(getattr(e, "label", "") or "").strip()
-            for e in (getattr(u, "elements", None) or [])
-            if str(getattr(e, "label", "") or "").strip()
-        )
-    except Exception:
-        return ""
-
-
-def _build_replay_system_instruction(
-    *,
-    action: dict[str, Any],
-    idx: int,
-    total: int,
-    current_activity: str,
-    mode: str,
-    recovery_used: int,
-    recovery_budget: int,
-) -> str:
-    pre = action.get("precondition") or {}
-    expected_activity = str(pre.get("expected_activity", "") or "")
-    if mode == "script":
-        post = action.get("postcondition") or {}
-        return (
-            f"## REPLAY_SCRIPT_STEP [{idx + 1}/{total}]\n"
-            f"当前页面={current_activity or 'unknown'}，脚本前置页面={expected_activity or 'unknown'}。\n"
-            "严格按以下操作执行，不要自由探索：\n"
-            f"- tool: {action.get('tool', '')}\n"
-            f"- instruction: {_replay_tool_instruction(action)}\n"
-            f"- postcondition: {post!r}\n"
-            "执行后等待系统判定是否推进到下一步。"
-        )
-    return (
-        "## REPLAY_RECOVERY\n"
-        f"当前页面={current_activity or 'unknown'}，脚本期望页面={expected_activity or 'unknown'}，"
-        f"当前目标步骤={idx + 1}/{total}。\n"
-        f"已使用 recovery 步数={recovery_used}/{recovery_budget}。\n"
-        "如果当前页面存在与脚本无关的弹窗/覆盖层（如导入弹窗、广告等），"
-        '优先使用 press_key("back") 关闭它，然后重试脚本步骤。\n'
-        "请优先使用确定性工具恢复路径（click 带 rid 或 index、get_screen_info）。"
-    )
-
-
-# 回放直执允许的工具白名单：参数完全确定、无需主 LLM 决策。
-# 名单外的工具（如出现意外类型）自动降级到 LLM 路径。
-_REPLAY_DIRECT_TOOLS = {
-    "click",
-    "type_input",
-    "vision_tap",
-    "set_permission_intent",
-    "click_and_check",
-    "launch_app",
-    "assert_page_contains",
-    "assert_element_exists",
-    "assert_verification",
-    "report_done",
-}
-
-# 只读/导航工具：不计入脚本步骤的 tool_match 判定（跳过取 last_exec），
-# 也不因"本轮只调用了它们"而直接误烧 recovery 预算（有容忍上限）。
-_REPLAY_READ_ONLY_TOOLS = {
-    "get_screen_info",
-    "check_page_health",
-    "query_app_knowledge",
-    "visual_check",
-    "detect_popup",
-    "detect_overlay",
-}
-
-
-def _replay_business_popup_present(ctx: Any) -> bool:
-    """单发业务弹窗检测（无重试，供闸门用）：UI 树中存在含弹窗关键词的可点击按钮。"""
-    try:
-        if not ctx or not getattr(ctx, "device", None):
-            return False
-        import xml.etree.ElementTree as _ET
-
-        from tools.perceive_tools import _POPUP_KEYWORDS
-
-        root = _ET.fromstring(ctx.device.dump_hierarchy())
-        for node in root.iter():
-            if node.get("clickable") != "true":
-                continue
-            for cand in (
-                (node.get("text") or "").strip(),
-                (node.get("content-desc") or "").strip(),
-            ):
-                if cand and any(kw in cand for kw in _POPUP_KEYWORDS):
-                    return True
-        return False
-    except Exception:
-        return False
-
-
-def _replay_popup_blocks_next(
-    ctx: Any, actions: list[dict[str, Any]], idx: int, after_activity: str
-) -> bool:
-    """同宿主弹窗补盲：当前步骤判全过时调用。仅当检测到业务弹窗、且下一步
-    脚本动作期望的 Activity 不是当前页（弹窗在阻挡前进路径）时返回 True。
-    弹窗流程（下一步仍在本页操作滚轮/输入框）不触发，避免误杀脚本内弹窗。"""
-    try:
-        nxt = actions[idx + 1] if idx + 1 < len(actions) else None
-        if not isinstance(nxt, dict):
-            return False
-        nxt_pre = str(((nxt.get("precondition") or {}).get("expected_activity")) or "")
-        if not nxt_pre or (after_activity and nxt_pre in after_activity):
-            return False
-        return _replay_business_popup_present(ctx)
-    except Exception:
-        return False
-
-
-def _parse_vision_decision(observation: str) -> str:
-    """Task 10: 从 click_and_check / visual_check 的 observation 中提取 decision。
-
-    支持格式:
-    - click_and_check: '...[yes/no]...'
-    - visual_check JSON: '{"decision": "yes/no", ...}'
-    - verify_decision= 格式: 'verify_decision=yes/no'
-
-    返回: 'yes' / 'no' / '' (无法解析)
-    """
-    obs = str(observation or "").strip()
-    if not obs:
-        return ""
-    # click_and_check 格式: 匹配 [yes] 或 [no]
-    m = re.search(r"\[(yes|no)\]", obs, re.IGNORECASE)
-    if m:
-        return m.group(1).lower()
-    # visual_check 格式: JSON 中 decision 字段
-    if obs.startswith("{"):
-        try:
-            data = json.loads(obs)
-            decision = str(data.get("decision", "") or "").lower()
-            if decision in ("yes", "no"):
-                return decision
-        except (json.JSONDecodeError, TypeError):
-            pass
-    # verify_decision= 格式
-    m2 = re.search(r"verify_decision\s*=\s*(yes|no)", obs, re.IGNORECASE)
-    if m2:
-        return m2.group(1).lower()
-    return ""
-
-
-# Task 10: 回溯扫描范围（最近 N 个 tool_log 条目）
-# 设为 10 以覆盖 vision_tap 操作 + 多次确认弹窗的典型序列
-_VERIFICATION_LOOKBACK = 10
-# Task 10: 可提供证据的工具
-_VISION_EVIDENCE_TOOLS = ("click_and_check", "visual_check", "vision_tap")
-
-# Task 10: verify key 格式校验（^v\d+$），避免自然语言 verify 被误当 key
-# 例如 vision_tap 的 tool_input.verify = "结束分钟列当前选中值是否为53" 不应被当作 key
-_VERIFY_KEY_RE = re.compile(r"^v\d+$")
-
-
-def _build_replay_verification_args(
-    action: dict[str, Any],
-    actions: list[dict[str, Any]],
-    tool_log: list[dict[str, Any]],
-    goal: dict[str, Any],
-) -> dict[str, Any]:
-    """直执 assert_verification 的诚信策略 + Task 10 证据回溯：
-
-    1. 先查关联的 assert_page_contains / assert_element_exists（结构化断言）
-    2. 若无关联断言，向前扫描最近 _VERIFICATION_LOOKBACK 步的
-       click_and_check / visual_check / vision_tap 结果，提取 decision 作为证据
-       - 2a: 优先按 verify key 精确关联（避免跨 verification 误读）
-       - 2b: 无 key 时退化为位置扫描（跳过已关联其他 key 的 action）
-    3. 仍无证据时报 unknown（需人工复核），不猜测为 passed
-
-    返回的 dict 额外包含 _evidence_source 字段，供 run_trace 指标采集。
-    """
-    key = str(action.get("verify_key") or "")
-    items = [str(x or "") for x in (goal.get("verification") or [])]
-    v_idx = int(key[1:]) if key.startswith("v") and key[1:].isdigit() else -1
-    condition = items[v_idx] if 0 <= v_idx < len(items) else (key or "验证项")
-
-    # ── 第 1 层：关联断言（assert_page_contains / assert_element_exists）──
-    linked_idx = {
-        i
-        for i, a in enumerate(actions)
-        if str(a.get("verify") or "") == key
-        and a.get("tool") in {"assert_page_contains", "assert_element_exists"}
-    }
-    results: list[str] = []
-    for e in tool_log or []:
-        if not isinstance(e, dict):
-            continue
-        ri = e.get("replay_step_idx", -1)
-        if isinstance(ri, int) and ri in linked_idx:
-            results.append(str(e.get("status_code", "") or ""))
-    if results and all(r == "PASS" for r in results):
-        verdict = "passed"
-        evidence_source = "assert"
-    elif any(r == "FAIL" for r in results):
-        verdict = "failed"
-        evidence_source = "assert"
-    else:
-        verdict = "unknown"
-        evidence_source = "none"
-
-    # ── 第 2 层（Task 10）：向前扫描 click_and_check / visual_check / vision_tap ──
-    # 2a: 优先按 verify key 精确关联（避免跨 verification 误读）
-    # 2b: 无 key 时退化为最近 _VERIFICATION_LOOKBACK 步位置扫描
-    #     （跳过已关联其他 verify key 的 action，降低误关联风险）
-    if verdict == "unknown" and tool_log:
-        found_by_key = False
-        for back_entry in reversed(tool_log[-_VERIFICATION_LOOKBACK:]):
-            if not isinstance(back_entry, dict):
-                continue
-            back_name = str(back_entry.get("name", "") or "")
-            if back_name not in _VISION_EVIDENCE_TOOLS:
-                continue
-            # 通过 replay_step_idx 查找对应 action 的 verify 字段
-            back_rsi = back_entry.get("replay_step_idx", -1)
-            back_verify = ""
-            if isinstance(back_rsi, int) and 0 <= back_rsi < len(actions):
-                back_verify = str(actions[back_rsi].get("verify", "") or "")
-            # 防御性：只有 ^v\d+$ 格式才当作 verify key
-            # 自然语言 verify（如 vision_tap 的 "结束分钟列当前选中值是否为53"）不作为 key
-            is_key = bool(back_verify and _VERIFY_KEY_RE.match(back_verify))
-            # 2a: verify key 匹配 → 精确关联
-            if is_key and back_verify == key:
-                back_obs = str(back_entry.get("observation", "") or "")
-                decision = _parse_vision_decision(back_obs)
-                if decision in ("yes", "no"):
-                    verdict = "passed" if decision == "yes" else "failed"
-                    evidence_source = back_name
-                    found_by_key = True
-                    break
-            # 跳过已关联其他 verify key 的条目
-            elif is_key and back_verify != key:
-                continue
-            # 2b: 无 verify key（或非 key 格式）→ 退化为位置扫描
-            if not is_key and not found_by_key:
-                back_obs = str(back_entry.get("observation", "") or "")
-                decision = _parse_vision_decision(back_obs)
-                if decision in ("yes", "no"):
-                    verdict = "passed" if decision == "yes" else "failed"
-                    evidence_source = back_name
-                    break
-
-    detail = (
-        f"回放直执自动上报：依据本次运行"
-        f"{('关联断言结果 ' + str(results)) if evidence_source == 'assert' else (evidence_source + ' decision') if evidence_source != 'none' else '无关联证据'}"
-    )
-    return {
-        "condition": condition,
-        "result": verdict,
-        "detail": detail,
-        "verification_key": key,
-        "_evidence_source": evidence_source,
-    }
+    return AGENT_SYSTEM
 
 
 PLANNER_TEMPLATE = ChatPromptTemplate.from_messages(
@@ -615,10 +221,9 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
         return _stop_cmd
     kb = ctx.knowledge_base if ctx else None
     rag = _rag_ctx(kb, state.get("app_package", ""), state.get("user_request", ""))
-    budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
     rag, rag_truncated = _clip_to_token_budget(rag, 500)
-    if rag_truncated:
-        budget_violation_count += 1
+    # reducer 通道：只上报本次增量（delta），不要读旧值累加，也不要重置。
+    budget_violation_count = 1 if rag_truncated else 0
     msgs = PLANNER_TEMPLATE.format_messages(
         user_request=state.get("user_request", ""),
         app_name=state.get("app_name", ""),
@@ -632,20 +237,42 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     )
     import time as _time
 
-    _t0 = _time.time()
-    raw = _call_retry(cl.invoke, msgs) if cl else None
-    logger.info("Planner LLM: %.1fs", _time.time() - _t0)
-    if raw is None:
+    goal: dict[str, Any] | None = None
+    for _attempt in range(3):
+        _t0 = _time.time()
+        raw = _call_retry(cl.invoke, msgs) if cl else None
+        logger.info("Planner LLM: %.1fs", _time.time() - _t0)
+        if raw is None:
+            break
+        text = raw.content if hasattr(raw, "content") else str(raw)
+        candidate = _parse_goal(text)
+        if _goal_is_usable(candidate):
+            goal = candidate
+            break
+        # 格式不符合要求：把错误反馈回 LLM 让其重新生成，而不是在解析层堆特例。
+        msgs = list(msgs) + [
+            AIMessage(content=text),
+            HumanMessage(
+                content=(
+                    "输出格式不符合要求：verification 必须是非空字符串数组，"
+                    "goal 必须是纯文本（不要再嵌套 JSON）。请只重新输出一个 JSON 对象。"
+                )
+            ),
+        ]
+    if goal is None:
         goal = {
             "goal": state.get("user_request", ""),
             "target_pages": [],
             "verification": [],
             "hints": [],
+            "parameter_slots": [],
         }
-    else:
-        text = raw.content if hasattr(raw, "content") else str(raw)
-        goal = _parse_goal(text)
     logger.info("Planner: %s", goal.get("goal", "")[:80])
+    from agents.verification import build_verification_contract
+
+    verification_contract = build_verification_contract(
+        goal, state.get("user_request", "")
+    )
     # 每次新 run 开始时清空 RAG 查询缓存和计数器
     try:
         ctx_cleanup = get_tool_context()
@@ -663,14 +290,12 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     return Command(
         update={
             "goal_description": goal,
+            "verification_contract": verification_contract,
             "step_history": [],
             "messages": [],
             "started_at": datetime.now().isoformat(),
             "step_times": [],
             "budget_violation_count": budget_violation_count,
-            "llm_call_count": 0,
-            "tool_call_400_count": 0,
-            "tool_call_400_rate": 0.0,
             "_rag_injected_once": False,
             "_rag_last_app_package": "",
             "_knowledge_query_hint_injected": False,
@@ -680,56 +305,11 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     )
 
 
-def _render_replay_evidence_block(goal_desc: dict[str, Any]) -> str:
-    """Render only validated v4 effective evidence (or legacy flat v3 evidence)."""
-    if not isinstance(goal_desc, dict):
-        return ""
-    plan = goal_desc.get("execution_plan")
-    if not isinstance(plan, dict):
-        return ""
-    if plan.get("schema_version") == 4:
-        effective = plan.get("effective")
-        if not isinstance(effective, dict) or effective.get("schema_version") != 4:
-            return ""
-    else:
-        effective = plan if isinstance(plan.get("key_actions"), list) else None
-    if not isinstance(effective, dict):
-        return ""
-    lines = [
-        "## REPLAY_EVIDENCE_BLOCK (historical facts, not a forced script)",
-        "Use current perception as the authority. Reuse this evidence only when its per-action precondition fits; adapt, recover, or skip when the page drifted.",
-        "preferred_locator is a stable locator. observed_index is historical context only: never combine observed_index with preferred_locator in the same click call.",
-    ]
-    entry = effective.get("entry")
-    if isinstance(entry, dict) and isinstance(entry.get("launch_app_args"), dict):
-        args = entry["launch_app_args"]
-        lines.append(
-            f"Entry reference: launch_app(package={args.get('package', '')!r}, activity={args.get('activity', '')!r})."
-        )
-    for index, action in enumerate(effective.get("key_actions") or [], 1):
-        if not isinstance(action, dict):
-            continue
-        pre = action.get("precondition") or {}
-        pre_text = str(pre.get("expected_activity", "") or "")
-        if action.get("tool") == "click":
-            locator = action.get("preferred_locator") or {}
-            observed = action.get("observed_index")
-            lines.append(
-                f"{index}. click reference locator={locator!r}; observed_index={observed!r}; precondition_activity={pre_text!r}."
-            )
-        else:
-            tool_name = action.get("tool", "action")
-            tool_input = action.get("tool_input") or action.get("args") or {}
-            lines.append(
-                f"{index}. {tool_name} params={tool_input!r}; precondition_activity={pre_text!r}."
-            )
-    return "\n".join(lines)
-
-
 def agent_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     llm = _llm_cfg(cfg)
     ctx = get_tool_context()
+    ctx._execution_mode = str(state.get("execution_mode", "explore") or "explore")
 
     # 入口 stop 检查：优先于设备检查、感知、LLM 调用——命中直接收敛
     _stop_cmd = _stop_or_continue(state, ctx)
@@ -760,7 +340,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         ]
         return Command(
             update={
-                "step_history": nh,
+                "step_history": [nh[-1]],
                 "status": "fail",
                 "conclusion": conclusion,
             }
@@ -901,10 +481,10 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     budget = _calc_budget(goal)
     goal_str = json.dumps(goal, ensure_ascii=False, indent=2)
     history = state.get("step_history", [])
-    budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
     effective_app_package = goal.get("app_package", "") or state.get("app_package", "")
     include_rag = _should_include_rag(state, effective_app_package)
     rag_summary = ""
+    rag_truncated = False
     if include_rag:
         rag_summary = _rag_ctx(
             ctx.knowledge_base if ctx else None,
@@ -912,8 +492,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             state.get("user_request", ""),
         )
         rag_summary, rag_truncated = _clip_to_token_budget(rag_summary, 500)
-        if rag_truncated:
-            budget_violation_count += 1
+    # reducer 通道：累计本地增量（rag 截断 + 后置裁剪 + 重复检测），只上报 delta。
+    budget_violation_count = 1 if rag_truncated else 0
     if include_rag and rag_summary and ctx:
         _apply_click_preferences(ctx, rag_summary, effective_app_package)
     _cfg_steps = max(1, getattr(cfg, "context_history_steps", 5) or 5)
@@ -926,204 +506,74 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     verification_key_guide = "\n".join(
         f"- {key}: {item}" for key, item in key_to_item.items()
     )
+    clause_guide = "\n".join(
+        f"- {verification.get('key', '')}/{clause.get('id', '')}: "
+        + ", ".join(str(channel) for channel in clause.get("channels", []) or [])
+        for verification in (state.get("verification_contract", {}) or {}).get(
+            "verifications", []
+        )
+        or []
+        if isinstance(verification, dict)
+        for clause in verification.get("clauses", []) or []
+        if isinstance(clause, dict)
+    )
     if ctx:
         ctx._verification_key_map = key_lookup
         ctx._verification_items_by_key = key_to_item
-        merged_verifications = _merge_goal_verification_results(
-            goal, getattr(ctx, "_verifications", []) or []
+        ctx._verification_contract = (
+            state.get("verification_contract", {})
+            if isinstance(state.get("verification_contract", {}), dict)
+            else {}
+        )
+        merged_verifications = (getattr(ctx, "_clause_state", {}) or {}).get(
+            "verifications", []
         )
         passed_items = [
-            f"[{entry.get('key', '')}] {entry.get('item', '')}"
+            f"[{entry.get('key', '')}] {key_to_item.get(entry.get('key', ''), '')}"
             for entry in merged_verifications
             if str(entry.get("result", "") or "") == "passed"
         ]
         if passed_items:
             hist_str += "\n\n已通过验证: " + "; ".join(passed_items)
 
-    replay_actions = _effective_replay_actions(goal)
-    replay_enabled = str(state.get("_run_type", "") or "") == "rerun" and bool(
-        replay_actions
-    )
-    replay_step_idx_raw = int(state.get("_replay_step_idx", 0) or 0)
-    replay_finished = bool(replay_actions) and replay_step_idx_raw >= len(
-        replay_actions
-    )
-    replay_step_idx = (
-        max(0, min(replay_step_idx_raw, max(len(replay_actions) - 1, 0)))
-        if replay_actions
-        else 0
-    )
-    replay_mode = str(state.get("_replay_mode", "") or "")
-    if replay_enabled and replay_mode not in {"script", "recovery"}:
-        replay_mode = "script"
-    if replay_finished:
-        replay_mode = ""
-    replay_input_actuals = dict(state.get("_replay_input_actuals", {}) or {})
-    replay_recovery_used = int(state.get("_replay_recovery_used", 0) or 0)
-    _configured_budget = int(goal.get("replay_recovery_budget", 0) or 0)
-    if _configured_budget > 0:
-        replay_recovery_budget = _configured_budget
-    elif replay_actions:
-        replay_recovery_budget = max(3, len(replay_actions) // 4)
-    else:
-        replay_recovery_budget = 3
-    replay_instruction = ""
-    replay_action_for_turn: dict[str, Any] | None = None
-    entry_align_active = False
-    entry_align_activity = ""
-    entry_align_package = ""
-    if replay_enabled and replay_actions and not replay_finished:
-        # entry 对齐：脚本第 0 步前先确认当前页面已在入口 Activity。
-        # 首帧感知抖动或 App 恢复到非入口页时，若直接比对第 0 步 precondition
-        # 会误判 recovery，先确定性地 launch_app 对齐入口。
-        if replay_step_idx == 0:
-            _plan = _effective_replay_plan(goal) or {}
-            _entry = _plan.get("entry") if isinstance(_plan, dict) else None
-            _launch_args = (
-                _entry.get("launch_app_args") if isinstance(_entry, dict) else None
-            )
-            if isinstance(_launch_args, dict) and _launch_args.get("package"):
-                _entry_act = _extract_activity_name(
-                    str(_launch_args.get("activity", "") or "")
-                )
-                _entry_pkg = str(_launch_args.get("package", "") or "")
-                _cur_pkg = (
-                    current_app_key.split(":")[0] if ":" in current_app_key else ""
-                )
-                if _entry_act:
-                    _need_align = bool(
-                        page_activity_short
-                        and page_activity_short != "?"
-                        and _entry_act != page_activity_short
-                    )
-                else:
-                    # 录制时未记 activity（launch_app 未传）：退化为包名比对，
-                    # 仅当前前台不是目标 App 时才对齐，避免误重开
-                    _need_align = bool(
-                        _entry_pkg and _cur_pkg and _entry_pkg != _cur_pkg
-                    )
-                if _need_align:
-                    entry_align_active = True
-                    entry_align_activity = _entry_act
-                    entry_align_package = _entry_pkg
-                    replay_instruction = (
-                        f"## REPLAY_SCRIPT_STEP [entry 对齐/{len(replay_actions)}]\n"
-                        f"当前页面={page_activity_short}，脚本入口={_entry_act or _entry_pkg}。\n"
-                        "严格按以下操作执行，不要自由探索：\n"
-                        "- tool: launch_app\n"
-                        f"- instruction: launch_app(package={_launch_args.get('package')!r}, activity={_launch_args.get('activity')!r})\n"
-                        "执行后等待系统判定是否对齐到脚本入口。"
-                    )
-        if not entry_align_active:
-            replay_action_for_turn = _resolve_action_texts(
-                replay_actions[replay_step_idx], replay_input_actuals
-            )
-            if replay_action_for_turn.get(
-                "tool"
-            ) == "type_input" and replay_action_for_turn.get("inject_random_suffix"):
-                original_text = str(
-                    ((replay_action_for_turn.get("tool_input") or {}).get("text") or "")
-                )
-                if original_text:
-                    actual_text = _get_actual_text(original_text, replay_input_actuals)
-                    replay_action_for_turn = _resolve_action_texts(
-                        replay_actions[replay_step_idx], replay_input_actuals
-                    )
-                    replay_action_for_turn.setdefault("tool_input", {})[
-                        "text"
-                    ] = actual_text
-            pre = replay_action_for_turn.get("precondition") or {}
-            expected_activity = str(pre.get("expected_activity", "") or "")
-            precondition_match = bool(
-                expected_activity
-                and page_activity_short
-                and expected_activity in page_activity_short
-            )
-            # 尊重上一 turn 留下的 recovery 状态。若上一 turn 因 postcondition 失败进入
-            # recovery，本 turn 的 precondition 可能仍匹配当前页面；若此时无条件覆写为
-            # script，会再次以相同 direct action 执行同一失败步骤，形成死循环。
-            replay_mode = _resolve_replay_mode(replay_mode, precondition_match)
-            replay_instruction = _build_replay_system_instruction(
-                action=replay_action_for_turn,
-                idx=replay_step_idx,
-                total=len(replay_actions),
-                current_activity=page_activity_short,
-                mode=replay_mode,
-                recovery_used=replay_recovery_used,
-                recovery_budget=replay_recovery_budget,
-            )
-
-    # ── G: replay 直执计划（executor=direct 且 script 模式时，跳过主 LLM）──
-    direct_tool_name = ""
-    direct_tool_args: dict[str, Any] = {}
-    if (
-        replay_enabled
-        and str(getattr(cfg, "replay_executor", "llm") or "llm").lower() == "direct"
-        and replay_mode == "script"
-        and not replay_finished
-    ):
-        if entry_align_active:
-            _plan = _effective_replay_plan(goal) or {}
-            _entry = _plan.get("entry") if isinstance(_plan, dict) else None
-            _launch = (
-                _entry.get("launch_app_args") if isinstance(_entry, dict) else None
-            ) or {}
-            direct_tool_name = "launch_app"
-            direct_tool_args = {
-                "package": str(_launch.get("package", "") or ""),
-                "activity": str(_launch.get("activity", "") or ""),
-                "force_fresh": True,  # 强制冷启动，确保从主 Activity 开始
-            }
-        elif replay_action_for_turn is not None:
-            direct_tool_name = str(replay_action_for_turn.get("tool") or "")
-            if direct_tool_name == "click":
-                direct_tool_args = _build_direct_click_args(
-                    replay_action_for_turn.get("preferred_locator"),
-                    replay_action_for_turn.get("tool_input"),
-                )
-            elif direct_tool_name == "assert_verification":
-                direct_tool_args = _build_replay_verification_args(
-                    replay_action_for_turn,
-                    replay_actions,
-                    state.get("_tool_calls_log", []) or [],
-                    goal,
-                )
-            else:
-                direct_tool_args = dict(
-                    replay_action_for_turn.get("tool_input")
-                    or replay_action_for_turn.get("args")
-                    or {}
-                )
-                if direct_tool_name == "vision_tap":
-                    _post = replay_action_for_turn.get("postcondition") or {}
-                    _ev = str(_post.get("expected_value", "") or "")
-                    if (
-                        str(
-                            replay_action_for_turn.get("postcondition_channel", "")
-                            or ""
-                        )
-                        == "vision_verify"
-                        and _ev
-                    ):
-                        direct_tool_args.setdefault("verify", f"当前页面是否显示 {_ev}")
-
     # Messages — always include goal + page for context
     msgs = list(state.get("messages", []))
     if not msgs:
         msgs = [SystemMessage(content=_select_agent_system(state))]
-        replay_block = _render_replay_evidence_block(state.get("goal_description", {}))
-        if replay_block:
-            msgs.append(SystemMessage(content=replay_block))
-    if replay_instruction:
-        msgs.append(SystemMessage(content=replay_instruction))
+        if state.get("execution_mode") == "guided":
+            guided_actions = []
+            for action in state.get("selected_plan_actions", []) or []:
+                if not isinstance(action, dict):
+                    continue
+                try:
+                    tool_input = json.loads(action.get("tool_input_json") or "{}")
+                    precondition = json.loads(action.get("precondition_json") or "{}")
+                    postcondition = json.loads(action.get("postcondition_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                guided_actions.append(
+                    {
+                        "tool": action.get("tool_name", ""),
+                        "input": tool_input,
+                        "precondition": precondition,
+                        "postcondition": postcondition,
+                    }
+                )
+            if guided_actions:
+                msgs.append(
+                    SystemMessage(
+                        content=(
+                            "GUIDED_PLAN: These are historical candidate actions. "
+                            "Use them only when current perception satisfies their "
+                            "preconditions; adapt or explore when it does not.\n"
+                            + json.dumps(guided_actions, ensure_ascii=False)
+                        )
+                    )
+                )
     used_tool_calls_before = len(state.get("_tool_calls_log", []) or [])
     remaining_tool_budget = budget["max_tool_calls_total"] - used_tool_calls_before
     finalization_hint_injected = bool(state.get("_finalization_hint_injected", False))
-    force_query_hint = (
-        False
-        if replay_enabled
-        else _should_force_query_app_knowledge(state, include_rag, rag_summary)
-    )
+    force_query_hint = _should_force_request_knowledge(state, include_rag, rag_summary)
     knowledge_query_hint_injected = bool(
         state.get("_knowledge_query_hint_injected", False)
     )
@@ -1168,7 +618,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 0,
                 "finalization",
                 "FINALIZATION_HINT: 剩余工具预算较低。请优先对可判定项调用 "
-                'assert_verification；若无法继续，请立即 report_done(status="abort")。',
+                '验证当前页面；若无法继续，请立即 terminate_run(reason="无法安全继续")。',
                 "",
             )
         )
@@ -1178,7 +628,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             query_text = "当前页面下一步"
         _kq = (
             "检测到循环或无进展风险，下一步先调用 "
-            f'query_app_knowledge(query="{query_text}", app_package="{effective_app_package}") '
+            f'request_knowledge(intent="{query_text}") '
             "再执行点击/滑动。"
         )
         hint_candidates.append(
@@ -1192,19 +642,14 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "SELF_DOUBT_HINT: 检测到不确定状态（"
                 + "；".join(self_doubt_reasons[:2])
                 + "）。下一步先调用 get_screen_info 复核；若仍无法确认路径，请立即 "
-                'report_done(status="abort", summary="页面异常，建议人工确认")。',
+                'terminate_run(reason="页面异常，建议人工确认")。',
                 "",
             )
         )
-    if (
-        (not replay_enabled)
-        and current_app_key
-        and current_app_key != last_page_app_key
-        and last_page_app_key
-    ):
+    if current_app_key and current_app_key != last_page_app_key and last_page_app_key:
         _as = (
             f"已进入新应用上下文（{current_app_key}），如不确定下一步，优先调用 "
-            f'query_app_knowledge(query="当前页面下一步", app_package="{effective_app_package}")。'
+            'request_knowledge(intent="当前页面下一步")。'
         )
         hint_candidates.append((3, "app_switch", "APP_SWITCH_HINT: " + _as, _as))
 
@@ -1239,87 +684,64 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 else ""
             )
             + (
+                "\n\nClause channels（验证工具必须同时传 verification_key 与 clause_id）：\n"
+                + clause_guide
+                if clause_guide
+                else ""
+            )
+            + (
                 "\n\nKnowledge Policy:\n默认不预置场景知识。若不确定下一步，"
-                "优先调用 query_app_knowledge(query, app_package) 获取当前场景知识。"
-                if (not include_rag and not replay_enabled)
+                "优先调用 request_knowledge(intent) 获取当前场景知识。"
+                if not include_rag
                 else ""
             )
             + ("\n\nRAG:\n" + rag_summary if rag_summary else "")
         )
     )
 
-    _direct_entry: dict[str, Any] | None = None
-    if direct_tool_name and direct_tool_name in _REPLAY_DIRECT_TOOLS:
-        # G: 确定性直执——脚本步骤参数完整，无需主 LLM 复述
-        _tool_obj = next((t for t in AGENT_TOOLS if t.name == direct_tool_name), None)
-        result, _direct_entry = _execute_replay_tool(
-            _tool_obj,
-            direct_tool_name,
-            direct_tool_args,
-            run_id=config.get("configurable", {}).get("thread_id", "unknown"),
-            tool_seq=used_tool_calls_before + 1,
-            replay_mode=replay_mode,
-        )
-        if direct_tool_name == "report_done":
-            _st = str(direct_tool_args.get("status", "done") or "done").lower()
-            _summary = str(direct_tool_args.get("summary", "") or "")
-            result = f"DONE: {_summary}" if _st == "done" else f"ABORT: {_summary}"
-        tool_calls_log = [_direct_entry]
-        loop_meta = {
-            "llm_call_count": 0,
-            "tool_call_400_count": 0,
-            "loop_detected": False,
-            "loop_pattern": "",
-            "loop_break_action": "",
-        }
-        logger.info(
-            "[replay direct] %s(%s) → %s",
-            direct_tool_name,
-            direct_tool_args,
-            str(result)[:120],
-        )
-    else:
-        if direct_tool_name:
-            logger.info(
-                "[replay direct] tool %s 不在直执白名单，降级 LLM 路径",
-                direct_tool_name,
-            )
-        result, tool_calls_log, loop_meta = _run_agent(
-            msgs,
-            AGENT_TOOLS,
-            llm["model"],
-            llm["api_key"],
-            llm["base_url"],
-            max_turns=budget["max_turns_per_iteration"],
-            run_id=config.get("configurable", {}).get("thread_id", "unknown"),
-            # 回放模式：工具执行一次即返回主图，由 agent_node 逐步驱动状态机
-            one_step=replay_enabled,
-        )
-    prev_llm_call_count = int(state.get("llm_call_count", 0) or 0)
-    prev_tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
+    result, tool_calls_log, loop_meta, terminal_verdict = _run_agent(
+        msgs,
+        AGENT_TOOLS,
+        llm["model"],
+        llm["api_key"],
+        llm["base_url"],
+        max_turns=budget["max_turns_per_iteration"],
+        run_id=config.get("configurable", {}).get("thread_id", "unknown"),
+    )
+    # reducer 通道：只上报本次迭代增量（delta），累计由通道 reducer 完成。
     iter_llm_call_count = int(loop_meta.get("llm_call_count", 0) or 0)
     iter_tool_call_400_count = int(loop_meta.get("tool_call_400_count", 0) or 0)
-    llm_call_count = prev_llm_call_count + iter_llm_call_count
-    tool_call_400_count = prev_tool_call_400_count + iter_tool_call_400_count
+    llm_call_count = iter_llm_call_count
+    tool_call_400_count = iter_tool_call_400_count
+    # 派生比率：基于（累计值 + 本次增量）估算，仅用于实时展示，reporter 会重算。
+    _acc_llm = int(state.get("llm_call_count", 0) or 0) + iter_llm_call_count
+    _acc_400 = int(state.get("tool_call_400_count", 0) or 0) + iter_tool_call_400_count
     tool_call_400_rate = (
-        round(tool_call_400_count / llm_call_count, 4) if llm_call_count > 0 else 0.0
+        round(_acc_400 / _acc_llm, 4) if _acc_llm > 0 else 0.0
     )
     # 不再写入 ctx._tool_calls_log（避免 rebuild 丢失），改为存入 state
     logger.info("Agent #%d: %s", len(history) + 1, result[:200])
 
     done, abort = _detect_termination(result)
+    # 结构化 verdict 优先：消除对 DONE:/ABORT: 文本前缀的依赖
+    if terminal_verdict == "passed":
+        done = True
+        abort = False
+    elif terminal_verdict == "failed":
+        done = False
+        abort = True
     used_tool_calls_total = used_tool_calls_before + len(tool_calls_log)
     if used_tool_calls_total >= budget["max_tool_calls_total"] and not done:
         abort = True
         done = False
+        terminal_verdict = ""  # 资源耗尽不是明确的测试 verdict
         result = (
             result.rstrip()
             + f"\nABORT: MAX_TOOL_CALLS_EXHAUSTED ({used_tool_calls_total}/{budget['max_tool_calls_total']})"
         )
-    # 结构化信号优先：tool call 中的 report_done 已被 _run_agent 转为 "DONE: ..." / "ABORT: ..."
-    # _detect_termination 已覆盖文本兜底，此处仅记录来源
+    # 结构化终止请求由 _run_agent 转为 ABORT；成功只能来自 evaluator 的证据 verdict。
     _signal_source = "text" if (done or abort) else "none"
-    if loop_meta.get("loop_break_action") in ("report_done", "report_abort"):
+    if loop_meta.get("loop_break_action") == "terminate_run":
         _signal_source = "tool_call"
     si = len(history) + 1
     st = "success" if done else ("fail" if abort else "continue")
@@ -1342,16 +764,12 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             if _tn not in (
                 "get_screen_info",
                 "check_page_health",
-                "query_app_knowledge",
+                "request_knowledge",
             ):
                 _tool_name = _tn
                 _args = _last.get("args", {}) or {}
                 _tool_target = _build_tool_target(_tn, _args)
             break
-    if _direct_entry is not None:
-        # 直执路径没有 LLM 的 tool_calls 消息，步骤记录从直执 entry 取
-        _tool_name = str(_direct_entry.get("name", "") or "agent")
-        _tool_target = str(_direct_entry.get("target", "") or "")
     # 尝试捕获 page_to（本步骤之后下一次感知的页面）
     try:
         if ctx and ctx.perceiver and (done or abort or si == 1):
@@ -1367,151 +785,12 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     except NameError:
         _step_duration_ms = 0
 
-    replay_step_idx_next = replay_step_idx
-    replay_mode_next = replay_mode if replay_enabled else ""
-    replay_input_actuals_next = dict(replay_input_actuals)
-    replay_recovery_used_next = replay_recovery_used
-    replay_nav_streak_next = int(state.get("_replay_nav_streak", 0) or 0)
-    replay_source = replay_mode if replay_enabled else ""
-
-    tool_calls_log_tagged: list[dict[str, Any]] = []
-    for item in tool_calls_log:
-        if not isinstance(item, dict):
-            continue
-        tagged = dict(item)
-        tagged["replay_source"] = replay_source
-        tagged["replay_step_idx"] = replay_step_idx if replay_enabled else -1
-        tool_calls_log_tagged.append(tagged)
-
-    last_exec = None
-    for entry in reversed(tool_calls_log_tagged):
-        if entry.get("name") not in _REPLAY_READ_ONLY_TOOLS:
-            last_exec = entry
-            break
-
-    if replay_enabled and entry_align_active and not (done or abort):
-        # entry 对齐回合：launch_app 执行且落到入口 Activity → 保持 idx=0 继续 script；
-        # 否则计 recovery（消耗预算，避免入口不可达时无限对齐）
-        launch_ok = str((last_exec or {}).get("name", "") or "") == "launch_app"
-        after_activity = (
-            _extract_activity_name(
-                str((last_exec or {}).get("page_after_activity", "") or "")
-            )
-            or page_activity_short
-        )
-        if launch_ok:
-            if entry_align_activity:
-                _aligned = entry_align_activity in after_activity
-            else:
-                # 录制时无 activity：按包名判定对齐
-                _after_pkg = str((last_exec or {}).get("page_after_package", "") or "")
-                _aligned = (
-                    bool(entry_align_package) and entry_align_package == _after_pkg
-                )
-        else:
-            _aligned = False
-        if _aligned:
-            replay_mode_next = "script"
-            replay_recovery_used_next = 0
-        else:
-            replay_mode_next = "recovery"
-            replay_recovery_used_next += 1
-        if replay_recovery_used_next > replay_recovery_budget:
-            abort = True
-            done = False
-            result = (
-                result.rstrip()
-                + f"\nABORT: REPLAY_RECOVERY_EXHAUSTED ({replay_recovery_used_next}/{replay_recovery_budget})"
-            )
-    elif replay_enabled and replay_action_for_turn and not (done or abort):
-        if last_exec is None and replay_mode == "script":
-            # 只读/导航轮次：本轮未执行任何业务工具（如 LLM 先 get_screen_info
-            # 复核页面）。原地重注同一步，最多容忍 2 次；超过才计 recovery，
-            # 防止把"谨慎感知"误判为偏离而误烧 recovery 预算。
-            replay_nav_streak_next += 1
-            if replay_nav_streak_next > 2:
-                replay_mode_next = "recovery"
-                replay_recovery_used_next += 1
-                replay_nav_streak_next = 0
-        else:
-            replay_nav_streak_next = 0
-            post = replay_action_for_turn.get("postcondition") or {}
-            expected_activity = str(post.get("expected_activity", "") or "")
-            after_activity = (
-                _extract_activity_name(
-                    str((last_exec or {}).get("page_after_activity", "") or "")
-                )
-                or page_activity_short
-            )
-            activity_match = (
-                bool(expected_activity)
-                and bool(after_activity)
-                and expected_activity in after_activity
-            )
-            expected_tool = str(replay_action_for_turn.get("tool", "") or "")
-            tool_match = (
-                bool(last_exec)
-                and str(last_exec.get("name", "") or "") == expected_tool
-            )
-            expected_value = str(post.get("expected_value", "") or "")
-            channel = str(
-                replay_action_for_turn.get("postcondition_channel", "ui_text")
-                or "ui_text"
-            )
-            value_match = True
-            if expected_value:
-                if channel == "vision_verify":
-                    value_match = (
-                        str(
-                            (last_exec or {})
-                            .get("result_evidence", {})
-                            .get("verify_decision", "")
-                        ).lower()
-                        == "yes"
-                    )
-                elif channel == "deferred_assert":
-                    value_match = True
-                else:
-                    # postcondition 语义是"动作之后"，page_text_snapshot 是动作前快照，
-                    # 必须用动作后的重新感知判定，否则 type_input 等步骤恒 false → 假 recovery
-                    post_text = _perceive_page_text(ctx) or page_text_snapshot
-                    value_match = expected_value in post_text
-
-            if replay_mode == "script":
-                if tool_match and activity_match and value_match:
-                    # 同宿主弹窗补盲：判全过但检测到阻挡前进路径的意外弹窗 → recovery
-                    if _replay_popup_blocks_next(
-                        ctx, replay_actions, replay_step_idx, after_activity
-                    ):
-                        replay_mode_next = "recovery"
-                        replay_recovery_used_next += 1
-                    else:
-                        replay_step_idx_next = replay_step_idx + 1
-                        replay_mode_next = "script"
-                        replay_recovery_used_next = 0
-                else:
-                    replay_mode_next = "recovery"
-                    replay_recovery_used_next += 1
-            else:
-                pre = replay_action_for_turn.get("precondition") or {}
-                pre_activity = str(pre.get("expected_activity", "") or "")
-                if pre_activity and after_activity and pre_activity in after_activity:
-                    replay_mode_next = "script"
-                else:
-                    replay_mode_next = "recovery"
-                    replay_recovery_used_next += 1
-
-        if replay_recovery_used_next > replay_recovery_budget:
-            abort = True
-            done = False
-            result = (
-                result.rstrip()
-                + f"\nABORT: REPLAY_RECOVERY_EXHAUSTED ({replay_recovery_used_next}/{replay_recovery_budget})"
-            )
+    tool_calls_log_tagged = [item for item in tool_calls_log if isinstance(item, dict)]
 
     nh = list(history) + [
         {
             "index": si,
+            "execution_mode": str(state.get("execution_mode", "explore") or "explore"),
             "intent": result[:80].replace("\n", " "),
             "action_type": _tool_name,
             "target": _tool_target,
@@ -1526,8 +805,6 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "loop_detected": bool(loop_meta.get("loop_detected")),
             "loop_pattern": str(loop_meta.get("loop_pattern", "")),
             "loop_break_action": str(loop_meta.get("loop_break_action", "")),
-            "replay_source": replay_source,
-            "replay_step_idx": replay_step_idx if replay_enabled else -1,
         }
     ]
     um: list[Any] = list(state.get("messages", []))
@@ -1544,7 +821,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 if tc.get("name") not in (
                     "get_screen_info",
                     "check_page_health",
-                    "query_app_knowledge",
+                    "request_knowledge",
                 ):
                     had_action = True
                     break
@@ -1578,7 +855,9 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                         _facts.append(f"匹配模式={_ev.get('match_mode', '')}(回退)")
                     if _facts:
                         post_check += "操作结果: " + "；".join(_facts) + "\n"
-                post_check += '如果页面状态已满足验证条件，请立即调用 report_done(status="done") 报告结果。'
+                post_check += (
+                    "如果页面状态满足验证条件，继续收集对应 clause 的工具证据。"
+                )
                 post_check, violated = _clip_to_token_budget(post_check, 160)
                 if violated:
                     budget_violation_count += 1
@@ -1595,7 +874,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             if unique == 1:
                 dup_warning = (
                     "[系统提醒] 你已连续 3 次执行相同的操作，页面可能没有变化。"
-                    '请立即调 get_screen_info 检查当前状态，如果目标已达成则调用 report_done(status="done")。'
+                    "请立即调 get_screen_info 检查当前状态；目标达成时继续收集 clause 证据。"
                 )
                 dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
                 if violated:
@@ -1609,7 +888,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 # 4 步内只有 2 种操作 → 可能在循环
                 dup_warning = (
                     "[系统提醒] 检测到可能的循环模式。"
-                    '如果目标已达成，请直接调用 report_done(status="done") 报告结果。'
+                    "如果目标已达成，请继续调用对应验证工具收集 clause 证据。"
                 )
                 dup_warning, violated = _clip_to_token_budget(dup_warning, 100)
                 if violated:
@@ -1626,10 +905,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     if done or abort:
         return Command(
             update={
-                "step_history": nh,
+                "step_history": [nh[-1]],
                 "messages": um,
                 "status": "success" if done else "fail",
                 "conclusion": result.strip(),
+                "_terminal_verdict": terminal_verdict,
                 "budget_violation_count": budget_violation_count,
                 "_finalization_hint_injected": finalization_hint_injected,
                 "_knowledge_query_hint_injected": knowledge_query_hint_injected,
@@ -1647,16 +927,11 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "tool_call_400_rate": tool_call_400_rate,
                 "_tool_calls_log": list(state.get("_tool_calls_log", []))
                 + tool_calls_log_tagged,
-                "_replay_step_idx": replay_step_idx_next,
-                "_replay_mode": replay_mode_next,
-                "_replay_input_actuals": replay_input_actuals_next,
-                "_replay_recovery_used": replay_recovery_used_next,
-                "_replay_nav_streak": replay_nav_streak_next,
             }
         )
     return Command(
         update={
-            "step_history": nh,
+            "step_history": [nh[-1]],
             "messages": um,
             "budget_violation_count": budget_violation_count,
             "_finalization_hint_injected": finalization_hint_injected,
@@ -1675,11 +950,6 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "tool_call_400_rate": tool_call_400_rate,
             "_tool_calls_log": list(state.get("_tool_calls_log", []))
             + tool_calls_log_tagged,
-            "_replay_step_idx": replay_step_idx_next,
-            "_replay_mode": replay_mode_next,
-            "_replay_input_actuals": replay_input_actuals_next,
-            "_replay_recovery_used": replay_recovery_used_next,
-            "_replay_nav_streak": replay_nav_streak_next,
         }
     )
 
@@ -1688,9 +958,15 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     history = state.get("step_history", [])
     conclusion = state.get("conclusion", "")
-    status = state.get("status", "") or (
-        "success" if _detect_termination(conclusion)[0] else "fail"
-    )
+    terminal_verdict = state.get("_terminal_verdict", "")
+    if terminal_verdict == "passed":
+        status = "success"
+    elif terminal_verdict == "failed":
+        status = "fail"
+    else:
+        status = state.get("status", "") or (
+            "success" if _detect_termination(conclusion)[0] else "fail"
+        )
     goal = state.get("goal_description", {})
 
     # Compute duration
@@ -1721,10 +997,110 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             conclusion = f"{conclusion}\n\n---\n{progress}" if conclusion else progress
 
     ctx = get_tool_context()
+    evidence_events = list(getattr(ctx, "_evidence_events", []) or [])
 
-    # ── 双维度结果判定 ──
+    # ── Contract-only verdict ──
     execution_status = _determine_execution_status(state)
-    test_verdict, verification_results = _collect_verification_results(goal)
+    verification_contract = state.get("verification_contract", {})
+    evaluation = evaluate_verification(
+        verification_contract if isinstance(verification_contract, dict) else {},
+        evidence_events,
+    )
+    test_verdict = str(evaluation.get("verdict", "inconclusive"))
+    # 结构化 verdict 优先：evidence 已到 passed/failed 且运行是「自然结束但缺 DONE
+    # 前缀」导致的 error（如用 visual_check 验证、子循环自然结束）时，判为 completed。
+    # 只纠正 error，不动 exhausted/cancelled/device_offline。
+    if (
+        evaluation.get("verdict") in ("passed", "failed")
+        and execution_status == "error"
+    ):
+        execution_status = "completed"
+    if evaluation.get("terminated_on_authoritative_failure"):
+        failure_summary = json.dumps(
+            {
+                "terminated_on_authoritative_failure": True,
+                "failed_clauses": evaluation.get("failed_clauses", []),
+                "pending_clauses": evaluation.get("pending_clauses", []),
+            },
+            ensure_ascii=False,
+        )
+        conclusion = f"{conclusion}\n{failure_summary}".strip()
+    statements = (
+        {
+            str(item.get("key", "") or ""): str(item.get("statement", "") or "")
+            for item in verification_contract.get("verifications", [])
+            if isinstance(item, dict)
+        }
+        if isinstance(verification_contract, dict)
+        else {}
+    )
+
+    # ── 诊断日志：clause channels vs 实际 evidence 匹配情况 ──
+    # 用于快速定位「证据是否产生」以及「是否因 channels 配置被过滤」。
+    # channels 从原始 contract 读（evaluate_verification 返回的 clause 不含 channels）。
+    _contract_clause_meta: dict[tuple[str, str], dict[str, Any]] = {}
+    for v in (verification_contract.get("verifications", []) or []):
+        key = str(v.get("key", "") or "")
+        for c in (v.get("clauses", []) or []):
+            _contract_clause_meta[(key, str(c.get("id", "") or ""))] = c
+
+    _diag_lines = ["Evidence matching diagnostics:"]
+    for item in evaluation.get("verifications", []) or []:
+        key = str(item.get("key", "") or "")
+        for clause in item.get("clauses", []) or []:
+            cid = str(clause.get("id", "") or "")
+            claim = str(clause.get("claim", "") or "")
+            meta = _contract_clause_meta.get((key, cid), {})
+            channels = meta.get("channels", []) or []
+            matched = [
+                e
+                for e in evidence_events
+                if str(e.get("verification_key", "") or "") == key
+                and str(e.get("clause_id", "") or "") == cid
+            ]
+            matched_channels = {str(e.get("channel", "") or "") for e in matched}
+            _diag_lines.append(
+                f"  {key}/{cid}: claim='{claim}' channels={channels} "
+                f"matched_channels={sorted(matched_channels)} status={clause.get('status')}"
+            )
+    logger.info("\n".join(_diag_lines))
+
+    # 给每个 clause 补充「决定性证据」：第一个 PASS/YES 事件及其通道，便于 reporter 展示。
+    _deciding_evidence: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in evidence_events:
+        if not isinstance(event, dict):
+            continue
+        status = str(event.get("status", "") or "").upper()
+        if status not in {"PASS", "YES"}:
+            continue
+        key = str(event.get("verification_key", "") or "")
+        cid = str(event.get("clause_id", "") or "")
+        if (key, cid) not in _deciding_evidence:
+            _deciding_evidence[(key, cid)] = {
+                "channel": str(event.get("channel", "") or ""),
+                "status": status,
+                "fact": event.get("fact", {}),
+            }
+
+    def _enrich_clause(key: str, clause: dict[str, Any]) -> dict[str, Any]:
+        cid = str(clause.get("id", "") or "")
+        enriched = dict(clause)
+        enriched["deciding_evidence"] = _deciding_evidence.get((key, cid))
+        return enriched
+
+    verification_results = [
+        {
+            "key": item.get("key", ""),
+            "item": statements.get(str(item.get("key", "") or ""), ""),
+            "result": item.get("result", "unknown"),
+            "clauses": [
+                _enrich_clause(str(item.get("key", "") or ""), c)
+                for c in item.get("clauses", [])
+            ],
+            "review_required": item.get("result") == "unknown",
+        }
+        for item in evaluation.get("verifications", [])
+    ]
     budget_violation_count = int(state.get("budget_violation_count", 0) or 0)
     llm_call_count = int(state.get("llm_call_count", 0) or 0)
     tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
@@ -1738,89 +1114,25 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         )
         execution_status = "cancelled"
         test_verdict = "inconclusive"
-    # 修复A：全部 goal 验证项通过即视为达成目标——即便因 max_turns/预算在最后一步收尾
-    # 未及时 report_done，也不应把 passed 降级为 inconclusive。route_after_agent 已按
-    # 「全部通过」路由到 reporter，此处把 exhausted/error 归正为 completed，避免成功被误判。
-    _goal_v_items = (
-        [v for v in (goal.get("verification", []) or []) if str(v or "").strip()]
-        if isinstance(goal, dict)
-        else []
-    )
-    if (
-        _goal_v_items
-        and test_verdict == "passed"
-        and execution_status in ("exhausted", "error")
-    ):
-        logger.info(
-            "Reporter: 全部 %d 项验证通过（原 execution_status=%s）→ 归正为 completed",
-            len(_goal_v_items),
-            execution_status,
-        )
-        execution_status = "completed"
-    # Task 8: 回放防幻觉安全闸门 —— 脚本未走完时，阻止假 passed
-    _replay_actions_guard = _effective_replay_actions(goal)
-    _replay_enabled_guard = str(state.get("_run_type", "") or "") == "rerun" and bool(
-        _replay_actions_guard
-    )
-    _replay_step_guard = int(state.get("_replay_step_idx", 0) or 0)
-    # 检测 report_done 是否已执行（report_done 触发 done=True 导致
-    # replay_step_idx 不会 +1，所以单靠 step_idx >= len 会误判脚本未完成）
-    _report_done_executed = any(
-        isinstance(e, dict) and str(e.get("name", "")) == "report_done"
-        for e in state.get("_tool_calls_log", [])
-    )
-    _replay_finished_guard = bool(_replay_actions_guard) and (
-        _replay_step_guard >= len(_replay_actions_guard) or _report_done_executed
-    )
-    _guard_triggered = False
-    _guard_reason = ""
-    _strict_completion = bool(goal.get("strict_replay_completion", True))
-    if _strict_completion and _replay_enabled_guard and not _replay_finished_guard:
-        if test_verdict == "passed":
-            # 收集已执行的验证 key
-            _tool_log_guard = state.get("_tool_calls_log", [])
-            _collected_vkeys = {
-                str(e.get("result_evidence", {}).get("verification_key", ""))
-                for e in _tool_log_guard
-                if isinstance(e, dict)
-                and str(e.get("name", "")) == "assert_verification"
-            }
-            # 检查必需的验证项
-            _goal_ver_keys = (
-                {f"v{i}" for i in range(len(_goal_v_items))} if _goal_v_items else set()
-            )
-            _missing_vkeys = (
-                _goal_ver_keys - _collected_vkeys if _goal_ver_keys else set()
-            )
-            _missing_detail = f"，缺少验证: {_missing_vkeys}" if _missing_vkeys else ""
-            _guard_reason = f"script_incomplete,step={_replay_step_guard}/{len(_replay_actions_guard)}"
-            if _missing_vkeys:
-                _guard_reason += f",missing_verifications={sorted(_missing_vkeys)}"
-            logger.warning(
-                "Reporter: replay script incomplete (step %d/%d%s) but verdict=passed → force fail",
-                _replay_step_guard,
-                len(_replay_actions_guard),
-                _missing_detail,
-            )
-            test_verdict = "failed"
-            _guard_triggered = True
     if execution_status not in ("completed",):
         test_verdict = "inconclusive"
-    # 向后兼容 status
-    status = (
-        "success"
-        if (execution_status == "completed" and test_verdict == "passed")
-        else status
-    )
+    # 向后兼容 status（仅在无结构化 verdict 时生效）
+    if not terminal_verdict:
+        status = (
+            "success"
+            if (execution_status == "completed" and test_verdict == "passed")
+            else status
+        )
 
     # ── 点击质量指标 ──
     _tool_log = state.get("_tool_calls_log", [])
     click_count = sum(1 for s in _tool_log if s.get("name") == "click")
-    exact_count = sum(
-        1
-        for s in _tool_log
-        if s.get("name") == "click" and s.get("match_mode") == "exact"
-    )
+    # Phase 4 locator 解析指标（统一走 run_trace 的聚合逻辑，避免分叉）。
+    # exact_count / semantic_count 由 resolution_type 得出；旧逻辑误用 match_mode=="exact"
+    # （click 的 match_mode 实际为 resource_id/element/...，永不命中），此处纠正。
+    _resolution_metrics = compute_resolution_metrics(_tool_log)
+    exact_count = _resolution_metrics["exact_resolution_count"]
+    semantic_count = _resolution_metrics["semantic_resolution_count"]
     fuzzy_count = sum(
         1 for s in _tool_log if s.get("name") == "click" and s.get("fuzzy_match")
     )
@@ -1831,7 +1143,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     )
     rag_query_count = int(getattr(ctx, "_rag_query_count", 0) or 0)
 
-    # RAG same_app ratio: 统计 query_app_knowledge 调用中 same_app 回应的占比
+    # RAG same_app ratio: 统计 request_knowledge 调用中 same_app 回应的占比
     _rag_same_app = int(getattr(ctx, "_rag_same_app_count", 0) or 0)
     _rag_cross_app = int(getattr(ctx, "_rag_cross_app_count", 0) or 0)
     _rag_empty = int(getattr(ctx, "_rag_empty_hit_count", 0) or 0)
@@ -1839,91 +1151,116 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     rag_same_app_ratio = round(_rag_same_app / max(rag_total_resolved, 1), 4)
     rag_empty_hit_rate = round(_rag_empty / max(rag_total_resolved, 1), 4)
 
-    replay_entries = [
-        e
-        for e in _tool_log
-        if isinstance(e, dict)
-        and str(e.get("replay_source", "") or "") in {"script", "recovery"}
-    ]
-    script_steps = [e for e in replay_entries if e.get("replay_source") == "script"]
-    recovery_steps = [e for e in replay_entries if e.get("replay_source") == "recovery"]
-    script_hit_rate = round(len(script_steps) / max(len(replay_entries), 1), 4)
-    recovery_count = len(recovery_steps)
-    recovery_success_count = 0
-    for i, item in enumerate(replay_entries[:-1]):
-        if item.get("replay_source") != "recovery":
-            continue
-        if replay_entries[i + 1].get("replay_source") == "script":
-            recovery_success_count += 1
-    recovery_success_rate = round(recovery_success_count / max(recovery_count, 1), 4)
-
     # O1: 单次运行 token 消耗（纯观测）
     token_usage = dict(getattr(ctx, "_token_usage", {}) or {})
 
-    # Task 10: 验证证据来源统计
-    _verification_evidence_sources: dict[str, int] = {}
-    for _ev_entry in _tool_log:
-        if (
-            isinstance(_ev_entry, dict)
-            and str(_ev_entry.get("name", "")) == "assert_verification"
-        ):
-            _ev_src = str(
-                _ev_entry.get("result_evidence", {}).get("_evidence_source", "")
-                or "unknown"
-            )
-            _verification_evidence_sources[_ev_src] = (
-                _verification_evidence_sources.get(_ev_src, 0) + 1
+    evidence_event_counts: dict[str, int] = {}
+    for event in evidence_events:
+        if isinstance(event, dict):
+            event_type = str(event.get("channel", "") or "unknown")
+            evidence_event_counts[event_type] = (
+                evidence_event_counts.get(event_type, 0) + 1
             )
 
     # 延迟 import：读取 graph 的可变全局当前值（set_relational_db 会更新它）
     from agents.graph import _relational_db
+    from agents.orchestrator import _build_display_steps
 
+    dd = _build_display_steps(history, _tool_log)
     if _relational_db:
         try:
-            from agents.orchestrator import _build_display_steps
+            action_events = list(getattr(ctx, "_action_events", []) or [])
+            generated_plan_id = None
+            if (
+                test_verdict == "passed"
+                and isinstance(verification_contract, dict)
+                and verification_contract.get("status") == "approved"
+            ):
+                from agents.plan_extractor import extract_candidate_plan
 
-            dd = _build_display_steps(history, _tool_log)
-            _relational_db.record_test_run(
+                kb = getattr(ctx, "knowledge_base", None) if ctx else None
+                # #1 修复：沉淀侧必须把 app_version/fixture 写进 environment_key，
+                # 否则评分 optional 档（app_version 漂移 -0.2、fixture 漂移 -0.3）
+                # 永远不触发（候选 plan 的 page 只含 package/activity/screen_profile）。
+                _app_pkg = state.get("app_package", "")
+                _env_app_version = _get_app_version(ctx, _app_pkg)
+                _env_fixture = cfg.fixture_profile
+                # 注意：action_events 来自 ctx._action_events（reporter 之前可能还持有同一引用），
+                # 因此这里对 page 字典做浅拷贝后再注入，避免 in-place 改写污染上层持有的副本。
+                for _ev in action_events:
+                    if not isinstance(_ev, dict):
+                        continue
+                    for _page_key in ("page_before", "page_after"):
+                        _page = _ev.get(_page_key)
+                        if not isinstance(_page, dict):
+                            continue
+                        _page = dict(_page)
+                        if _env_app_version and not _page.get("app_version"):
+                            _page["app_version"] = _env_app_version
+                        if _env_fixture and not _page.get("fixture_fingerprint"):
+                            _page["fixture_fingerprint"] = _env_fixture
+                        _ev[_page_key] = _page
+                generated_plan_id = extract_candidate_plan(
+                    _relational_db,
+                    app_package=_app_pkg,
+                    user_request=state.get("user_request", ""),
+                    goal=state.get("goal_description") or {},
+                    verification_contract=verification_contract,
+                    action_events=action_events,
+                    evidence_events=evidence_events,
+                    knowledge_base=kb,
+                )
+            _relational_db.record_execution_run(
                 run_id=config.get("configurable", {}).get("thread_id", ""),
                 user_request=state.get("user_request", ""),
                 app_package=state.get("app_package", ""),
-                app_name=state.get("app_name", ""),
-                status=status,
-                conclusion=str(conclusion),
-                steps=dd,
-                duration_seconds=duration,
-                execution_status=execution_status,
-                test_verdict=test_verdict,
-                verification_json=json.dumps(verification_results, ensure_ascii=False),
-                llm_call_count=llm_call_count,
-                click_count=click_count,
-                fuzzy_click_count=fuzzy_count,
-                ambiguous_count=ambiguous_count,
-                exact_click_count=exact_count,
-                exact_click_rate=round(exact_count / max(click_count, 1), 4),
-                fuzzy_click_rate=round(fuzzy_count / max(click_count, 1), 4),
-                rag_query_count=rag_query_count,
-                rag_same_app_ratio=rag_same_app_ratio,
-                rag_empty_hit_rate=rag_empty_hit_rate,
-                rag_cross_app_used_count=_rag_cross_app,
-                input_tokens=int(token_usage.get("input_tokens", 0) or 0),
-                output_tokens=int(token_usage.get("output_tokens", 0) or 0),
-                total_tokens=int(token_usage.get("total_tokens", 0) or 0),
-                cached_input_tokens=int(token_usage.get("cached_input_tokens", 0) or 0),
-                llm_token_calls=int(token_usage.get("llm_calls", 0) or 0),
-                goal_json=json.dumps(
-                    state.get("goal_description") or {}, ensure_ascii=False
+                goal=state.get("goal_description") or {},
+                verification_contract=(
+                    verification_contract
+                    if isinstance(verification_contract, dict)
+                    else {}
                 ),
-                run_type=state.get("_run_type", "normal"),
-                source_run_id=state.get("_source_run_id"),
-                source_case_id=state.get("_source_case_id"),
-                execution_plan_revision=int(
-                    state.get("_execution_plan_revision", 0) or 0
-                ),
+                execution_mode=str(state.get("execution_mode", "explore") or "explore"),
+                lifecycle_state="Terminal",
+                plan_id=state.get("plan_id") or generated_plan_id,
+                plan_trust=str(state.get("plan_trust", "") or ""),
+                verdict=test_verdict,
+                terminal_reason=str(conclusion)[:2000],
+                resolution_metrics=_resolution_metrics,
+                duration_seconds=float(duration or 0.0),
+                llm_call_count=int(llm_call_count or 0),
+                token_usage=token_usage,
+            )
+            _relational_db.record_evidence_events(
+                config.get("configurable", {}).get("thread_id", ""), evidence_events
+            )
+            _relational_db.record_action_events(
+                config.get("configurable", {}).get("thread_id", ""),
+                action_events,
+            )
+            _relational_db.record_mode_transition_events(
+                config.get("configurable", {}).get("thread_id", ""),
+                list(state.get("mode_transition_events", []) or []),
+            )
+            _relational_db.record_plan_action_outcomes(
+                str(state.get("plan_id", "") or ""),
+                action_events,
+                decay_lambda=cfg.quality_decay_lambda,
+            )
+            _relational_db.record_plan_action_alignment_events(
+                config.get("configurable", {}).get("thread_id", ""),
+                str(state.get("plan_id", "") or ""),
+                action_events,
+            )
+            _relational_db.record_execution_plan_outcome(
+                str(state.get("plan_id", "") or ""),
+                test_verdict,
+                config.get("configurable", {}).get("thread_id", ""),
+                direct_quality_threshold=cfg.direct_quality_threshold,
             )
         except Exception:
             logger.exception(
-                "Failed to persist test run %s",
+                "Failed to persist execution run %s",
                 config.get("configurable", {}).get("thread_id", ""),
             )
 
@@ -1932,7 +1269,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     fc = sum(1 for s in dd if s.get("status") == "fail")
     cc = sum(1 for s in dd if s.get("status") == "continue")
     logger.info(
-        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f click=%d exact=%d fuzzy=%d ambiguous=%d rag_q=%d rag_same=%.2f replay(script_hit=%.2f recovery=%d recovery_success=%.2f) tokens(in=%d out=%d total=%d cached=%d calls=%d) conclusion=%s",
+        "Reporter: exec=%s verdict=%s display_steps=%d steps(success=%d fail=%d continue=%d) duration=%.1fs budget_violation=%d llm_calls=%d tool_call_400=%d tool_call_400_rate=%.4f click=%d exact=%d semantic=%d fuzzy=%d ambiguous=%d rag_q=%d rag_same=%.2f tokens(in=%d out=%d total=%d cached=%d calls=%d) conclusion=%s",
         execution_status,
         test_verdict,
         len(dd),
@@ -1946,13 +1283,11 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         tool_call_400_rate,
         click_count,
         exact_count,
+        semantic_count,
         fuzzy_count,
         ambiguous_count,
         rag_query_count,
         rag_same_app_ratio,
-        script_hit_rate,
-        recovery_count,
-        recovery_success_rate,
         int(token_usage.get("input_tokens", 0) or 0),
         int(token_usage.get("output_tokens", 0) or 0),
         int(token_usage.get("total_tokens", 0) or 0),
@@ -1963,7 +1298,10 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     # 本地逐轮 trace 落盘（离线可观测；config 可关；绝不影响主流程）
     if getattr(cfg, "write_run_trace", True):
         try:
-            from agents.run_trace import build_run_trace, write_run_trace
+            from agents.run_trace import (
+                build_run_trace,
+                write_run_trace,
+            )
 
             _trace = build_run_trace(
                 run_id=config.get("configurable", {}).get("thread_id", ""),
@@ -1982,17 +1320,13 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                     "tool_call_400_rate": tool_call_400_rate,
                     "click_count": click_count,
                     "exact_click_count": exact_count,
+                    "semantic_click_count": semantic_count,
                     "fuzzy_click_count": fuzzy_count,
                     "ambiguous_count": ambiguous_count,
                     "rag_query_count": rag_query_count,
                     "rag_same_app_ratio": rag_same_app_ratio,
                     "rag_empty_hit_rate": rag_empty_hit_rate,
-                    "script_hit_rate": script_hit_rate,
-                    "recovery_count": recovery_count,
-                    "recovery_success_rate": recovery_success_rate,
-                    "replay_guard_triggered": _guard_triggered,
-                    "replay_guard_reason": _guard_reason,
-                    "verification_evidence_sources": _verification_evidence_sources,
+                    "evidence_event_counts": evidence_event_counts,
                 },
             )
             _trace_path = write_run_trace(_trace)
@@ -2005,13 +1339,9 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         update={
             "conclusion": str(conclusion),
             "status": status,
-            "step_history": history,
             "execution_status": execution_status,
             "test_verdict": test_verdict,
             "verification_results": verification_results,
-            "budget_violation_count": budget_violation_count,
-            "llm_call_count": llm_call_count,
-            "tool_call_400_count": tool_call_400_count,
             "tool_call_400_rate": tool_call_400_rate,
             "token_usage": token_usage,
         }
@@ -2027,6 +1357,7 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
     if _stop_cmd is not None:
         return _stop_cmd
     goal = state.get("goal_description", {})
+    verification_contract = state.get("verification_contract", {})
     from langgraph.types import interrupt
 
     result = interrupt(
@@ -2036,6 +1367,8 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
             "goal": goal.get("goal", ""),
             "pages": goal.get("target_pages", []),
             "verification": goal.get("verification", []),
+            "user_request": state.get("user_request", ""),
+            "verification_contract": verification_contract,
         }
     )
     # If user edited the goal, use the edited version
@@ -2051,12 +1384,535 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
         )
         edited["hints"] = result.get("hints", goal.get("hints", []))
         logger.info("Plan review: user edited goal")
-        return Command(update={"goal_description": edited})
+        from agents.verification import (
+            build_verification_contract,
+            validate_contract_spans,
+        )
+
+        reviewed_contract = result.get("verification_contract")
+        contract = (
+            reviewed_contract
+            if isinstance(reviewed_contract, dict)
+            else build_verification_contract(edited, state.get("user_request", ""))
+        )
+        contract = dict(contract)
+        span_validation = validate_contract_spans(contract)
+        if span_validation["valid"]:
+            contract["status"] = "approved"
+            contract["span_validation_error"] = None
+        else:
+            contract["status"] = "contract_pending_review"
+            contract["span_validation_error"] = span_validation
+            logger.warning(
+                "Plan review: span validation failed, keeping contract pending: %s",
+                span_validation,
+            )
+        return Command(
+            update={"goal_description": edited, "verification_contract": contract}
+        )
     if result == "cancel" or (
         isinstance(result, dict) and result.get("action") == "cancel"
     ):
         return Command(update={"status": "cancelled"})
+    if verification_contract:
+        from agents.verification import validate_contract_spans
+
+        approved = dict(verification_contract)
+        span_validation = validate_contract_spans(approved)
+        if span_validation["valid"]:
+            approved["status"] = "approved"
+            approved["span_validation_error"] = None
+        else:
+            approved["status"] = "contract_pending_review"
+            approved["span_validation_error"] = span_validation
+            logger.warning(
+                "Plan review: span validation failed on simple confirm: %s",
+                span_validation,
+            )
+        return Command(update={"verification_contract": approved})
     return Command(update={})
+
+
+def _get_app_version(ctx: Any, app_package: str) -> str:
+    """Query the device for the installed app version, cached per run."""
+    if not ctx or not app_package:
+        return ""
+    cache_key = f"_app_version_{app_package}"
+    cached = getattr(ctx, cache_key, None)
+    if cached is not None:
+        return cached
+    version = ""
+    try:
+        if ctx.device and hasattr(ctx.device, "shell"):
+            output = ctx.device.shell(["dumpsys", "package", app_package])
+            text = str(output or "")
+            for line in text.splitlines():
+                if "versionName=" in line:
+                    parts = line.split("versionName=")
+                    if len(parts) > 1:
+                        candidate = parts[1].split()[0].strip()
+                        if candidate:
+                            version = candidate
+                            break
+    except Exception:
+        version = ""
+    setattr(ctx, cache_key, version)
+    return version
+
+
+def _action_postcond_rate(action: dict[str, Any]) -> float:
+    """postcondition 通过率 = pass / attempt（attempt 为 0 时视为 0，未对齐）。"""
+    try:
+        attempts = int(action.get("attempt_count", 0) or 0)
+        if attempts <= 0:
+            return 0.0
+        passes = int(action.get("postcondition_pass_count", 0) or 0)
+        return passes / attempts
+    except Exception:
+        return 0.0
+
+
+def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
+    """Select a one-way v2 execution mode from an approved task plan."""
+    from agents.verification import validate_contract_spans
+
+    cfg: TestConfig = (
+        config.get("configurable", {}).get("test_config")
+        if isinstance(config, dict) and config.get("configurable")
+        else TestConfig()
+    )
+
+    contract = state.get("verification_contract", {})
+    if not isinstance(contract, dict) or contract.get("status") != "approved":
+        return Command(
+            update={
+                "status": "fail",
+                "conclusion": "CONTRACT_REVIEW_REQUIRED: verification contract is not approved",
+                "execution_mode": "explore",
+                "lifecycle_state": "Terminal",
+                "mode_selection_reason": "verification_contract_not_approved",
+                "selected_plan_actions": [],
+            },
+            goto="reporter",
+        )
+
+    span_validation = validate_contract_spans(contract)
+    if not span_validation["valid"]:
+        contract = dict(contract)
+        contract["span_validation_error"] = span_validation
+        return Command(
+            update={
+                "status": "fail",
+                "conclusion": (
+                    "CONTRACT_REVIEW_REQUIRED: verification contract span validation failed: "
+                    f"gaps={len(span_validation.get('gaps', []))} "
+                    f"overlaps={len(span_validation.get('overlaps', []))}"
+                ),
+                "execution_mode": "explore",
+                "lifecycle_state": "Terminal",
+                "mode_selection_reason": "verification_contract_span_invalid",
+                "verification_contract": contract,
+                "selected_plan_actions": [],
+            },
+            goto="reporter",
+        )
+
+    from agents.plan_extractor import (
+        environment_fingerprint,
+        _task_signature_from_goal,
+    )
+    from agents.rag_context import retrieve_knowledge
+
+    environment_key = ""
+    actual_environment_key = ""
+    try:
+        ctx = get_tool_context()
+        current_app = ctx.device.current_app() if ctx and ctx.device else {}
+        screen_size = ctx.screen_size if ctx else (0, 0)
+        screen_profile = "x".join(str(value) for value in screen_size)
+        app_version = _get_app_version(ctx, state.get("app_package", ""))
+        fixture_fingerprint = cfg.fixture_profile
+        # 语义说明：environment_key 由「执行时前台 app 的 package/activity」+「目标 app 的
+        # app_version/fixture」混合组成。find_matching_execution_plan 已按 app_package 过滤，
+        # package/activity 是弱信号不会误判；严格对齐 Plan 4.1 时应改用「目标 App 启动后首屏
+        # activity」而非当前前台 app，但当前侧与沉淀侧口径一致，匹配自洽。
+        page_payload = {
+            "package": (current_app or {}).get("package", ""),
+            "activity": (current_app or {}).get("activity", ""),
+            "app_version": app_version,
+            "fixture_fingerprint": fixture_fingerprint,
+        }
+        actual_environment_key = environment_fingerprint(page_payload, screen_profile)
+        # For matching, use the same key (candidate plans store their own page facts).
+        environment_key = actual_environment_key
+    except Exception:
+        environment_key = ""
+        actual_environment_key = ""
+
+    task_signature = _task_signature_from_goal(
+        state.get("user_request", ""),
+        state.get("goal_description", {}),
+        contract,
+        [],
+    )
+
+    plan_result = retrieve_knowledge(
+        app_package=state.get("app_package", ""),
+        purpose="task_plan",
+        query=state.get("user_request", ""),
+        verification_fingerprint=task_signature["verification_fingerprint"],
+        environment_key=environment_key,
+        task_signature=task_signature,
+    )
+    plan = plan_result["items"][0] if plan_result["items"] else None
+    env_score = float(plan_result.get("environment_compatibility_score", 0.0) or 0.0)
+    env_reasons = list(plan_result.get("environment_compatibility_reasons") or [])
+
+    # Fallback: if the retrieval backend did not attach a score, compute it here.
+    if plan and env_score == 0.0 and not env_reasons:
+        from agents.plan_extractor import environment_compatibility_score
+
+        env_score_result = environment_compatibility_score(
+            plan.get("environment_key", ""), environment_key
+        )
+        env_score = float(env_score_result.get("score", 0.0) or 0.0)
+        env_reasons = list(env_score_result.get("reasons") or [])
+
+    base_update = {
+        "actual_environment_key": actual_environment_key,
+        "environment_compatibility_score": env_score,
+        "environment_compatibility_reasons": env_reasons,
+    }
+
+    if not plan:
+        return Command(
+            update={
+                **base_update,
+                "execution_mode": "explore",
+                "lifecycle_state": "Bootstrapping",
+                "mode_selection_reason": "no_matching_plan",
+                "selected_plan_actions": [],
+            }
+        )
+
+    actions = list(plan.get("actions", []) or [])
+    all_direct_eligible = bool(actions) and all(
+        action.get("execution_eligibility") == "direct_eligible"
+        for action in actions
+        if isinstance(action, dict)
+    )
+
+    # Plan 4.1 direct 准入闸门（码级强制，除人工批准外还需满足）：
+    # (a) 同一兼容键下累计成功运行 >= direct_min_runs（连续 N 次 guided 成功近似）；
+    # (b) 每个动作 postcondition 通过率 >= direct_postcond_rate_threshold（全动作对齐）；
+    # (c) plan 平均质量 >= direct_quality_threshold。
+    _success_runs = int(plan.get("success_count", 0) or 0)
+    _min_runs_ok = _success_runs >= max(1, int(cfg.direct_min_runs))
+    _actions_aligned = bool(actions) and all(
+        _action_postcond_rate(action) >= float(cfg.direct_postcond_rate_threshold)
+        for action in actions
+        if isinstance(action, dict)
+    )
+    _plan_quality = float(plan.get("quality_score", 0.0) or 0.0)
+    _quality_ok = _plan_quality >= float(cfg.direct_quality_threshold)
+
+    direct_ready = (
+        bool(plan.get("direct_approved", False))
+        and all_direct_eligible
+        and env_score == 1.0
+        and _min_runs_ok
+        and _actions_aligned
+        and _quality_ok
+    )
+    _approved_but_blocked = (
+        bool(plan.get("direct_approved", False))
+        and all_direct_eligible
+        and env_score == 1.0
+        and not direct_ready
+    )
+    if direct_ready:
+        return Command(
+            update={
+                **base_update,
+                "execution_mode": "direct",
+                "lifecycle_state": "Direct",
+                "plan_id": str(plan["plan_id"]),
+                "plan_trust": str(plan.get("plan_trust", "") or "candidate"),
+                "mode_selection_reason": "direct_approved_full_environment_match",
+                "selected_plan_actions": actions,
+                "_direct_action_cursor": 0,
+            }
+        )
+
+    guided_threshold = cfg.environment_guided_threshold
+    if env_score >= guided_threshold:
+        return Command(
+            update={
+                **base_update,
+                "execution_mode": "guided",
+                "lifecycle_state": "Guided",
+                "plan_id": str(plan["plan_id"]),
+                "plan_trust": str(plan.get("plan_trust", "") or "candidate"),
+                "mode_selection_reason": (
+                    "guided_from_approved_no_runs"
+                    if _approved_but_blocked
+                    else (
+                        "matching_plan_guided_partial_environment"
+                        if env_score < 1.0
+                        else "matching_plan_guided"
+                    )
+                ),
+                "selected_plan_actions": actions,
+            }
+        )
+
+    return Command(
+        update={
+            **base_update,
+            "execution_mode": "explore",
+            "lifecycle_state": "Explore",
+            "mode_selection_reason": "matching_plan_environment_incompatible",
+            "selected_plan_actions": [],
+        }
+    )
+
+
+def direct_node(state: TestState, config: RunnableConfig) -> Command:
+    """Execute one stable plan action without an LLM decision."""
+    from agents.budget import _calc_mode_phase_budget
+    from tools.results import parse_status
+
+    cfg: TestConfig = (
+        config.get("configurable", {}).get("test_config")
+        if isinstance(config, dict) and config.get("configurable")
+        else TestConfig()
+    )
+
+    _direct_plan_id = str(state.get("plan_id", "") or "")
+    _direct_phase_budget = _calc_mode_phase_budget(state, "direct")
+
+    if int(state.get("_direct_downgrade_count", 0) or 0) >= 1:
+        transitions = list(state.get("mode_transition_events", []) or [])
+        transitions.append(
+            {
+                "from": "direct",
+                "to": "guided",
+                "reason": "direct_reentry_guard",
+                "step_index": int(state.get("_direct_action_cursor", 0) or 0),
+                "plan_id": _direct_plan_id,
+                "action_id": "",
+                "phase_budget": _direct_phase_budget,
+            }
+        )
+        return Command(
+            update={
+                "execution_mode": "guided",
+                "lifecycle_state": "Guided",
+                "mode_selection_reason": "direct_reentry_guard",
+                "mode_transition_events": transitions,
+            }
+        )
+
+    cursor = int(state.get("_direct_action_cursor", 0) or 0)
+    actions = list(state.get("selected_plan_actions", []) or [])
+    if cursor >= len(actions) or cursor >= _calc_mode_phase_budget(state, "direct"):
+        transitions = list(state.get("mode_transition_events", []) or [])
+        transitions.append(
+            {
+                "from": "direct",
+                "to": "guided",
+                "reason": (
+                    "direct_phase_budget_exhausted"
+                    if cursor < len(actions)
+                    else "direct_actions_exhausted"
+                ),
+                "step_index": cursor,
+                "plan_id": _direct_plan_id,
+                "action_id": "",
+                "phase_budget": _direct_phase_budget,
+            }
+        )
+        return Command(
+            update={
+                "execution_mode": "guided",
+                "lifecycle_state": "Guided",
+                "mode_selection_reason": transitions[-1]["reason"],
+                "_direct_downgrade_count": 1,
+                "mode_transition_events": transitions,
+            }
+        )
+    action = actions[cursor]
+    ctx = get_tool_context()
+    tool_input: dict[str, Any] = {}
+    before_app: dict[str, Any] = {}
+    output = ""
+    try:
+        tool_input = json.loads(action.get("tool_input_json") or "{}")
+        precondition = json.loads(action.get("precondition_json") or "{}")
+        before_app = ctx.device.current_app() if ctx and ctx.device else {}
+        if (
+            precondition.get("package")
+            and precondition.get("package") != before_app.get("package")
+        ) or (
+            precondition.get("activity")
+            and precondition.get("activity") != before_app.get("activity")
+        ):
+            raise RuntimeError("direct precondition mismatch")
+        tool = next(
+            tool for tool in AGENT_TOOLS if tool.name == action.get("tool_name")
+        )
+        output = str(tool.invoke(tool_input))
+        postcondition = json.loads(action.get("postcondition_json") or "{}")
+        after_app = ctx.device.current_app() if ctx and ctx.device else {}
+        if (
+            postcondition.get("package")
+            and postcondition.get("package") != after_app.get("package")
+        ) or (
+            postcondition.get("activity")
+            and postcondition.get("activity") != after_app.get("activity")
+        ):
+            raise RuntimeError("direct postcondition mismatch")
+    except Exception as exc:
+        output = f"ERROR: {exc}"
+
+    parsed_status = parse_status(output)
+    if parsed_status:
+        status = parsed_status
+    else:
+        status = "OK" if output.startswith(("OK", "PASS")) else "ERROR"
+
+    after_app = ctx.device.current_app() if ctx and ctx.device else {}
+    if ctx:
+        screen_profile = ""
+        try:
+            screen_profile = "x".join(str(value) for value in ctx.screen_size)
+        except Exception:
+            pass
+        ctx._action_events.append(
+            {
+                "action_index": cursor,
+                "tool_name": str(action.get("tool_name", "") or ""),
+                "tool_input": tool_input if "tool_input" in locals() else {},
+                "intent_text": "",
+                "screenshot_path": "",
+                "resolved_locator": json.loads(action.get("locator_json") or "{}"),
+                "page_before": {
+                    **dict(before_app or {}),
+                    "screen_profile": screen_profile,
+                },
+                "page_after": {
+                    **dict(after_app or {}),
+                    "screen_profile": screen_profile,
+                },
+                "status": status,
+                "execution_mode": "direct",
+            }
+        )
+    if status not in {"OK", "PASS", "YES"}:
+        transitions = list(state.get("mode_transition_events", []) or [])
+        reason = "direct_action_failed"
+        if "precondition mismatch" in output:
+            reason = "direct_precondition_failed"
+        elif "postcondition mismatch" in output:
+            reason = "direct_postcondition_failed"
+        elif status == "TIMEOUT":
+            reason = "direct_action_timeout"
+        elif status == "NOT_FOUND":
+            reason = "direct_action_not_found"
+        transitions.append(
+            {
+                "from": "direct",
+                "to": "guided",
+                "reason": reason,
+                "step_index": cursor,
+                "plan_id": _direct_plan_id,
+                "action_id": str(action.get("action_id", "") or action.get("action_index", "") or ""),
+                "phase_budget": _direct_phase_budget,
+            }
+        )
+        return Command(
+            update={
+                "execution_mode": "guided",
+                "lifecycle_state": "Guided",
+                "mode_selection_reason": reason,
+                "_direct_downgrade_count": 1,
+                "mode_transition_events": transitions,
+            }
+        )
+    return Command(update={"_direct_action_cursor": cursor + 1})
+
+
+def mode_transition_node(state: TestState, config: RunnableConfig) -> Command:
+    """Perform the only currently supported degradation: guided to explore."""
+    if int(state.get("_guided_downgrade_count", 0) or 0) >= 1:
+        return Command(
+            update={
+                "execution_mode": "explore",
+                "lifecycle_state": "Explore",
+                "mode_selection_reason": "guided_reentry_guard",
+                "selected_plan_actions": [],
+            }
+        )
+
+    history = list(state.get("step_history", []) or [])
+    last_step = history[-1] if history else {}
+    from agents.budget import _calc_mode_phase_budget
+
+    guided_steps = sum(
+        1
+        for step in history
+        if isinstance(step, dict) and step.get("execution_mode") == "guided"
+    )
+    reason = (
+        "guided_loop_detected"
+        if bool(last_step.get("loop_detected", False))
+        else (
+            "guided_phase_budget_exhausted"
+            if guided_steps >= _calc_mode_phase_budget(state, "guided")
+            else "guided_action_failed"
+        )
+    )
+    transitions = list(state.get("mode_transition_events", []) or [])
+    transitions.append(
+        {
+            "from": "guided",
+            "to": "explore",
+            "reason": reason,
+            "step_index": last_step.get("index"),
+            "plan_id": str(state.get("plan_id", "") or ""),
+            "action_id": str(last_step.get("action_id", "") or ""),
+            "phase_budget": _calc_mode_phase_budget(state, "guided"),
+        }
+    )
+    return Command(
+        update={
+            "execution_mode": "explore",
+            "lifecycle_state": "Explore",
+            "mode_selection_reason": reason,
+            "selected_plan_actions": [],
+            "mode_transition_events": transitions,
+            "_guided_downgrade_count": 1,
+            "status": "",
+            "conclusion": "",
+            "messages": [],
+        }
+    )
+
+
+def evaluator_node(state: TestState, config: RunnableConfig) -> Command:
+    """Materialize the current-run typed-evidence verdict without invoking an LLM."""
+    contract = state.get("verification_contract", {})
+    try:
+        ctx = get_tool_context()
+    except Exception:
+        ctx = None
+    evaluation = evaluate_verification(
+        contract if isinstance(contract, dict) else {},
+        list(getattr(ctx, "_evidence_events", []) or []) if ctx else [],
+    )
+    if ctx:
+        ctx._clause_state = evaluation
+    return Command(update={"clause_state": evaluation})
 
 
 # ═══ ROUTING ═══
@@ -2123,24 +1979,52 @@ def _prune_messages(
     um[:] = [um[i] for i in preserved]
 
 
+def _goal_is_usable(goal: dict) -> bool:
+    """A planner goal is usable only when it has a plain-text goal and a
+    non-empty verification list — otherwise the verification contract would be
+    empty and the run can never reach a terminal verdict."""
+    if not isinstance(goal, dict):
+        return False
+    goal_text = goal.get("goal", "")
+    if not isinstance(goal_text, str) or goal_text.strip().startswith("{"):
+        return False
+    verification = goal.get("verification", [])
+    return isinstance(verification, list) and any(
+        str(v or "").strip() for v in verification
+    )
+
+
 def _parse_goal(text: str) -> dict:
     m = re.search(r"\{[\s\S]*\}", text)
-    if not m:
-        return {
-            "goal": text.strip()[:200],
-            "target_pages": [],
-            "verification": [],
-            "hints": [],
-        }
-    try:
-        r = json.loads(m.group(0))
-        if isinstance(r, dict):
-            return r
-    except json.JSONDecodeError:
-        pass
-    return {
+    fallback = {
         "goal": text.strip()[:200],
         "target_pages": [],
         "verification": [],
         "hints": [],
+        "parameter_slots": [],
     }
+    if not m:
+        return fallback
+    try:
+        r = json.loads(m.group(0))
+        if isinstance(r, dict):
+            # Normalize parameter_slots to plain dicts for downstream compatibility.
+            slots = r.get("parameter_slots", [])
+            normalized_slots: list[dict[str, Any]] = []
+            for slot in slots or []:
+                if isinstance(slot, dict):
+                    normalized_slots.append(
+                        {
+                            "name": str(slot.get("name", "") or ""),
+                            "type": str(slot.get("type", "") or ""),
+                            "unit": str(slot.get("unit", "") or ""),
+                            "value": slot.get("value"),
+                            "original": str(slot.get("original", "") or ""),
+                            "source": str(slot.get("source", "") or "user_request"),
+                        }
+                    )
+            r["parameter_slots"] = normalized_slots
+            return r
+    except json.JSONDecodeError:
+        pass
+    return fallback

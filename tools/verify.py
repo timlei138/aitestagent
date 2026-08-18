@@ -28,45 +28,56 @@ except Exception:
         return wrapper(func) if func else wrapper
 
 
-def _record_deterministic_check(text: str, kind: str, passed: bool) -> None:
-    """M4：记录一次确定性断言（page_contains/element_exists）的结果，
-    供 assert_verification 反查作为 ground truth。仅追加、绝不抛异常。"""
+def _simple_activity_match(expected: str, actual: str) -> bool:
+    """按简单类名匹配 Activity，兼容包名前缀与内部类 $ 分隔。"""
+    exp = expected.strip().lstrip(".")
+    act = actual.strip().lstrip(".")
+    if not exp or not act:
+        return False
+    exp_simple = exp.rsplit("$", 1)[-1].rsplit(".", 1)[-1]
+    act_simple = act.rsplit("$", 1)[-1].rsplit(".", 1)[-1]
+    return exp_simple == act_simple
+
+
+def _record_deterministic_check(
+    text: str,
+    kind: str,
+    passed: bool,
+    verification_key: str = "",
+    clause_id: str = "",
+    channel: str = "",
+) -> None:
+    """Record deterministic current-run evidence for a declared clause."""
     try:
         ctx = get_tool_context()
     except Exception:
         return
     if ctx is None:
         return
-    if not getattr(ctx, "_deterministic_checks", None):
-        ctx._deterministic_checks = []
-    ctx._deterministic_checks.append(
+    if not verification_key or not clause_id or not channel:
+        return
+    if not hasattr(ctx, "_evidence_events"):
+        ctx._evidence_events = []
+    ctx._evidence_events.append(
         {
-            "text": str(text or ""),
-            "kind": kind,
-            "result": "pass" if passed else "fail",
+            "verification_key": verification_key,
+            "clause_id": clause_id,
+            "channel": channel,
+            "status": "PASS" if passed else "FAIL",
+            # Text/element lookup FAIL is intentionally non-authoritative.
+            "authoritative": False,
+            "fact": {"kind": kind, "text": str(text or "")},
         }
     )
 
 
-def _lookup_deterministic_ground_truth(ctx: ToolContext, condition: str):
-    """M4：在已记录的确定性断言中，反查与验证项 condition 匹配的最近一条结果。
-    采用保守的「子串包含」匹配（断言文本 ⊆ 验证项，或反之），最近的优先。
-    返回 "pass" / "fail" / None。"""
-    checks = getattr(ctx, "_deterministic_checks", None) or []
-    cond_norm = _normalize_verification_text(condition)
-    if not cond_norm:
-        return None
-    for check in reversed(checks):
-        text_norm = _normalize_verification_text(check.get("text", ""))
-        if not text_norm:
-            continue
-        if text_norm in cond_norm or cond_norm in text_norm:
-            return check.get("result")
-    return None
-
-
 @tool
-def assert_page_contains(text: str, pattern: bool = False) -> str:
+def assert_page_contains(
+    text: str,
+    pattern: bool = False,
+    verification_key: str = "",
+    clause_id: str = "",
+) -> str:
     """断言当前页面包含指定文本或匹配正则模式。
 
     - pattern=False（默认）: 检查页面是否包含 text 子串
@@ -75,8 +86,14 @@ def assert_page_contains(text: str, pattern: bool = False) -> str:
     返回: PASS 或 FAIL: <原因>
     """
     _result = _assert_page_contains_impl(text, pattern)
-    # M4：记录确定性核实结果，供 assert_verification 反查 ground truth
-    _record_deterministic_check(text, "page_contains", _result.startswith("PASS"))
+    _record_deterministic_check(
+        text,
+        "page_contains",
+        _result.startswith("PASS"),
+        verification_key,
+        clause_id,
+        "ui_text",
+    )
     return _result
 
 
@@ -150,7 +167,9 @@ def _assert_page_contains_impl(text: str, pattern: bool = False) -> str:
 
 
 @tool
-def assert_element_exists(label: str) -> str:
+def assert_element_exists(
+    label: str, verification_key: str = "", clause_id: str = ""
+) -> str:
     """断言当前页面存在指定元素（按 text / content_desc / resource_id 匹配）。"""
     ctx = get_tool_context()
     if ctx.perceiver is None:
@@ -158,525 +177,218 @@ def assert_element_exists(label: str) -> str:
     understanding = ctx.perceiver.perceive()
     for element in understanding.elements:
         if label in (element.label or ""):
-            _record_deterministic_check(label, "element_exists", True)
+            _record_deterministic_check(
+                label,
+                "element_exists",
+                True,
+                verification_key,
+                clause_id,
+                "element_state",
+            )
             return "PASS"
-    _record_deterministic_check(label, "element_exists", False)
+    _record_deterministic_check(
+        label,
+        "element_exists",
+        False,
+        verification_key,
+        clause_id,
+        "element_state",
+    )
     return f"FAIL: 元素不存在 {label}"
 
 
-def _normalize_verification_text(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    return re.sub(r"\s+", "", text)
-
-
-def _resolve_verification_key(
-    ctx: ToolContext, condition: str, verification_key: str = ""
-) -> str:
-    explicit = str(verification_key or "").strip()
-    if explicit:
-        return explicit
-    raw = str(condition or "").strip()
-    normalized = _normalize_verification_text(raw)
-    key_map = getattr(ctx, "_verification_key_map", {}) or {}
-    if raw and raw in key_map:
-        return str(key_map[raw])
-    if normalized and normalized in key_map:
-        return str(key_map[normalized])
-    if raw.startswith("v") and raw[1:].isdigit():
-        return raw
-    if normalized:
-        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
-        return f"dyn_{digest}"
-    return f"dyn_{len(getattr(ctx, '_verifications', [])) + 1}"
-
-
-def _verification_match_terms(value: Any) -> set[str]:
-    """Extract conservative, auditable terms for lexical UI association."""
-    text = str(value or "").strip()
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text).lower()
-    terms = set(re.findall(r"[a-z][a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", text))
-    for chunk in re.findall(r"[\u4e00-\u9fff]{3,}", text):
-        for size in (2, 3, 4):
-            if len(chunk) >= size:
-                terms.update(chunk[i : i + size] for i in range(len(chunk) - size + 1))
-    ignored = {
-        "包含",
-        "显示",
-        "当前",
-        "页面",
-        "具体",
-        "可以",
-        "进行",
-        "需要",
-        "无法",
-        "点击",
-        "确认",
-        "核实",
-        "存在",
-        "弹窗",
-    }
-    return {term for term in terms if term not in ignored}
-
-
-def _element_fact_text(element: Any) -> str:
-    return " ".join(
-        str(value or "")
-        for value in (
-            getattr(element, "label", ""),
-            getattr(element, "associated_label", ""),
-            getattr(element, "resource_id", ""),
-            getattr(element, "class_name", ""),
-            getattr(element, "context_path", ""),
-        )
-    )
-
-
-def _score_verification_element(
-    element: Any, *, canonical: str, detail: str, focus: str
-) -> tuple[int, list[str]]:
-    fact_text = _element_fact_text(element)
-    fact_norm = _normalize_verification_text(fact_text)
-    if not fact_norm:
-        return 0, []
-    fact_terms = _verification_match_terms(fact_text)
-    sources = (
-        ("detail_focus", focus, 120),
-        ("detail", detail, 70),
-        ("item", canonical, 45),
-    )
-    score = 0
-    basis: list[str] = []
-    label = str(getattr(element, "label", "") or "").strip()
-    label_norm = _normalize_verification_text(label)
-    for source_name, source_text, weight in sources:
-        source_norm = _normalize_verification_text(source_text)
-        if not source_norm:
-            continue
-        if (
-            label_norm
-            and len(label_norm) >= 2
-            and (label_norm in source_norm or source_norm in label_norm)
-        ):
-            score += weight + 40
-            basis.append(f"{source_name}↔label:{label[:24]}")
-            continue
-        overlap = sorted(
-            fact_terms & _verification_match_terms(source_text),
-            key=lambda value: (-len(value), value),
-        )
-        if overlap:
-            term = overlap[0]
-            score += weight + min(len(term), 8)
-            basis.append(f"{source_name}↔element:{term}")
-    return score, basis[:3]
-
-
-def _collect_related_interactive_facts(
-    ctx: ToolContext,
-    *,
-    verification_key: str,
-    condition: str,
-    detail: str,
-    limit: int = 3,
-) -> list[dict[str, Any]]:
-    """Return current-page UI facts related by lexical evidence to an unknown claim.
-
-    Element existence/clickability/index are deterministic current-page facts. The
-    relation is explicitly reported as lexical match_basis and is not treated as
-    proof that a candidate satisfies the verification claim.
-    """
-    perceiver = getattr(ctx, "perceiver", None)
-    if perceiver is None:
-        return []
-    try:
-        understanding = perceiver.perceive()
-    except Exception:
-        return []
-    elements = list(getattr(understanding, "elements", []) or [])
-    clickables = [
-        element for element in elements if getattr(element, "clickable", False)
-    ]
-    canonical = str(
-        (getattr(ctx, "_verification_items_by_key", {}) or {}).get(
-            verification_key, condition
-        )
-        or condition
-    )
-    detail_text = str(detail or "")
-    focus_parts = re.split(r"但|但是|然而|不过|仍需|需要|无法|未能|缺少", detail_text)
-    focus = focus_parts[-1].strip() if len(focus_parts) > 1 else detail_text
-
-    scored: dict[int, tuple[int, Any, list[str]]] = {}
-    for index, element in enumerate(clickables):
-        if not getattr(element, "enabled", True) or not getattr(
-            element, "safe_to_click", True
-        ):
-            continue
-        score, basis = _score_verification_element(
-            element, canonical=canonical, detail=detail_text, focus=focus
-        )
-        if score > 0:
-            scored[index] = (score, element, basis)
-
-    # If a matching child is not clickable, promote the smallest safe clickable
-    # container whose bounds contain it. This preserves the real click index.
-    for child in elements:
-        if getattr(child, "clickable", False):
-            continue
-        child_score, child_basis = _score_verification_element(
-            child, canonical=canonical, detail=detail_text, focus=focus
-        )
-        if child_score <= 0:
-            continue
-        child_bounds = tuple(getattr(child, "bounds", (0, 0, 0, 0)) or (0, 0, 0, 0))
-        if len(child_bounds) != 4:
-            continue
-        containers: list[tuple[int, int, Any]] = []
-        for index, candidate in enumerate(clickables):
-            if not getattr(candidate, "enabled", True) or not getattr(
-                candidate, "safe_to_click", True
-            ):
-                continue
-            bounds = tuple(getattr(candidate, "bounds", (0, 0, 0, 0)) or (0, 0, 0, 0))
-            if len(bounds) != 4 or not (
-                bounds[0] <= child_bounds[0]
-                and bounds[1] <= child_bounds[1]
-                and bounds[2] >= child_bounds[2]
-                and bounds[3] >= child_bounds[3]
-            ):
-                continue
-            candidate_path = str(getattr(candidate, "context_path", "") or "")
-            child_path = str(getattr(child, "context_path", "") or "")
-            if (
-                candidate_path
-                and child_path
-                and not (
-                    child_path.startswith(candidate_path)
-                    or candidate_path in child_path
-                )
-            ):
-                continue
-            area = max(0, bounds[2] - bounds[0]) * max(0, bounds[3] - bounds[1])
-            containers.append((area, index, candidate))
-        if containers:
-            _, index, parent = min(containers, key=lambda item: item[0])
-            promoted_basis = [
-                f"child:{str(getattr(child, 'label', '') or '?')[:24]}"
-            ] + child_basis
-            previous = scored.get(index)
-            if previous is None or child_score > previous[0]:
-                scored[index] = (child_score, parent, promoted_basis[:3])
-
-    facts: list[dict[str, Any]] = []
-    for index, (score, element, basis) in sorted(
-        scored.items(), key=lambda item: (-item[1][0], item[0])
-    )[: max(0, limit)]:
-        facts.append(
-            {
-                "index": index,
-                "label": str(getattr(element, "label", "") or ""),
-                "rid": str(getattr(element, "resource_id", "") or ""),
-                "class_name": str(getattr(element, "class_name", "") or ""),
-                "path": str(getattr(element, "context_path", "") or ""),
-                "bounds": list(getattr(element, "bounds", ()) or ()),
-                "region": str(getattr(element, "region", "") or ""),
-                "match_basis": basis,
-            }
-        )
-    if not facts:
-        return []
-
-    page_identity = "|".join(
-        (
-            str(getattr(understanding, "activity", "") or ""),
-            str(getattr(understanding, "page_title", "") or ""),
-            json.dumps(
-                facts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ),
-        )
-    )
-    signature = hashlib.sha1(
-        f"{verification_key}|{page_identity}".encode("utf-8")
-    ).hexdigest()
-    seen = getattr(ctx, "_verification_interactive_facts_seen", None)
-    if seen is None:
-        seen = set()
-        ctx._verification_interactive_facts_seen = seen
-    if signature in seen:
-        return []
-    seen.add(signature)
-    return facts
-
-
 @tool
-def assert_verification(
-    condition: str,
-    result: str,
-    detail: str = "",
+def assert_page_state(
+    package: str = "",
+    activity: str = "",
     verification_key: str = "",
+    clause_id: str = "",
 ) -> str:
-    """逐条报告验证条件的结果。
-
-    condition 对应 goal.verification 中的验证项；可选 ``verification_key`` 传入
-    Agent 上下文提供的 ``vN``，将同义描述稳定归入该验证项。result 只能为
-    ``passed``、``failed`` 或 ``unknown``。``unknown`` 表示当前架构缺少可核实证据，
-    需要人工复核，不能被当作功能失败或模型猜测通过。所有结果均需 detail。
-    截图策略：每个验证点都实时截图，保证验证清单中每条记录对应独立证据。"""
-    # 延迟 import：避免加载期循环依赖；同时让测试对 tools.get_tool_context 的
-    # monkeypatch 生效（局部名遮蔽模块级 import）。
-    from tools import _run_multimodal_from_context, get_tool_context
-    from tools.results import ERROR, OK, make_result
-
-    normalized_result = str(result or "").strip().lower()
-    if normalized_result not in ("passed", "failed", "unknown"):
-        return make_result(
-            ERROR,
-            "assert_verification result 必须为 passed、failed 或 unknown",
-            evidence={"reported_result": normalized_result},
-        )
-
+    """Assert the current application package and/or activity deterministically."""
     ctx = get_tool_context()
-    related_interactive_facts: list[dict[str, Any]] = []
-    if ctx:
-        if not hasattr(ctx, "_verifications"):
-            ctx._verifications = []
-        if not hasattr(ctx, "_verification_detail_retries"):
-            ctx._verification_detail_retries = {}
-        if not hasattr(ctx, "_duplicate_assert_count"):
-            ctx._duplicate_assert_count = 0
-        verification_key = _resolve_verification_key(ctx, condition, verification_key)
-        normalized = normalized_result
-        if normalized == "passed":
-            for index, existing in enumerate(ctx._verifications):
-                if (
-                    str(existing.get("key", "") or "") == verification_key
-                    and str(existing.get("result", "") or "") == "passed"
-                ):
-                    ctx._duplicate_assert_count = (
-                        int(ctx._duplicate_assert_count or 0) + 1
-                    )
-                    return make_result(
-                        OK,
-                        f"DUPLICATE_IGNORED: {verification_key} already passed at step={index + 1}",
-                        evidence={
-                            "verification_key": verification_key,
-                            "reported_result": normalized_result,
-                            "review_required": False,
-                            "duplicate_ignored": True,
-                        },
-                    )
-        if not (detail or "").strip():
-            retries = int(
-                ctx._verification_detail_retries.get(verification_key, 0) or 0
-            )
-            if retries < 2:
-                ctx._verification_detail_retries[verification_key] = retries + 1
-                return make_result(
-                    ERROR,
-                    "detail is required for assert_verification "
-                    f"(attempt {retries + 1}/2)",
-                    evidence={
-                        "verification_key": verification_key,
-                        "reported_result": normalized_result,
-                        "review_required": normalized_result == "unknown",
-                    },
-                )
-            detail = (
-                "需要人工复核：未提供可核实证据说明"
-                if normalized == "unknown"
-                else "detail unavailable after retries"
-            )
-        else:
-            ctx._verification_detail_retries.pop(verification_key, None)
-        if normalized == "unknown":
-            related_interactive_facts = _collect_related_interactive_facts(
-                ctx,
-                verification_key=verification_key,
-                condition=condition,
-                detail=detail,
-            )
-        shot_path = ""  # 相对路径（供前端 /storage 挂载解析）
-        shot_abs_path = ""  # 绝对路径（供本地文件操作）
-
-        # 每个验证点都尝试实时截图，失败时再回退到最近缓存截图。
-        if ctx.device:
-            try:
-                app_paths.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-                safe_cond = re.sub(r"[^\w一-鿿-]", "_", condition[:30])
-                verify_index = len(getattr(ctx, "_verifications", [])) + 1
-                new_path = str(
-                    app_paths.SCREENSHOT_DIR
-                    / f"verify_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{verify_index:02d}_{safe_cond}.png"
-                )
-                ctx.device.screenshot().save(new_path)
-                shot_abs_path = new_path
-                # 转为相对于 DATA_DIR 的路径，使前端 /storage 挂载能解析
-                try:
-                    shot_path = os.path.relpath(
-                        new_path, app_paths.DATA_DIR_STR
-                    ).replace("\\", "/")
-                except Exception:
-                    shot_path = new_path.replace("\\", "/")
-            except Exception:
-                shot_abs_path = getattr(ctx, "_last_screenshot_path", "") or ""
-                try:
-                    shot_path = (
-                        os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace(
-                            "\\", "/"
-                        )
-                        if shot_abs_path
-                        else ""
-                    )
-                except Exception:
-                    shot_path = shot_abs_path
-        else:
-            shot_abs_path = getattr(ctx, "_last_screenshot_path", "") or ""
-            try:
-                shot_path = (
-                    os.path.relpath(shot_abs_path, app_paths.DATA_DIR_STR).replace(
-                        "\\", "/"
-                    )
-                    if shot_abs_path
-                    else ""
-                )
-            except Exception:
-                shot_path = shot_abs_path
-
-        if shot_path:
-            shot_path = shot_path.replace("\\", "/")
-        if shot_abs_path:
-            shot_abs_path = shot_abs_path.replace("\\", "/")
-
-        # failed 时追加视觉分析（短超时，不阻塞主流程）
-        if (
-            normalized == "failed"
-            and ctx.verification_auto_vision
-            and shot_abs_path
-            and os.path.exists(shot_abs_path)
-        ):
-            try:
-                with open(shot_abs_path, "rb") as fh:
-                    raw_bytes = fh.read()
-                from io import BytesIO as _BytesIO
-                from PIL import Image as _PILImage
-                img = _PILImage.open(_BytesIO(raw_bytes))
-                w, h = img.size
-                longer = max(w, h)
-                if longer > 1024:
-                    ratio = 1024 / longer
-                    img = img.resize((int(w * ratio), int(h * ratio)), _PILImage.LANCZOS)
-                if img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
-                buf = _BytesIO()
-                img.save(buf, format="JPEG", quality=75)
-                image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                prompt = (
-                    "请分析该失败截图，说明此验证项失败的可能原因。"
-                    "只返回 JSON，字段: decision(yes/no/unknown), reason, evidence。"
-                    f"验证项: {condition}"
-                )
-                vres = _run_multimodal_from_context(
-                    prompt=prompt,
-                    image_base64=image_b64,
-                    purpose="verification_fail_analyze",
-                    strict_json=True,
-                    timeout_sec=30,
-                )
-                if vres.get("ok"):
-                    vis = f"vision={vres.get('decision', 'unknown')}: {vres.get('reason', '')}"
-                    detail = f"{detail} | {vis}" if detail else vis
-            except Exception:
-                pass
-
-        # M4（方案A）：确定性断言参与核实，但 PASS 与 FAIL **不对称**——
-        # PASS = 权威 ground truth（文字/元素确实存在，可确认甚至 override）；
-        # FAIL = **不权威**（文字未匹配 ≠ 元素不存在，如图标/canvas 绘制/无 content-desc），
-        #        只作弱证据，绝不否定模型、绝不 override，避免对图标类 UI 误判为冲突。
-        code_gt = _lookup_deterministic_ground_truth(ctx, condition)
-        if code_gt == "pass" and normalized in ("passed", "failed"):
-            if normalized == "passed":
-                tag = "[代码核实=PASS]"
-            elif getattr(ctx, "deterministic_verification_override", False):
-                normalized = "passed"
-                tag = f"[已按代码核实修正为PASS(模型原判定={result})]"
-            else:
-                tag = f"[⚠️代码核实=PASS，与模型判定({result})冲突]"
-            detail = f"{detail} | {tag}" if detail else tag
-        elif code_gt == "fail" and normalized == "failed":
-            # 模型也判 failed，文字未匹配与之一致 → 作弱佐证（不改判定）。
-            # 注意：model=passed 时故意不加任何标记（FAIL 不足以否定，可能是图标）。
-            tag = "[代码核实=文字未匹配(与判定一致)]"
-            detail = f"{detail} | {tag}" if detail else tag
-
-        ctx._verifications.append(
+    current = ctx.device.current_app() if ctx.device else {}
+    actual_package = str(current.get("package", "") or "")
+    actual_activity = str(current.get("activity", "") or "")
+    # Activity 名前导点归一化：设备返回的 activity 常带前导点
+    # （如 ".Settings$WifiSettingsActivity"），agent 传入时可能漏掉，
+    # strip 前导点后再比较，避免多余一次往返。
+    expected_activity = (activity or "").strip().lstrip(".")
+    actual_activity_norm = actual_activity.strip().lstrip(".")
+    passed = (not package or package == actual_package) and (
+        not expected_activity
+        or expected_activity == actual_activity_norm
+        or _simple_activity_match(expected_activity, actual_activity_norm)
+    )
+    fact = {"package": actual_package, "activity": actual_activity}
+    if verification_key and clause_id:
+        ctx._evidence_events.append(
             {
-                "key": verification_key,
-                "item": condition,
-                "result": normalized,
-                "detail": detail,
-                "screenshot": shot_path,
-                "review_required": normalized == "unknown",
+                "verification_key": verification_key,
+                "clause_id": clause_id,
+                "channel": "page_state",
+                "status": "PASS" if passed else "FAIL",
+                "authoritative": bool(package or activity) and not passed,
+                "fact": fact,
             }
         )
-    suffix = "（需要人工复核）" if normalized_result == "unknown" else ""
-    message = f"记录完成: {condition} → {normalized_result}{suffix}"
-    evidence: dict[str, Any] = {
-        "verification_key": verification_key,
-        "reported_result": normalized_result,
-        "review_required": normalized_result == "unknown",
-        "detail_len": len(detail or ""),
-    }
-    if related_interactive_facts:
-        fact_lines = [
-            "[当前页面可交互事实] "
-            f"发现 {len(related_interactive_facts)} 个与未核实文本存在字面关联的候选："
-        ]
-        for fact in related_interactive_facts:
-            label = fact.get("label") or "<无文本>"
-            rid = fact.get("rid") or ""
-            basis = ",".join(fact.get("match_basis") or [])
-            fact_lines.append(
-                f"- [{fact.get('index')}] {label!r} rid={rid or '?'} "
-                f"bounds={fact.get('bounds')} match_basis={basis or '?'}"
-            )
-        message += "\n" + "\n".join(fact_lines)
-        evidence.update(
-            {
-                "related_interactive_count": len(related_interactive_facts),
-                "related_interactives": json.dumps(
-                    related_interactive_facts,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ),
-            }
-        )
-    return make_result(OK, message, evidence=evidence)
+    return "PASS" if passed else f"FAIL: page state {fact}"
+
+
+def _infer_state_from_text(text: str) -> str | None:
+    """从元素文本 / content-desc 推断开关状态（on/off），作为 checked 缺失时的兜底。"""
+    text_lower = str(text or "").lower()
+    on_markers = ("开启", "打开", "启用", "选中", "勾选", "on", "yes", "true", "已连接")
+    off_markers = ("关闭", "禁用", "未选中", "未勾选", "off", "no", "false", "未连接")
+    if any(m in text_lower for m in on_markers):
+        return "on"
+    if any(m in text_lower for m in off_markers):
+        return "off"
+    return None
 
 
 @tool
-def report_done(status: str, summary: str = "") -> str:
-    """报告测试完成或无法继续。所有验证完成后必须调用此工具。
-
-    Args:
-        status: "done" 表示所有验证条件已完成，"abort" 表示无法继续执行
-        summary: 简要描述验证结果或无法继续的原因
-    """
-    from tools.results import ERROR, OK, make_result
-
-    status_norm = (status or "").strip().lower()
-    if status_norm not in {"done", "abort"}:
-        return make_result(
-            ERROR,
-            "report_done status 必须为 done 或 abort",
-            evidence={"terminal_status": status_norm},
+def assert_behavior_effect(
+    expected: str, verification_key: str = "", clause_id: str = ""
+) -> str:
+    """Assert a deterministic page behavior using a restricted predicate DSL."""
+    ctx = get_tool_context()
+    expected = str(expected or "").strip()
+    passed = False
+    channel = "behavior_effect"
+    fact: dict[str, Any] = {"expected": expected}
+    try:
+        current_app = ctx.device.current_app() if ctx.device else {}
+        if expected.startswith("still_on_activity(") and expected.endswith(")"):
+            activity = expected[18:-1]
+            actual_activity = str(current_app.get("activity", "") or "")
+            passed = actual_activity == activity or _simple_activity_match(
+                activity, actual_activity
+            )
+            fact["activity"] = current_app.get("activity", "")
+        elif expected.startswith("no_page_change(") and expected.endswith(")"):
+            signature = expected[15:-1]
+            actual_signature = (
+                str(ctx.perceiver.screen_signature() or "") if ctx.perceiver else ""
+            )
+            passed = bool(actual_signature) and actual_signature == signature
+            fact["signature"] = actual_signature
+        elif expected.startswith("list_count_unchanged(") and expected.endswith(")"):
+            anchor, separator, expected_count = expected[21:-1].rpartition(",")
+            if not separator:
+                return f"ERROR: list_count_unchanged requires anchor,count: {expected}"
+            understanding = ctx.perceiver.perceive() if ctx.perceiver else None
+            try:
+                count = sum(
+                    1
+                    for element in (understanding.elements if understanding else [])
+                    if anchor in (element.label or "")
+                )
+                passed = count == int(expected_count)
+                fact.update({"anchor": anchor, "count": count})
+            except ValueError:
+                return f"ERROR: invalid list count: {expected}"
+        elif expected.startswith("element_present(") and expected.endswith(")"):
+            label = expected[16:-1]
+            understanding = ctx.perceiver.perceive() if ctx.perceiver else None
+            passed = bool(
+                understanding
+                and any(
+                    label in (element.label or "") for element in understanding.elements
+                )
+            )
+            fact["label"] = label
+        elif expected.startswith("element_absent(") and expected.endswith(")"):
+            label = expected[15:-1]
+            understanding = ctx.perceiver.perceive() if ctx.perceiver else None
+            passed = bool(
+                understanding
+                and not any(
+                    label in (element.label or "") for element in understanding.elements
+                )
+            )
+            fact["label"] = label
+        elif expected.startswith("toggled(") and expected.endswith(")"):
+            # toggled(label, on|off): 点击某开关后它应变为 on/off。
+            # 与 element_state 的区别是语义更明确，且为切换类操作提供直接断言。
+            anchor, separator, state_spec = expected[8:-1].rpartition(",")
+            if not separator:
+                return f"ERROR: toggled requires label,on|off: {expected}"
+            anchor = anchor.strip().strip('"').strip("'")
+            state_spec = state_spec.strip().lower()
+            if "=" in state_spec:
+                _, expected_value = state_spec.split("=", 1)
+            else:
+                expected_value = state_spec
+            expected_checked = expected_value.strip() in ("true", "on", "yes", "1")
+            understanding = ctx.perceiver.perceive() if ctx.perceiver else None
+            matched = None
+            for element in understanding.elements if understanding else []:
+                if anchor and (
+                    anchor in (element.label or "")
+                    or anchor in (element.resource_id or "")
+                ):
+                    # 优先匹配真正的开关节点（role=switch 或含 switch 子控件的父行），
+                    # 跳过结构容器——它们可能残留硬编码的 checked="false"，导致误读。
+                    if (
+                        getattr(element, "has_switch_child", False)
+                        or getattr(element, "role", "") == "switch"
+                    ):
+                        matched = element
+                        break
+                    if matched is None:
+                        matched = element
+            if matched is None:
+                return f"ERROR: toggled anchor not found: {anchor}"
+            if matched.checked is not None:
+                actual_checked = bool(matched.checked)
+                inferred = None
+            else:
+                inferred = _infer_state_from_text(matched.label) or _infer_state_from_text(
+                    getattr(matched, "associated_label", "")
+                )
+                actual_checked = inferred == "on" if inferred is not None else False
+            fact.update({"anchor": anchor, "checked": actual_checked})
+            if inferred:
+                fact["inferred_from_text"] = inferred
+            passed = actual_checked == expected_checked
+            # toggled 是「切换行为」断言，产出 behavior_effect 通道，与状态/开关类
+            # claim 的默认通道一致。
+            channel = "behavior_effect"
+        else:
+            return (
+                f"ERROR: unsupported behavior predicate: {expected}. "
+                "supported predicates: still_on_activity(activity), "
+                "no_page_change(signature), list_count_unchanged(anchor,count), "
+                "element_present(label), element_absent(label), "
+                "toggled(label,on|off)"
+            )
+    except Exception as exc:
+        return f"ERROR: behavior effect check failed: {exc}"
+    if verification_key and clause_id:
+        ctx._evidence_events.append(
+            {
+                "verification_key": verification_key,
+                "clause_id": clause_id,
+                "channel": channel,
+                "status": "PASS" if passed else "FAIL",
+                "authoritative": True,
+                "fact": fact,
+            }
         )
-    # abort is an intentional terminal report, not a tool-execution failure.
+    return "PASS" if passed else f"FAIL: behavior effect not observed: {expected}"
+
+
+@tool
+def terminate_run(reason: str) -> str:
+    """Request an evaluator-confirmed abort when no safe path remains."""
+    from tools.results import OK, make_result
+
     return make_result(
         OK,
-        f"已报告: {status_norm}",
+        "已请求终止运行",
         evidence={
-            "terminal_status": status_norm,
-            "summary_len": len(summary or ""),
+            "agent_abort_requested": True,
+            "reason": str(reason or ""),
         },
     )
 

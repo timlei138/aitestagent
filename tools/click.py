@@ -65,8 +65,10 @@ def _query_known_identities(description: str) -> list[dict[str, Any]]:
         # 使用缓存的屏幕尺寸（设备分辨率运行期间不变）
         screen_w, screen_h = ctx.screen_size
         return (
-            db.query_element_identity(
-                package, description, target_screen=(screen_w, screen_h)
+            db.query_locator_knowledge(
+                package,
+                alias=description,
+                limit=3,
             )
             or []
         )
@@ -153,16 +155,11 @@ def _query_known_by_rid(resource_id: str) -> list[dict[str, Any]]:
 
             db = create_relational_db(TestConfig())
         package = ctx.device.current_app().get("package", "")
-        rows = db.select(
-            "element_identities",
-            {
-                "app_package": package,
-                "resource_id": resource_id,
-            },
-            order_by="click_count DESC",
+        return db.query_locator_knowledge(
+            package,
+            resource_id=resource_id,
             limit=3,
         )
-        return [dict(r) for r in rows]
     except Exception:
         return []
 
@@ -195,18 +192,25 @@ def _save_click_identity(
                 {"x1": bounds[0], "y1": bounds[1], "x2": bounds[2], "y2": bounds[3]}
             )
         screen_w, screen_h = ctx.screen_size
-        db.save_element_identity(
+        db.save_locator_knowledge(
             app_package=ctx.device.current_app().get("package", ""),
             page_signature=page_sig,
             alias=label,
-            resource_id=resource_id,
-            class_name=getattr(best_el, "class_name", "") or "",
-            role=getattr(best_el, "role", "") or "",
-            region=getattr(best_el, "region", "") or "",
-            text_hint=getattr(best_el, "text", "") or "",
-            bounds_json=bounds_json,
-            screen_width=screen_w,
-            screen_height=screen_h,
+            locator={
+                "rid": resource_id,
+                "class_name": getattr(best_el, "class_name", "") or "",
+                "role": getattr(best_el, "role", "") or "",
+                "region": getattr(best_el, "region", "") or "",
+                "bounds_json": bounds_json,
+            },
+            identity={
+                "resource_id": resource_id,
+                "class_name": getattr(best_el, "class_name", "") or "",
+                "role": getattr(best_el, "role", "") or "",
+                "region": getattr(best_el, "region", "") or "",
+                "text_hint": getattr(best_el, "text", "") or "",
+            },
+            screen_profile=f"{screen_w}x{screen_h}",
         )
         logger.info(
             "Saved identity: alias=%r rid=%s page_sig=%s", label, resource_id, page_sig
@@ -363,49 +367,6 @@ def _extract_curated_rule_label(content: str) -> str:
     if m:
         return (m.group(1) or "").strip()
     return ""
-
-
-def _maybe_promote_exact_rule(
-    ctx: Any,
-    *,
-    label: str,
-    pre_page: str,
-    matched_el: Any,
-) -> None:
-    kb = getattr(ctx, "knowledge_base", None)
-    if not kb or matched_el is None:
-        return
-    app_pkg = (ctx.device.current_app() or {}).get("package", "")
-    if not app_pkg:
-        return
-
-    rid = getattr(matched_el, "resource_id", "") or ""
-    cls = _normalize_text(getattr(matched_el, "class_name", "")).split(".")[-1]
-    path = getattr(matched_el, "context_path", "") or ""
-    post_page = _capture_page_id(ctx)
-    action = f'click_exact("{label}")'
-    if rid:
-        action += f" rid={rid}"
-    if cls:
-        action += f" class={cls}"
-    if path:
-        action += f" path={path}"
-
-    kb.save_experience(
-        app_package=app_pkg,
-        page=pre_page or "",
-        action=action,
-        to_page=post_page or "",
-        outcome="成功",
-        detail="exact_click",
-        signal_type="exact_click",
-        quality_score=1.0,
-        action_semantic=action,
-        page_stability="stable",
-    )
-    # NOTE(2026-07-10): 点击偏好已通过 save_experience 保存为操作经验，
-    # _extract_click_preferences_from_rag 在 RAG 查询时自动提取。
-    # 不再自动提升为 curated_rule —— 人工知识应仅由测试人员手动维护。
 
 
 # ═══════════════════════════════════════════
@@ -757,7 +718,9 @@ def click(
             rid_is_unique = rid_count <= 1
         if role in ("switch", "switch_row") or _is_checkbox_like(el):
             ctx.device.click_bounds(el.bounds)
-            time.sleep(1.0)
+            # 部分开关（如 Wi-Fi）关→开需要 3-4 秒才能真正生效，1 秒后读到的是
+            # 过渡态（会短暂 on 再回 off），导致「开关状态」误报。等 4 秒再回检。
+            time.sleep(4.0)
             new_checked = _check_switch_state(ctx, el)
             if new_checked is not None:
                 if role in ("switch", "switch_row"):
@@ -828,10 +791,19 @@ def click(
         if snap:
             parts.append(snap)
 
+        # Phase 4 locator 解析类型：semantic=语义搜索 ranker 命中（match_mode=element 且
+        # 非兜底）；exact=确定性定位（resource_id/bounds/text/known-rid/pct-bounds 兜底）。
+        resolution_type = (
+            "semantic"
+            if (match_mode == "element" and not fallback_used)
+            else "exact"
+        )
         evidence: dict[str, Any] = {
             "match_mode": match_mode,
             "fallback_used": fallback_used,
+            "resolution_type": resolution_type,
             "resolved_label": resolved.get("label", ""),
+            "requested_label": label,
             "resolved_role": resolved.get("role", ""),
             "resolved_rid": resolved.get("rid", ""),
             "resolved_class": resolved.get("class_name", ""),
@@ -846,11 +818,15 @@ def click(
             if _m:
                 evidence["checked"] = _m.group(1) in ("开启", "已勾选")
         # C: 模糊匹配（搜索词≠实际标签的语义命中）是独立事实，透传供指标统计。
+        # 用最终写进 evidence 的 resolved_label 作为比较基准，而不是 clicked_el.label：
+        # 后者是控件自身语义（如 switch 的 "WLAN"），前者才是本次点击解析出的目标语义
+        # （如 "WLAN 开关"），两者不一致会把 label 完全相等的 exact 点击误判为 fuzzy。
         if clicked_el is not None:
-            _el_label = (getattr(clicked_el, "label", "") or "").strip().lower()
+            _el_label = (str(resolved.get("label", "") or "")).strip().lower()
             _q = (label or "").strip().lower()
             evidence["fuzzy_match"] = (
-                bool(_el_label)
+                bool(_q)
+                and bool(_el_label)
                 and _q != _el_label
                 and (_q not in _el_label or len(_q) < len(_el_label) * 0.5)
             )
@@ -881,19 +857,6 @@ def click(
         if ok:
             strategy_match = re.search(r"strategy=([A-Za-z0-9_-]+)", result or "")
             match_mode = strategy_match.group(1) if strategy_match else "element"
-            _record_page_transition(
-                ctx,
-                _pre_page,
-                label,
-                click_context=_build_click_context(match_mode, best_el),
-            )
-            if exact_mode:
-                _maybe_promote_exact_rule(
-                    ctx,
-                    label=label,
-                    pre_page=_pre_page,
-                    matched_el=best_el,
-                )
             return _make_click_success(
                 result,
                 _resolved_from_element(best_el),
@@ -908,12 +871,6 @@ def click(
 
     # 兆底：未找到语义匹配，回退到原始文本/资源点击
     if ctx.device.click_text(label):
-        _record_page_transition(
-            ctx,
-            _pre_page,
-            label,
-            click_context=_build_click_context("text-fallback", None),
-        )
         return _make_click_success(
             f"已点击: {label} (strategy=text-fallback)",
             {"label": label},
@@ -927,12 +884,6 @@ def click(
     for known in known_ids:
         known_rid = known.get("resource_id", "")
         if known_rid and ctx.device.click_resource_id(known_rid):
-            _record_page_transition(
-                ctx,
-                _pre_page,
-                label,
-                click_context=_build_click_context("known-rid-fallback", None),
-            )
             return _make_click_success(
                 f"已点击历史资源: {label} rid={known_rid} "
                 "(strategy=known-rid-fallback)",
@@ -964,12 +915,6 @@ def click(
                 and bounds[3] <= screen_h
             ):
                 ctx.device.click_bounds(bounds)
-                _record_page_transition(
-                    ctx,
-                    _pre_page,
-                    label,
-                    click_context=_build_click_context("pct-bounds-fallback", None),
-                )
                 return _make_click_success(
                     f"已点击历史坐标: {label} "
                     f"bounds=({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) "
@@ -980,12 +925,6 @@ def click(
                     clicked_el=None,
                 )
     if ctx.device.click_resource_id(label):
-        _record_page_transition(
-            ctx,
-            _pre_page,
-            label,
-            click_context=_build_click_context("rid-fallback", None),
-        )
         return _make_click_success(
             f"已点击资源: {label} (strategy=rid-fallback)",
             {"label": label, "rid": label},
@@ -1014,7 +953,7 @@ def click(
                 f"未找到可点击元素: {label}，但权限弹窗已自动处理",
                 _perm,
             )
-    # 误判防护（对应 agent_common/agent_replay 的权限契约）：NOT_FOUND 时若系统权限弹窗
+    # 误判防护（对应 agent_common 的权限契约）：NOT_FOUND 时若系统权限弹窗
     # 仍在（GrantPermissionsActivity 可见），把真实按钮回写给 LLM，避免它
     # 把"点空"误判成"弹窗超时"去烧 adb 兜底。
     try:
@@ -1240,114 +1179,6 @@ def _post_click_snapshot(ctx: Any, pre_title: str, label: str) -> str:
         return " | ".join(lines)
     except Exception:
         return ""
-
-
-def _record_page_transition(
-    ctx: Any, pre_page: str, label: str, *, click_context: dict[str, Any] | None = None
-) -> None:
-    """记录页面流转到知识库（异步，失败不阻塞）。
-
-    组合去重: 同一次执行中同一 (page, action, to_page) 只写入一次。
-    """
-    if not pre_page:
-        return
-    try:
-        post_page = _capture_page_id(ctx)
-        if post_page and post_page != pre_page:
-            # 组合去重
-            cc = dict(click_context or {})
-            strategy = str(cc.get("strategy", "") or "")
-            exact_mode = bool(cc.get("exact_mode", False))
-            rid = str(cc.get("rid", "") or "")
-            class_name = str(cc.get("class_name", "") or "")
-            path_contains = str(cc.get("path_contains", "") or "")
-            index = int(cc.get("index", -1) or -1)
-
-            action_parts = [f"click(label={label})"]
-            if class_name:
-                action_parts.append(f"class={class_name}")
-            if path_contains:
-                action_parts.append(f"path={path_contains}")
-            if rid:
-                action_parts.append(f"rid={rid}")
-            if index >= 0:
-                action_parts.append(f"index={index}")
-            action_semantic = ",".join(action_parts)
-            action = f'click_exact("{label}")' if exact_mode else f"click({label})"
-            if rid:
-                action += f" rid={rid}"
-            if class_name:
-                action += f" class={class_name}"
-            if path_contains:
-                action += f" path={path_contains}"
-
-            quality = 0.35
-            if exact_mode:
-                quality += 0.35
-            if index >= 0:
-                quality += 0.10
-            if rid:
-                quality += 0.25
-            if path_contains and ">" in path_contains:
-                quality += 0.20
-            if class_name:
-                quality += 0.10
-            if "fallback" in strategy or "bounds" in strategy:
-                quality -= 0.25
-            signal_type = (
-                "exact_click"
-                if exact_mode
-                else ("fallback_click" if "fallback" in strategy else "semantic_click")
-            )
-            page_stability = "stable"
-            if re.search(
-                r"\d+\.\d+\s*[KMG]?[Bb]/s|\d{1,2}:\d{2}(:\d{2})?|\d+%", pre_page
-            ):
-                page_stability = "volatile"
-                quality -= 0.30
-            quality = max(0.0, min(1.0, quality))
-            if quality < 0.75:
-                logger.info(
-                    "Skip low-quality experience: label=%r quality=%.2f strategy=%s",
-                    label,
-                    quality,
-                    strategy,
-                )
-                return
-            # §5.2: 同页同按钮不重复写 experience。跨页导航才写入。
-            pre_activity = (pre_page or "").split("「")[0].split("#")[0].strip()
-            post_activity = (post_page or "").split("「")[0].split("#")[0].strip()
-            if exact_mode and pre_activity == post_activity:
-                return  # 同 activity 内的精确点击（如计算器按键）不写 experience
-
-            combo_key = f"{pre_page}|{action}|{post_page}"
-            if combo_key in _page_transition_seen:
-                return
-            _page_transition_seen.add(combo_key)
-
-            kb = ctx.knowledge_base
-            if kb:
-                app_pkg = ctx.device.current_app().get("package", "")
-                # §5.3: content 精简 — page 归一化去 hash，action 传语义化摘要
-                rid_tail = (rid or "").split("/")[-1] if rid else ""
-                norm_pre = re.sub(r"#\w{6,}", "", (pre_page or "").split("「")[0])
-                norm_post = re.sub(r"#\w{6,}", "", (post_page or "").split("「")[0])
-                kb.save_experience(
-                    app_package=app_pkg,
-                    page=norm_pre,
-                    action=action,
-                    to_page=norm_post,
-                    outcome="成功",
-                    signal_type=signal_type,
-                    quality_score=quality,
-                    action_semantic=action_semantic,
-                    page_stability=page_stability,
-                )
-                logger.info(
-                    "KB page transition: %s → %s (click %r)", pre_page, post_page, label
-                )
-    except Exception as exc:
-        logger.debug("Page transition recording skipped: %s", exc)
 
 
 @tool

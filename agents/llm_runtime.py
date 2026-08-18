@@ -20,7 +20,9 @@ from llm.clients import _call_with_retry, _default_should_retry
 from agents.loop_control import (
     _build_call_signature,
     _build_page_signature,
+    _detect_termination,
     _cooldown_group,
+    _cooldown_group_from_evidence,
     _output_has_page_change,
     _resolve_click_fallback,
     _resolve_click_match_mode,
@@ -32,14 +34,15 @@ import app_paths
 logger = logging.getLogger(__name__)
 
 
-_SKIP_EMIT = {"get_screen_info", "check_page_health", "query_app_knowledge"}
+_SKIP_EMIT = {"get_screen_info", "check_page_health", "request_knowledge"}
 
 _SCREENSHOT_ACTIONS = {
     "click",
     "long_press",
     "scroll_find_and_click",
     "launch_app",
-    "assert_verification",
+    "assert_page_contains",
+    "assert_element_exists",
     "swipe",
 }
 
@@ -136,7 +139,7 @@ _LOOP_BREAK_CONSECUTIVE = 3
 _NO_PROGRESS_LIMIT = 8
 _FINALIZATION_REMAINING_TOOL_BUDGET = 5
 # launch_app 守卫：目标 App 已在前台（package 已匹配）却仍 launch 属冗余重开，
-# 累计同 package 超过该阈值则下次直接 COOLDOWN_SKIP，逼 LLM 转向 assert/report_done。
+# 累计同 package 超过该阈值则下次直接 COOLDOWN_SKIP，逼 LLM 转向验证或终止请求。
 _LAUNCH_REDUNDANT_LIMIT = 3
 _NO_PROGRESS_ACTIONS = {
     "click",
@@ -193,175 +196,6 @@ def _accumulate_token_usage(ctx, msg) -> None:
         )
 
 
-def _execute_replay_tool(
-    tool: Any,
-    name: str,
-    args: dict[str, Any],
-    run_id: str = "",
-    tool_seq: int = 0,
-    replay_mode: str = "",
-) -> tuple[str, dict[str, Any]]:
-    """回放 script 模式的确定性直接执行（不调主 LLM）。
-
-    复用 _tools_node 的核心管道：stop 检查 / 前后应用与页面签名 / 结构化
-    evidence 与 status_code 解析 / 关键操作截图 / ws 事件。刻意不含 loop
-    guard / cooldown —— 脚本步骤是确定的，防循环由 recovery 预算负责。
-    返回 (output_text, log_entry)，log_entry 字段与 _tools_node 产出一致。
-    """
-    # 延迟 import：读取 graph 的可变全局当前值（set_ws_emit_callback 会更新它）
-    from agents.graph import _ws_emit_callback
-
-    try:
-        ctx = get_tool_context()
-    except Exception:
-        ctx = None
-    if ctx and _ws_emit_callback:
-        ctx._ws_emit = _ws_emit_callback
-
-    # 用户手动停止：与 _tools_node 行为一致，立即终止
-    if ctx is not None:
-        _ev = getattr(ctx, "_stop_event", None)
-        if _ev is not None and _ev.is_set():
-            output = "ABORT: USER_STOPPED — 用户手动停止当前运行"
-            return output, {
-                "name": name,
-                "target": _build_tool_target(name, args),
-                "intent_text": "replay direct",
-                "observation": output,
-                "screenshot_path": "",
-                "tool_seq": tool_seq,
-                "tool_input": dict(args or {}),
-                "status_code": "ERROR",
-                "result_evidence": {},
-                "page_before_signature": "",
-                "page_after_signature": "",
-                "page_before_activity": "",
-                "page_after_activity": "",
-                "page_before_package": "",
-                "page_after_package": "",
-            }
-
-    page_sig_before = _build_page_signature(ctx)
-    try:
-        before_app = (
-            ctx.device.current_app() or {}
-            if ctx is not None and getattr(ctx, "device", None) is not None
-            else {}
-        )
-    except Exception:
-        before_app = {}
-    if name not in _SKIP_EMIT and ctx and getattr(ctx, "_ws_emit", None):
-        try:
-            ctx._ws_emit(
-                "tool_start",
-                {
-                    "name": name,
-                    "input": {"label": _build_tool_target(name, args)},
-                    "intent_text": "replay direct",
-                },
-            )
-        except Exception:
-            pass
-    # Task 10: 剥离内部元数据字段（_ 前缀），避免传给 tool.invoke
-    _internal_meta = {k: v for k, v in (args or {}).items() if k.startswith("_")}
-    _invoke_args = (
-        {k: v for k, v in (args or {}).items() if not k.startswith("_")}
-        if _internal_meta
-        else dict(args or {})
-    )
-    try:
-        output = str(tool.invoke(_invoke_args)) if tool else f"UNKNOWN_TOOL: {name}"
-    except Exception as e:
-        output = f"ERROR: {e}"
-    # Task 7.1: 弹层后置消解 —— 仅回放 script 模式下 click NOT_FOUND 时尝试 dismiss + retry
-    if (
-        name == "click"
-        and output.startswith("NOT_FOUND")
-        and replay_mode == "script"
-        and ctx is not None
-        and getattr(ctx, "device", None) is not None
-    ):
-        try:
-            logger.info(
-                "[replay popup guard] click NOT_FOUND → press_key(back) + retry"
-            )
-            from tools import press_key as _pk_tool
-
-            _pk_tool.invoke({"key": "back"})
-            import time as _t
-
-            _t.sleep(0.5)
-            output = str(tool.invoke(_invoke_args)) if tool else output
-        except Exception as _dismiss_exc:
-            logger.warning("[replay popup guard] dismiss failed: %s", _dismiss_exc)
-    page_sig_after = _build_page_signature(ctx)
-    try:
-        after_app = (
-            ctx.device.current_app() or {}
-            if ctx is not None and getattr(ctx, "device", None) is not None
-            else {}
-        )
-    except Exception:
-        after_app = {}
-    # 设备断开快速终止
-    try:
-        if get_tool_context().device is None:
-            output = "ERROR: 设备已断开连接"
-    except Exception:
-        pass
-    if name not in _SKIP_EMIT and ctx and getattr(ctx, "_ws_emit", None):
-        try:
-            ctx._ws_emit("tool_end", {"name": name, "output": output[:200]})
-        except Exception:
-            pass
-    screenshot_path = ""
-    if name in _SCREENSHOT_ACTIONS and ctx and getattr(ctx, "device", None):
-        try:
-            screenshot_path = _take_step_screenshot(ctx, run_id, tool_seq)
-        except Exception:
-            screenshot_path = ""
-    result_evidence = _parse_evidence(output)
-    status_code = _extract_status_code(output)
-    if name == "report_done":
-        status_code = "OK"
-        result_evidence.setdefault(
-            "terminal_status", (args.get("status", "") or "done").lower()
-        )
-    # Task 10: 透传内部元数据到 result_evidence（供 run_trace 指标采集）
-    if _internal_meta:
-        for _mk, _mv in _internal_meta.items():
-            result_evidence[_mk] = _mv
-    entry: dict[str, Any] = {
-        "name": name,
-        "target": _build_tool_target(name, args),
-        "intent_text": "replay direct",
-        "observation": output[:200],
-        "screenshot_path": screenshot_path,
-        "tool_seq": tool_seq,
-        "tool_input": dict(args or {}),
-        "status_code": status_code,
-        "result_evidence": result_evidence,
-        "page_before_signature": page_sig_before,
-        "page_after_signature": page_sig_after,
-        "page_before_activity": str(before_app.get("activity", "") or ""),
-        "page_after_activity": str(after_app.get("activity", "") or ""),
-        "page_before_package": str(before_app.get("package", "") or ""),
-        "page_after_package": str(after_app.get("package", "") or ""),
-    }
-    if name == "click":
-        entry["match_mode"] = _resolve_click_match_mode(name, args, output)
-        entry["fallback_used"] = _resolve_click_fallback(output)
-        entry["fuzzy_match"] = bool(result_evidence.get("fuzzy_match", False))
-        entry["resolved_target"] = {
-            "label": result_evidence.get("resolved_label", ""),
-            "role": result_evidence.get("resolved_role", ""),
-            "rid": result_evidence.get("resolved_rid", ""),
-            "class_name": result_evidence.get("resolved_class", ""),
-            "path": result_evidence.get("resolved_path", ""),
-        }
-    return output, entry
-
-
 def _run_agent(
     messages,
     tools,
@@ -370,8 +204,7 @@ def _run_agent(
     base_url,
     max_turns=20,
     run_id: str = "",
-    one_step: bool = False,
-) -> tuple[str, list, dict[str, Any]]:
+) -> tuple[str, list, dict[str, Any], str]:
     # 延迟 import：读取 graph 的可变全局当前值（set_ws_emit_callback 会更新它）
     from agents.graph import _ws_emit_callback
 
@@ -483,10 +316,10 @@ def _run_agent(
             name = tc["name"]
             args = tc.get("args", {}) or {}
             target_hint = _build_tool_target(name, args)
-            cooldown_group = _cooldown_group(name, args, target_hint)
+            cooldown_group = _cooldown_group(name, args, target_hint, page_sig_once)
             # launch_app 守卫（pre-check）：目标 App 已在前台却仍 launch 属冗余重开。
             # 若同 package 的冗余重开已累计达阈值，直接 COOLDOWN_SKIP 拒绝，
-            # 逼 LLM 转向 assert_verification / report_done，而不是反复"重开试试"。
+            # 逼 LLM 转向验证或终止请求，而不是反复"重开试试"。
             if (
                 name == "launch_app"
                 and _ctx is not None
@@ -497,7 +330,7 @@ def _run_agent(
                 # 修复：不再要求"launch 前 App 已在前台"才计为冗余。只要对
                 # 同一 package 的 launch 调用累计达阈值，即视为病态反复重开
                 # （无论中间是否被切走），直接 COOLDOWN_SKIP 拦截，逼 LLM
-                # 转向 assert_verification / report_done。
+                # 转向验证或终止请求。
                 if (
                     _req_pkg
                     and int(_lc.get(_req_pkg, 0) or 0) >= _LAUNCH_REDUNDANT_LIMIT
@@ -507,7 +340,7 @@ def _run_agent(
                             content=(
                                 f"COOLDOWN_SKIP: launch_app({_req_pkg}) 已多次重开同一应用，"
                                 "请勿重复启动；若无法继续请调用 "
-                                "report_done(status='abort')"
+                                "terminate_run(reason='无法安全继续')"
                             ),
                             tool_call_id=tc["id"],
                         )
@@ -565,6 +398,12 @@ def _run_agent(
                 )
             except Exception:
                 before_app = {}
+            screen_profile = ""
+            try:
+                if _ctx is not None:
+                    screen_profile = "x".join(str(value) for value in _ctx.screen_size)
+            except Exception:
+                pass
             try:
                 output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"
             except Exception as e:
@@ -578,10 +417,9 @@ def _run_agent(
                 )
             except Exception:
                 after_app = {}
-            progress_milestone = (
-                name == "assert_verification"
-                or _output_has_page_change(output, page_sig_once, page_sig_after)
-            )
+            progress_milestone = bool(
+                getattr(_ctx, "_evidence_events", []) or []
+            ) or _output_has_page_change(output, page_sig_once, page_sig_after)
             # launch_app 守卫（post-update）：冗余重开（App 已在前台）累计计数；
             # 真实启动（package 变化）则重置。冗余重开不重置 no_progress，让熔断器能 arming。
             if name == "launch_app":
@@ -651,14 +489,14 @@ def _run_agent(
                             SystemMessage(
                                 content=(
                                     "NO_PROGRESS_WARNING: 连续动作未提交验证结果。"
-                                    "请立即调用 assert_verification(condition, result)"
-                                    " 上报当前可验证项；无法确认时上报 failed。"
+                                    "请调用携带 verification_key 与 clause_id 的验证工具"
+                                    " 记录当前可验证事实；无法安全继续时请求终止。"
                                 )
                             )
                         )
                     elif no_progress_count >= 2 * _NO_PROGRESS_LIMIT:
                         loop_break_reason = (
-                            "NO_PROGRESS: no assert_verification "
+                            "NO_PROGRESS: no typed verification evidence "
                             f"for {2 * _NO_PROGRESS_LIMIT} consecutive action tool calls"
                         )
                         logger.warning(loop_break_reason)
@@ -668,7 +506,7 @@ def _run_agent(
             if name not in (
                 "get_screen_info",
                 "check_page_health",
-                "query_app_knowledge",
+                "request_knowledge",
             ):
                 call_sig = _build_call_signature(name, args, page_sig_once)
                 recent.append(call_sig)
@@ -686,26 +524,8 @@ def _run_agent(
                     break
 
             # 语义冷却：处理近似抖动（与签名断路器互补）
-            if progress_milestone:
-                recent_action_groups = []
-            elif cooldown_group:
-                recent_action_groups.append(cooldown_group)
-                if len(recent_action_groups) > 6:
-                    recent_action_groups = recent_action_groups[-6:]
-                if (
-                    len(recent_action_groups) >= 4
-                    and recent_action_groups.count(cooldown_group) >= 4
-                ):
-                    cooldown_map[cooldown_group] = 2
-                    recent_action_groups = []
-                    outputs.append(
-                        SystemMessage(
-                            content=(
-                                f"COOLDOWN_TRIGGERED: {cooldown_group} 连续重复。"
-                                "请改用结构化定位并优先完成验证上报。"
-                            )
-                        )
-                    )
+            # 注意：click 是否 fuzzy_match 要在工具执行后才能确定，因此本块在
+            # result_evidence 解析后重新计算 cooldown_group 再执行。
             page_sig_once = page_sig_after
 
             # Persist the full structured event for every executed tool call,
@@ -714,13 +534,9 @@ def _run_agent(
             # an unstructured successful-looking string is not evidence.
             result_evidence = _parse_evidence(output)
             status_code = _extract_status_code(output)
-            # report_done(abort) is an accepted terminal report rather than
-            # a tool error; retain its terminal state as evidence.
-            if name == "report_done":
+            if name == "terminate_run":
                 status_code = "OK"
-                result_evidence.setdefault(
-                    "terminal_status", (args.get("status", "") or "done").lower()
-                )
+                result_evidence.setdefault("agent_abort_requested", True)
             entry: dict[str, Any] = {
                 "name": name,
                 "target": target_hint,
@@ -741,9 +557,13 @@ def _run_agent(
             if name == "click":
                 entry["match_mode"] = _resolve_click_match_mode(name, args, output)
                 entry["fallback_used"] = _resolve_click_fallback(output)
+                # Phase 4 locator 解析类型：semantic=语义搜索 ranker 命中、exact=确定性定位。
+                entry["resolution_type"] = result_evidence.get("resolution_type", "")
                 # C: 模糊匹配（搜索词≠实际标签的语义命中）是独立事实，
                 # 透传 fuzzy_match 供 fuzzy_click_rate 门禁统计（非 fallback）。
                 entry["fuzzy_match"] = bool(result_evidence.get("fuzzy_match", False))
+                entry["requested_label"] = result_evidence.get("requested_label", "")
+                entry["resolved_label"] = result_evidence.get("resolved_label", "")
                 entry["resolved_target"] = {
                     "label": result_evidence.get("resolved_label", ""),
                     "role": result_evidence.get("resolved_role", ""),
@@ -751,15 +571,89 @@ def _run_agent(
                     "class_name": result_evidence.get("resolved_class", ""),
                     "path": result_evidence.get("resolved_path", ""),
                 }
+                if entry["fuzzy_match"]:
+                    cooldown_group = _cooldown_group_from_evidence(
+                        name, args, target_hint, page_sig_after, result_evidence
+                    )
             _current_log.append(entry)
 
-            # report_done: 结构化终止信号，立即终止子图
-            if name == "report_done":
-                _status = (args.get("status", "") or "").lower()
-                _summary = args.get("summary", "") or ""
+            # 破坏性切换环路检测：同一元素在同一页面被点击 >=3 次（如开关反复开/关/开）。
+            from agents.loop_control import _detect_toggle_loop
+
+            toggle_loop, toggle_key = _detect_toggle_loop(_current_log)
+            if toggle_loop and not loop_break_reason:
                 loop_break_reason = (
-                    f"REPORT_{'DONE' if _status == 'done' else 'ABORT'}: {_summary}"
+                    f"TOGGLE_LOOP_DETECTED: same target clicked repeatedly "
+                    f"({toggle_key}). Stop toggling and report current evidence."
                 )
+                logger.warning(loop_break_reason)
+                break
+
+            # 语义冷却：在 result_evidence 解析后执行，确保 fuzzy_click 被正确分组。
+            if progress_milestone:
+                recent_action_groups = []
+            elif cooldown_group:
+                recent_action_groups.append(cooldown_group)
+                if len(recent_action_groups) > 6:
+                    recent_action_groups = recent_action_groups[-6:]
+                if (
+                    len(recent_action_groups) >= 4
+                    and recent_action_groups.count(cooldown_group) >= 4
+                ):
+                    cooldown_map[cooldown_group] = 2
+                    recent_action_groups = []
+                    outputs.append(
+                        SystemMessage(
+                            content=(
+                                f"COOLDOWN_TRIGGERED: {cooldown_group} 连续重复。"
+                                "请改用结构化定位并优先完成验证上报。"
+                            )
+                        )
+                    )
+            if _ctx is not None:
+                _ctx._action_events.append(
+                    {
+                        "action_index": len(_ctx._action_events),
+                        "tool_name": name,
+                        "tool_input": dict(args or {}),
+                        "intent_text": (getattr(last_ai, "content", "") or "").strip()[:200],
+                        "screenshot_path": _screenshot_path,
+                        "resolved_locator": entry.get("resolved_target", {}),
+                        "page_before": {
+                            "signature": page_sig_before,
+                            "package": str(before_app.get("package", "") or ""),
+                            "activity": str(before_app.get("activity", "") or ""),
+                            "screen_profile": screen_profile,
+                        },
+                        "page_after": {
+                            "signature": page_sig_after,
+                            "package": str(after_app.get("package", "") or ""),
+                            "activity": str(after_app.get("activity", "") or ""),
+                            "screen_profile": screen_profile,
+                        },
+                        "status": status_code,
+                        "execution_mode": str(
+                            getattr(_ctx, "_execution_mode", "explore") or "explore"
+                        ),
+                    }
+                )
+
+                contract = getattr(_ctx, "_verification_contract", {}) or {}
+                if isinstance(contract, dict) and contract.get("status") == "approved":
+                    from agents.verification import evaluate_verification
+
+                    clause_state = evaluate_verification(
+                        contract, list(getattr(_ctx, "_evidence_events", []) or [])
+                    )
+                    _ctx._clause_state = clause_state
+                    if clause_state.get("verdict") in {"passed", "failed"}:
+                        loop_break_reason = "EVALUATOR_TERMINAL: " + str(
+                            clause_state.get("verdict", "")
+                        )
+                        break
+
+            if name == "terminate_run":
+                loop_break_reason = f"TERMINATE_REQUEST: {args.get('reason', '') or ''}"
                 break
 
         # 写回 run 级守卫（跨 _run_agent 调用持久）
@@ -782,9 +676,7 @@ def _run_agent(
         return END if r == "tools" and s.get("_turn_count", 0) >= max_turns else r
 
     def _after_tools(s: _SubState) -> str:
-        # one_step（回放模式）：工具执行一次即返回主图，由 agent_node 逐步驱动，
-        # 不再回到 llm —— 避免多跑一轮 LLM 并触发 MAX_TURNS_EXHAUSTED 误 abort
-        if s.get("_loop_break_reason") or one_step:
+        if s.get("_loop_break_reason"):
             return END
         return "llm"
 
@@ -825,33 +717,50 @@ def _run_agent(
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
                 },
+                "",
             )
-        # report_done 结构化终止：提取状态而非当 ABORT 处理
-        if loop_break_reason.startswith("REPORT_DONE:"):
-            _summary = loop_break_reason[len("REPORT_DONE:") :].strip()
-            return (
-                f"DONE: {_summary}",
-                _tool_calls_log,
-                {
-                    "loop_detected": False,
-                    "loop_pattern": "",
-                    "loop_break_action": "report_done",
-                    "llm_call_count": llm_call_count,
-                    "tool_call_400_count": tool_call_400_count,
-                },
-            )
-        if loop_break_reason.startswith("REPORT_ABORT:"):
-            _summary = loop_break_reason[len("REPORT_ABORT:") :].strip()
+        if loop_break_reason.startswith("TERMINATE_REQUEST:"):
+            _summary = loop_break_reason[len("TERMINATE_REQUEST:") :].strip()
             return (
                 f"ABORT: {_summary}",
                 _tool_calls_log,
                 {
                     "loop_detected": False,
                     "loop_pattern": "",
-                    "loop_break_action": "report_abort",
+                    "loop_break_action": "terminate_run",
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
                 },
+                "",
+            )
+        # evaluator 提前达到 terminal verdict 时：通过走 DONE，失败才走 ABORT，
+        # 避免前端把「EVALUATOR_TERMINAL: passed」当成失败展示。
+        if loop_break_reason.startswith("EVALUATOR_TERMINAL:"):
+            _verdict = loop_break_reason[len("EVALUATOR_TERMINAL:") :].strip()
+            if _verdict == "passed":
+                return (
+                    f"DONE: {loop_break_reason}",
+                    _tool_calls_log,
+                    {
+                        "loop_detected": False,
+                        "loop_pattern": loop_break_reason,
+                        "loop_break_action": "evaluator_terminal",
+                        "llm_call_count": llm_call_count,
+                        "tool_call_400_count": tool_call_400_count,
+                    },
+                    "passed",
+                )
+            return (
+                f"ABORT: {loop_break_reason}",
+                _tool_calls_log,
+                {
+                    "loop_detected": False,
+                    "loop_pattern": loop_break_reason,
+                    "loop_break_action": "evaluator_terminal",
+                    "llm_call_count": llm_call_count,
+                    "tool_call_400_count": tool_call_400_count,
+                },
+                "failed",
             )
         return (
             f"ABORT: {loop_break_reason}",
@@ -863,6 +772,7 @@ def _run_agent(
                 "llm_call_count": llm_call_count,
                 "tool_call_400_count": tool_call_400_count,
             },
+            "failed",
         )
 
     # Phase 1.1: 静默截断检测 —— 当 turn 耗尽时注入明确标记
@@ -880,6 +790,7 @@ def _run_agent(
                         "llm_call_count": llm_call_count,
                         "tool_call_400_count": tool_call_400_count,
                     },
+                    "",
                 )
         return (
             "ABORT: MAX_TURNS_EXHAUSTED — 达到最大工具调用次数",
@@ -891,13 +802,16 @@ def _run_agent(
                 "llm_call_count": llm_call_count,
                 "tool_call_400_count": tool_call_400_count,
             },
+            "",
         )
 
     for m in reversed(result["messages"]):
         c = getattr(m, "content", None)
         if c:
+            clause_state = getattr(_ctx, "_clause_state", None) or {}
+            conclusion = _normalize_agent_conclusion(str(c), clause_state)
             return (
-                str(c),
+                conclusion,
                 _tool_calls_log,
                 {
                     "loop_detected": False,
@@ -906,6 +820,7 @@ def _run_agent(
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
                 },
+                _terminal_verdict_from_conclusion(conclusion),
             )
     return (
         "ABORT: No agent response",
@@ -917,7 +832,49 @@ def _run_agent(
             "llm_call_count": llm_call_count,
             "tool_call_400_count": tool_call_400_count,
         },
+        "failed",
     )
+
+
+def _normalize_agent_conclusion(conclusion: str, clause_state: dict | None) -> str:
+    """为自然结束的 Agent 结论补齐 DONE/ABORT 前缀，避免 reporter 误判为 error。
+
+    若结论已含 DONE/ABORT 则原样返回；否则优先按 evaluator 的 verdict 兜底，
+    无 verdict 时默认视为完成。
+    """
+    done, abort = _detect_termination(conclusion)
+    if done or abort:
+        return conclusion
+    verdict = (clause_state or {}).get("verdict")
+    if verdict == "passed":
+        return f"DONE: EVALUATOR_TERMINAL: passed\n\n{conclusion}"
+    if verdict == "failed":
+        return f"ABORT: EVALUATOR_TERMINAL: failed\n\n{conclusion}"
+    return f"DONE: {conclusion}"
+
+
+def _terminal_verdict_from_conclusion(conclusion: str) -> str:
+    """从规范化的结论文本推断最终 verdict，供 reporter 优先使用。
+
+    返回 "passed" / "failed" / ""。空字符串表示该结论不是明确的测试 verdict
+    （如用户停止、资源耗尽、终止请求），需要 reporter fallback 到文本解析。
+    """
+    if conclusion.startswith("DONE:"):
+        return "passed"
+    if conclusion.startswith("ABORT:"):
+        # 用户停止 / 终止请求 / 资源耗尽不属于测试 verdict
+        if any(
+            conclusion.startswith(p)
+            for p in (
+                "ABORT: USER_STOPPED",
+                "ABORT: MAX_TURNS",
+                "ABORT: MAX_TOOL_CALLS",
+            )
+        ):
+            return ""
+        return "failed"
+    # 未规范化（理论上不应发生），保守视为失败
+    return "failed"
 
 
 def _ensure_device_alive(max_retries: int = 2, wait_sec: float = 5.0) -> bool:

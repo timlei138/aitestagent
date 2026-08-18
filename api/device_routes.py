@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/device", tags=["device"])
@@ -35,6 +36,7 @@ def _get_device():
     """安全获取设备实例，未连接时返回 None。"""
     try:
         from tools import get_tool_context
+
         ctx = get_tool_context()
         return getattr(ctx, "device", None)
     except Exception:
@@ -45,6 +47,7 @@ def _get_perceiver():
     """安全获取感知器实例。"""
     try:
         from tools import get_tool_context
+
         ctx = get_tool_context()
         return getattr(ctx, "perceiver", None)
     except Exception:
@@ -55,10 +58,14 @@ def _device_required(dev):
     """设备未连接时抛出统一错误。"""
     if dev is None:
         from fastapi import HTTPException
-        raise HTTPException(status_code=503, detail="Android 设备未连接，请检查 USB/ADB")
+
+        raise HTTPException(
+            status_code=503, detail="Android 设备未连接，请检查 USB/ADB"
+        )
 
 
 # ── 设备状态 ──
+
 
 @router.get("/status")
 async def device_status():
@@ -106,15 +113,23 @@ async def device_info():
 async def device_reconnect():
     """重连 Android 设备。"""
     from api.server import reconnect_device
+
     return reconnect_device()
 
 
 # ── 快照 ──
 
+
 @router.get("/snapshot")
 async def snapshot(include_vision: bool = False):
     dev = _get_device()
     _device_required(dev)
+
+    if not hasattr(dev, "snapshot"):
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "detail": "设备快照能力不可用"},
+        )
 
     from device.perceiver import PerceptionMode
 
@@ -124,7 +139,9 @@ async def snapshot(include_vision: bool = False):
     if perceiver:
         previous_mode = getattr(perceiver, "mode", PerceptionMode.UI_TREE)
         try:
-            perceiver.switch_mode(PerceptionMode.HYBRID if include_vision else PerceptionMode.UI_TREE)
+            perceiver.switch_mode(
+                PerceptionMode.HYBRID if include_vision else PerceptionMode.UI_TREE
+            )
             understanding = perceiver.perceive()
         finally:
             perceiver.switch_mode(previous_mode)
@@ -150,6 +167,7 @@ async def snapshot(include_vision: bool = False):
 
 # ── 当前应用 ──
 
+
 @router.get("/current")
 async def current():
     dev = _get_device()
@@ -158,6 +176,7 @@ async def current():
 
 
 # ── 点击 ──
+
 
 @router.post("/click")
 async def click(request: ClickRequest):
@@ -175,6 +194,7 @@ async def click(request: ClickRequest):
 
 # ── 输入 ──
 
+
 @router.post("/input")
 async def input_text(request: InputRequest):
     dev = _get_device()
@@ -184,6 +204,7 @@ async def input_text(request: InputRequest):
 
 
 # ── 按键 ──
+
 
 @router.post("/key")
 async def key(request: KeyRequest):

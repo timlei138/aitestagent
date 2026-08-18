@@ -25,12 +25,6 @@ from api.apps_routes import router as apps_router
 from api.apps_routes import resolve_app as _resolve_app_from_yaml
 from api.knowledge_routes import router as knowledge_router
 from api.config_routes import router as config_router
-from api.test_cases_routes import router as test_cases_router
-from api.test_cases_routes import (
-    set_backends as _set_tc_backends,
-    _resolve_run_entry,
-    resolve_report_rerun_entry,
-)
 from api.knowledge_routes import set_knowledge_base as _set_kb_for_routes
 from api.websocket_manager import WebSocketManager
 from config import TestConfig, resolve_perception_mode, resolve_vision_credentials
@@ -282,13 +276,6 @@ def _get_relational_db():
 def _rebuild_tool_context() -> None:
     """重新构建 ToolContext 并更新全局引用。"""
     global _ctx
-    # 经验推断挂载：惰性引用 _kb / _device，避免构造顺序耦合；
-    # perceive 运行时二者均已就绪。无设备/知识库时自动不生效。
-    if _perceiver is not None:
-        _perceiver.attach_knowledge(
-            lambda: _kb,
-            lambda: _device.current_app().get("package", "") if _device else "",
-        )
     _ctx = ToolContext(
         device=_device,
         perceiver=_perceiver,
@@ -349,7 +336,6 @@ set_device_runner(orchestrator)
 # ── 关系型数据库 ──
 _db = create_relational_db(config)
 set_relational_db(_db)
-_set_tc_backends(orchestrator, _db)
 
 # ── 事件广播 ──
 orchestrator.set_event_callback(
@@ -476,7 +462,6 @@ app.include_router(device_router)
 app.include_router(apps_router)
 app.include_router(knowledge_router)
 app.include_router(config_router)
-app.include_router(test_cases_router)
 _set_kb_for_routes(_kb)
 
 
@@ -498,6 +483,21 @@ class IdentityConfirmRequest(BaseModel):
     identities: list[dict]  # [{target, resource_id, class_name, role, ...}]
 
 
+class DirectApprovalRequest(BaseModel):
+    approved: bool
+
+
+@app.post("/api/execution_plans/{plan_id}/direct-approval")
+async def set_execution_plan_direct_approval(
+    plan_id: str, request: DirectApprovalRequest
+):
+    """Apply a human approval decision for deterministic direct execution."""
+    db = _get_relational_db()
+    if db is None or not db.set_direct_approval(plan_id, request.approved):
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+    return {"status": "success", "plan_id": plan_id, "approved": request.approved}
+
+
 @app.post("/api/run")
 async def run_test(request: RunRequest):
     """一步式执行（自动解析意图 + 执行）。"""
@@ -506,10 +506,11 @@ async def run_test(request: RunRequest):
     )
     # 设备连接前置检查
     if _device is None:
-        return {
+        offline = {
             "status": "device_offline",
             "message": "Android 设备未连接，请检查 USB/ADB 连接后重试",
         }
+        return {"status": "device_offline", "data": offline}
     ws_manager.bind_loop(asyncio.get_running_loop())
     logging.getLogger(__name__).info(
         "[stop-debug] HTTP /api/run bind_loop done, -> orchestrator.start"
@@ -589,9 +590,9 @@ async def stop_run(request: StopRunRequest):
     }
 
 
-@app.post("/api/element_identities/confirm")
-async def confirm_element_identities(request: IdentityConfirmRequest):
-    """确认 Level2 元素身份映射，写入 SQLite。"""
+@app.post("/api/locator_knowledge/confirm")
+async def confirm_locator_knowledge(request: IdentityConfirmRequest):
+    """Confirm locator facts for the current page."""
     from data import create_relational_db
     from agents.graph import set_relational_db, _relational_db
 
@@ -603,14 +604,20 @@ async def confirm_element_identities(request: IdentityConfirmRequest):
     count = 0
     for ident in request.identities:
         try:
-            db.save_element_identity(
+            db.save_locator_knowledge(
                 app_package=ident.get("app_package", ""),
                 page_signature=ident.get("page_signature", ""),
                 alias=ident.get("target", ""),
-                resource_id=ident.get("resource_id", ""),
-                class_name=ident.get("class_name", ""),
-                role=ident.get("role", ""),
-                candidates_count=ident.get("candidates_count", 2),
+                locator={
+                    "rid": ident.get("resource_id", ""),
+                    "class_name": ident.get("class_name", ""),
+                    "role": ident.get("role", ""),
+                },
+                identity={
+                    "resource_id": ident.get("resource_id", ""),
+                    "class_name": ident.get("class_name", ""),
+                    "role": ident.get("role", ""),
+                },
             )
             count += 1
         except Exception:
@@ -737,84 +744,6 @@ async def websocket_chat(websocket: WebSocket):
                 except RuntimeError:
                     pass
 
-            # ── v3: 复跑 / 用例运行 ──
-            elif msg_type == "rerun":
-                run_id = data.get("run_id", "")
-                run = _db.get_test_run(run_id) if _db and run_id else None
-                if not run:
-                    await ws_manager.send(
-                        websocket, {"type": "error", "content": f"报告不存在: {run_id}"}
-                    )
-                    continue
-                try:
-                    entry = resolve_report_rerun_entry(run)
-                except ValueError as exc:
-                    await ws_manager.send(
-                        websocket,
-                        {"type": "error", "content": f"报告计划数据损坏: {exc}"},
-                    )
-                    continue
-                result = await asyncio.to_thread(
-                    orchestrator.start,
-                    user_request=run.get("user_request", ""),
-                    app_package=run.get("app_package", ""),
-                    app_name=run.get("app_name", ""),
-                    goal_description=entry["goal"],
-                    reuse_plan=True,
-                    run_type="rerun",
-                    source_run_id=entry["source_run_id"],
-                    source_case_id=None,
-                    execution_plan_revision=entry["execution_plan_revision"],
-                )
-                try:
-                    await ws_manager.send(
-                        websocket, {"type": "result", "content": result}
-                    )
-                except RuntimeError:
-                    pass
-
-            elif msg_type == "run_case":
-                case_id = data.get("case_id", "")
-                case = _db.get_test_case(case_id) if _db and case_id else None
-                if not case:
-                    await ws_manager.send(
-                        websocket,
-                        {"type": "error", "content": f"用例不存在: {case_id}"},
-                    )
-                    continue
-                try:
-                    entry = _resolve_run_entry(case)
-                except ValueError as exc:
-                    await ws_manager.send(
-                        websocket,
-                        {"type": "error", "content": f"用例计划数据损坏: {exc}"},
-                    )
-                    continue
-                result = await asyncio.to_thread(
-                    orchestrator.start,
-                    user_request=case.get("user_request", ""),
-                    app_package=case.get("app_package", ""),
-                    app_name=case.get("app_name", ""),
-                    goal_description=entry["goal"],
-                    reuse_plan=True,
-                    run_type="rerun",
-                    source_run_id=entry["source_run_id"],
-                    source_case_id=entry["source_case_id"],
-                    execution_plan_revision=entry["execution_plan_revision"],
-                )
-                if result.get("status") != "busy":
-                    st = result.get("execution_status", "error")
-                    vd = result.get("test_verdict", "inconclusive")
-                    _db.record_case_run(
-                        case_id, f"{st}/{vd}", datetime.now().isoformat()
-                    )
-                try:
-                    await ws_manager.send(
-                        websocket, {"type": "result", "content": result}
-                    )
-                except RuntimeError:
-                    pass
-
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
 
@@ -827,7 +756,7 @@ async def list_reports(limit: int = 30):
     db = _get_relational_db()
     if db:
         try:
-            items = db.list_test_runs(limit)
+            items = db.list_execution_runs(limit)
             return {"status": "success", "items": items}
         except Exception:
             logging.getLogger(__name__).exception("Failed to list test reports")
@@ -839,7 +768,7 @@ async def get_report(run_id: str):
     db = _get_relational_db()
     if db:
         try:
-            report = db.get_test_run(run_id)
+            report = db.get_execution_run(run_id)
             if report:
                 return {"status": "success", "report": report}
         except Exception:
@@ -864,7 +793,7 @@ async def delete_report(run_id: str):
         return {"status": "error", "message": "数据库未初始化"}
 
     try:
-        report = db.get_test_run(run_id)
+        report = db.get_execution_run(run_id)
     except Exception:
         report = None
     if not report:
@@ -872,18 +801,6 @@ async def delete_report(run_id: str):
 
     deleted_images = 0
     deleted_logs = 0
-
-    image_paths: set[Path] = set()
-    for step in report.get("steps", []) or []:
-        p = str(step.get("screenshot_path", "") or "").strip()
-        if p:
-            _pp = Path(p.replace("/", "\\"))
-            image_paths.add(_pp if _pp.is_absolute() else PROJECT_ROOT / _pp)
-    for item in report.get("verification_results", []) or []:
-        p = str(item.get("screenshot", "") or "").strip()
-        if p:
-            _pp = Path(p.replace("/", "\\"))
-            image_paths.add(_pp if _pp.is_absolute() else PROJECT_ROOT / _pp)
 
     run_shot_dir = app_paths.SCREENSHOT_DIR / run_id
     if run_shot_dir.exists() and run_shot_dir.is_dir():
@@ -895,19 +812,6 @@ async def delete_report(run_id: str):
         except Exception:
             pass
 
-    for p in image_paths:
-        try:
-            resolved = p.resolve()
-            if (
-                PROJECT_ROOT not in resolved.parents
-                and app_paths.DATA_DIR not in resolved.parents
-            ):
-                continue
-        except Exception:
-            continue
-        if _safe_unlink(p):
-            deleted_images += 1
-
     logs_dir = app_paths.LOG_RUN_DIR
     if logs_dir.exists() and logs_dir.is_dir():
         for lf in logs_dir.glob(f"*{run_id}*langchain.log"):
@@ -916,7 +820,7 @@ async def delete_report(run_id: str):
 
     deleted_db = False
     try:
-        deleted_db = db.delete_test_run(run_id)
+        deleted_db = db.delete_execution_run(run_id)
     except Exception as exc:
         return {"status": "error", "message": f"删除数据库记录失败: {exc}"}
     if not deleted_db:

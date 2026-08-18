@@ -1,13 +1,12 @@
 <template>
   <div v-if="report" class="report-detail">
-    <!-- 顶部：大号通过/失败横幅 -->
-    <div class="rd-banner" :class="'rd-' + (report.test_verdict || 'inconclusive')">
+    <div class="rd-banner" :class="'rd-' + (report.verdict || 'inconclusive')">
       <div class="rd-banner-icon">{{ bannerIcon }}</div>
       <div class="rd-banner-body">
         <div class="rd-banner-title">{{ bannerTitle }}</div>
         <div class="rd-banner-meta">
-          <span>执行: {{ execStatusLabel(report.execution_status) }}</span>
-          <span>耗时: {{ report.duration_seconds || 0 }}s</span>
+          <span>模式: {{ report.execution_mode || 'explore' }}</span>
+          <span>阶段: {{ report.lifecycle_state || 'Terminal' }}</span>
           <span>{{ (report.created_at || '').replace('T', ' ').substring(0, 19) }}</span>
         </div>
       </div>
@@ -15,169 +14,151 @@
 
     <div class="rd-metrics">
       <div class="rd-metric-item">
-        <span class="rd-metric-label">LLM调用</span>
-        <b class="rd-metric-value">{{ Number(report.llm_call_count || 0) }}</b>
+        <span class="rd-metric-label">行动事件</span>
+        <b class="rd-metric-value">{{ actions.length }}</b>
       </div>
       <div class="rd-metric-item">
-        <span class="rd-metric-label">点击 (精确/模糊/歧义)</span>
-        <b class="rd-metric-value">{{ Number(report.click_count || 0) }} / {{ Number(report.fuzzy_click_count || 0) }} / {{ Number(report.ambiguous_count || 0) }}</b>
+        <span class="rd-metric-label">证据事件</span>
+        <b class="rd-metric-value">{{ evidence.length }}</b>
       </div>
       <div class="rd-metric-item">
-        <span class="rd-metric-label">精确点击率</span>
-        <b class="rd-metric-value">{{ fmtRate(report.exact_click_rate) }}</b>
+        <span class="rd-metric-label">LLM 调用</span>
+        <b class="rd-metric-value">{{ report.llm_call_count || 0 }}</b>
       </div>
       <div class="rd-metric-item">
-        <span class="rd-metric-label">模糊点击率</span>
-        <b class="rd-metric-value">{{ fmtRate(report.fuzzy_click_rate) }}</b>
+        <span class="rd-metric-label">总体耗时</span>
+        <b class="rd-metric-value">{{ formatDuration(report.duration_seconds) }}</b>
       </div>
-      <div class="rd-metric-item">
-        <span class="rd-metric-label">RAG查询</span>
-        <b class="rd-metric-value">{{ Number(report.rag_query_count || 0) }}</b>
-      </div>
-      <div class="rd-metric-item">
-        <span class="rd-metric-label">RAG同App率</span>
-        <b class="rd-metric-value">{{ fmtRate(report.rag_same_app_ratio) }}</b>
-      </div>
-      <div class="rd-metric-item">
-        <span class="rd-metric-label">RAG跨App</span>
-        <b class="rd-metric-value">{{ Number(report.rag_cross_app_used_count || 0) }}</b>
-      </div>
-      <div class="rd-metric-item">
-        <span class="rd-metric-label">Token 消耗 (入/出/总)</span>
-        <b class="rd-metric-value">{{ fmtTokens(report.input_tokens) }} / {{ fmtTokens(report.output_tokens) }} / {{ fmtTokens(report.total_tokens) }}</b>
-      </div>
-      <div class="rd-metric-item">
-        <span class="rd-metric-label">Token 缓存命中</span>
-        <b class="rd-metric-value">{{ fmtTokens(report.cached_input_tokens) }}</b>
+      <div class="rd-metric-item" v-if="tokenTotal">
+        <span class="rd-metric-label">Token 消耗</span>
+        <b class="rd-metric-value" :title="tokenTooltip">{{ tokenTotal }}</b>
       </div>
     </div>
 
     <!-- 请求文本 -->
     <div class="rd-request" v-if="report.user_request">{{ report.user_request }}</div>
 
-    <!-- 验证清单 -->
-    <div v-if="report.verification_results && report.verification_results.length" class="rd-verification">
-      <div class="rd-section-title">验证清单</div>
-      <div v-for="(v, i) in report.verification_results" :key="v.screenshot || i" class="rd-verify-item">
-        <span class="rd-verify-icon" :class="v.result">{{ v.result === 'passed' ? '✓' : v.result === 'failed' ? '✗' : '?' }}</span>
+    <div v-if="evidence.length" class="rd-verification">
+      <div class="rd-section-title">验证证据</div>
+      <div v-for="(v, i) in evidence" :key="v.evidence_id || i" class="rd-verify-item">
+        <span class="rd-verify-icon" :class="evidenceClass(v.status)">{{ evidenceIcon(v.status) }}</span>
         <div class="rd-verify-main">
-          <span class="rd-verify-text">{{ v.item }}</span>
-          <span v-if="v.review_required || v.result === 'unknown'" class="rd-review-badge">需人工复核</span>
-          <div v-if="v.detail" class="rd-verify-reason">理由：{{ v.detail }}</div>
+          <span class="rd-verify-text">{{ clauseText(v) }} · {{ channelLabel(v.channel) }}</span>
+          <div v-if="v.fact && Object.keys(v.fact).length" class="rd-verify-reason">{{ JSON.stringify(v.fact) }}</div>
         </div>
-        <el-image v-if="v.screenshot" :src="shotUrl(v.screenshot, i)" :preview-src-list="[shotUrl(v.screenshot, i)]"
-                  fit="cover" class="verify-shot" title="点击查看大图" />
       </div>
     </div>
 
-    <!-- 执行结论（验证清单下方，剥离 DONE/ABORT 前缀） -->
-    <div v-if="cleanConclusion" class="rd-conclusion">
-      <div class="rd-section-title">执行结论</div>
-      <pre>{{ cleanConclusion }}</pre>
+    <div v-if="report.terminal_reason" class="rd-conclusion">
+      <div class="rd-section-title">终止理由</div>
+      <pre>{{ report.terminal_reason }}</pre>
     </div>
 
-    <!-- 步骤统计 + 折叠步骤 -->
+    <div v-if="modeTransitions.length" class="rd-conclusion">
+      <div class="rd-section-title">模式降级</div>
+      <pre v-for="transition in modeTransitions" :key="transition.created_at">{{ transition.from_mode }} -> {{ transition.to_mode }}: {{ transition.reason }}</pre>
+    </div>
+
     <details class="rd-steps-details">
-      <summary class="rd-section-title">执行详情 · {{ report.total_steps || 0 }} 步 ·
-        <span class="rd-stat pass">✓ {{ report.pass_count || 0 }}</span>
-        <span class="rd-stat fail">✗ {{ report.fail_count || 0 }}</span>
-      </summary>
+      <summary class="rd-section-title">行动详情 · {{ actions.length }} 项</summary>
       <div class="rd-steps">
-        <div class="rd-step" v-for="s in (report.steps || [])" :key="s.index"
-             :class="{ 'rd-step-fail': s.status === 'fail', 'rd-step-done': s.status === 'success' }">
+        <div class="rd-step" v-for="s in actions" :key="`${s.action_index}-${s.created_at}`"
+             :class="{ 'rd-step-fail': s.status === 'ERROR', 'rd-step-done': s.status === 'OK' }">
           <div class="rd-step-head">
-            <span class="rd-step-idx">{{ s.index }}</span>
-            <code class="rd-step-action">{{ s.action_type }}</code>
-            <span v-if="s.target" class="rd-step-target">→ {{ s.target }}</span>
-            <el-image v-if="s.screenshot_path"
-                      :src="shotUrl(s.screenshot_path, s.index)"
-                      :preview-src-list="[shotUrl(s.screenshot_path, s.index)]"
-                      fit="cover" class="step-shot" title="点击查看大图" />
-            <span v-if="s.duration_ms" class="rd-step-time">{{ fmtDuration(s.duration_ms) }}</span>
-            <span v-if="s.status === 'fail'" class="rd-step-badge fail">失败</span>
-            <span v-if="s.status === 'success'" class="rd-step-badge done">完成</span>
+            <span class="rd-step-idx">{{ s.action_index }}</span>
+            <code class="rd-step-action">{{ s.tool_name }}</code>
+            <span class="rd-step-target">{{ s.execution_mode }}</span>
+            <span class="rd-step-badge" :class="s.status === 'OK' ? 'done' : 'fail'">{{ s.status }}</span>
+            <img v-if="s.screenshot" class="step-shot" :src="screenshotUrl(s.screenshot)" @click="openLightbox(s.screenshot)" />
           </div>
-          <div v-if="s.page_from || s.page_to" class="rd-step-pages">{{ s.page_from || '?' }} → {{ s.page_to || '?' }}</div>
-          <div v-if="stepIntent(s)" class="rd-step-intent">AI意图：{{ stepIntent(s) }}</div>
-          <div v-if="s.observation" class="rd-step-obs">{{ stripDONE(s.observation) }}</div>
+          <div v-if="s.intent" class="rd-step-intent">{{ s.intent }}</div>
+          <div v-if="s.resolved_locator && Object.keys(s.resolved_locator).length" class="rd-step-pages">定位：{{ JSON.stringify(s.resolved_locator) }}</div>
+          <div v-if="s.tool_input && Object.keys(s.tool_input).length" class="rd-step-obs">输入：{{ JSON.stringify(s.tool_input) }}</div>
         </div>
       </div>
     </details>
+  </div>
+
+  <!-- 截图放大 lightbox -->
+  <div v-if="lightboxUrl" class="rd-lightbox" @click.self="lightboxUrl = ''">
+    <img :src="lightboxUrl" />
   </div>
 
   <div v-else class="rd-empty">加载中...</div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 
 const props = defineProps({ report: { type: Object, default: null } })
+const actions = computed(() => props.report?.actions || [])
+const evidence = computed(() => props.report?.evidence || [])
+const modeTransitions = computed(() => props.report?.mode_transitions || [])
+
+const tokenUsage = computed(() => props.report?.token_usage || {})
+const tokenTotal = computed(() => {
+  const t = tokenUsage.value?.total_tokens || 0
+  return t ? t.toLocaleString() : ''
+})
+const tokenTooltip = computed(() => {
+  const t = tokenUsage.value
+  if (!t) return ''
+  return `输入: ${t.input_tokens || 0}\n输出: ${t.output_tokens || 0}\n缓存输入: ${t.cached_input_tokens || 0}`
+})
+function formatDuration(sec) {
+  const s = Number(sec || 0)
+  if (s < 60) return `${s.toFixed(1)}s`
+  const m = Math.floor(s / 60)
+  const r = (s % 60).toFixed(0)
+  return `${m}m ${r.padStart(2, '0')}s`
+}
+const lightboxUrl = ref('')
+function openLightbox(path) {
+  if (!path) return
+  lightboxUrl.value = screenshotUrl(path)
+}
 
 const bannerIcon = computed(() => {
   if (!props.report) return '⏳'
-  if (props.report.test_verdict === 'passed') return '✅'
-  if (props.report.test_verdict === 'failed') return '❌'
+  if (props.report.verdict === 'passed') return '✅'
+  if (props.report.verdict === 'failed') return '❌'
   return '⚠️'
 })
 const bannerTitle = computed(() => {
   if (!props.report) return ''
-  const v = props.report.test_verdict || 'inconclusive'
+  const v = props.report.verdict || 'inconclusive'
   const m = { passed: '测试通过', failed: '测试未通过', inconclusive: '待人工复核' }
   return m[v] || v
 })
 
-// 剥离 DONE:/ABORT: 前缀的结论文本
-const cleanConclusion = computed(() => {
-  const c = (props.report?.conclusion || '').trim()
-  if (!c) return ''
-  // 去掉 DONE: / ABORT: 前缀（含 ## 变体）
-  return c.replace(/^(?:#{1,3}\s*)?(?:DONE|ABORT)\s*[:：]\s*/im, '').trim()
-})
+function evidenceIcon(status) { return status === 'PASS' ? '✓' : status === 'FAIL' ? '✗' : '?' }
+function evidenceClass(status) { return status === 'PASS' ? 'passed' : status === 'FAIL' ? 'failed' : 'unknown' }
 
-function stripDONE(s) {
-  return (s || '').replace(/^(?:#{1,3}\s*)?(?:DONE|ABORT)\s*[:：]\s*/im, '').trim()
+const channelLabels = {
+  ui_text: '页面文本',
+  element_state: '元素状态',
+  vision_verify: '视觉确认',
+  click_and_check: '点击验证',
+  page_state: '页面状态',
+  behavior_effect: '行为效果',
+}
+function channelLabel(channel) { return channelLabels[channel] || channel || '未知通道' }
+
+// 用 verification_key + clause_id 反查 contract，显示可读的 statement/claim，而非内部 key。
+function clauseText(v) {
+  const verifications = props.report?.verification_contract?.verifications || []
+  const ver = verifications.find(x => x.key === v.verification_key)
+  if (!ver) return v.verification_key
+  const clause = (ver.clauses || []).find(c => c.id === v.clause_id)
+  if (clause && clause.claim) return clause.claim
+  return ver.statement || v.verification_key
 }
 
-function stepIntent(step) {
-  const t = String(step?.intent_text || step?.intent || '').trim()
-  return t ? stripDONE(t) : ''
-}
-
-const execStatusMap = {
-  completed: { label: '已完成' }, exhausted: { label: '步骤耗尽' },
-  error: { label: '异常中断' }, cancelled: { label: '已取消' },
-  device_offline: { label: '设备离线' },
-}
-function execStatusLabel(s) { return (execStatusMap[s] || execStatusMap.error).label }
-
-function fmtRate(v) {
-  const n = Number(v || 0)
-  return (n * 100).toFixed(2) + '%'
-}
-
-function fmtTokens(v) {
-  const n = Number(v || 0)
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return String(n)
-}
-
-function fmtDuration(ms) {
-  if (!ms || ms <= 0) return ''
-  if (ms < 1000) return ms + 'ms'
-  if (ms < 60000) return (ms / 1000).toFixed(1) + 's'
-  const m = Math.floor(ms / 60000)
-  const s = Math.round((ms % 60000) / 1000)
-  return s > 0 ? `${m}m${s}s` : `${m}m`
-}
-
-function shotUrl(path, index) {
-  let normalized = String(path || '').replace(/\\/g, '/').replace(/^\/+/, '')
-  // 确保路径以 storage/ 开头以匹配服务器的 /storage 挂载点
-  if (!normalized.startsWith('storage/')) {
-    normalized = 'storage/' + normalized
-  }
-  return `/${normalized}?v=${props.report?.id || 'report'}_${index}`
+// 截图相对路径拼成 /storage/ 静态资源 URL。
+function screenshotUrl(path) {
+  if (!path) return ''
+  const p = String(path).replace(/\\/g, '/').replace(/^\/+/, '')
+  return `/storage/${p}`
 }
 </script>
 
@@ -238,4 +219,8 @@ function shotUrl(path, index) {
 
 /* ── 步骤截图 ── */
 .step-shot { width: 40px; height: 30px; border-radius: 4px; cursor: pointer; object-fit: cover; border: 1px solid var(--line); margin-left: 8px; }
+
+/* ── 截图 lightbox ── */
+.rd-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 24px; }
+.rd-lightbox img { max-width: 90vw; max-height: 90vh; border-radius: var(--radius-sm); box-shadow: 0 20px 60px rgba(0,0,0,0.4); }
 </style>

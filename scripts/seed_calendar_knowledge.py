@@ -20,10 +20,29 @@ if _PROJ_ROOT not in sys.path:
 
 from config import TestConfig
 from data import create_vector_store
-from data.knowledge import KnowledgeBase
+from data.knowledge import KnowledgeBase, UIKnowledge
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
+
+
+def _save(kb: KnowledgeBase, app_package: str, knowledge_type: str, content: str,
+          scope: str, reviewed_by: str, domain: str, scenario: str) -> None:
+    kb.save_knowledge(
+        UIKnowledge(
+            app_package=app_package,
+            knowledge_type=knowledge_type,
+            content=content,
+            metadata={
+                "scope": scope,
+                "domain": domain,
+                "scenario": scenario,
+                "reviewed_by": reviewed_by,
+            },
+        )
+    )
 
 
 def main() -> None:
@@ -32,8 +51,10 @@ def main() -> None:
     kb = KnowledgeBase(vs)
 
     # ── 条目一：通用自绘控件规则（scope=universal，对所有 App 生效）──
-    kb.save_curated_rule(
+    _save(
+        kb,
         app_package="",
+        knowledge_type="constraint",
         content=(
             "Canvas、SurfaceView、TextureView、WebView 内嵌内容、OpenGL 绘制区域等自绘/原生渲染控件，"
             "view tree 中无可用文本节点和 resource-id，click(label) 会返回 NOT_FOUND。"
@@ -48,8 +69,10 @@ def main() -> None:
     logger.info("已写入通用 Canvas 规则 (scope=universal)")
 
     # ── 条目二：联想日历专属规则（scope=app）──
-    kb.save_curated_rule(
+    _save(
+        kb,
         app_package="com.zui.calendar",
+        knowledge_type="semantic_hint",
         content=(
             "TimeSlotSettingsActivity（课程时间设置）页面包含「上课时长」和「课间休息」两个滚轮选择器，"
             "均为 Canvas 绘制，view tree 无文本节点。"
@@ -58,15 +81,17 @@ def main() -> None:
             "操作示例：vision_tap('上课时长滚轮中值为50的那一行')"
         ),
         scope="app",
+        reviewed_by="dev",
         domain="ui_interaction",
         scenario="canvas_widget",
-        reviewed_by="dev",
     )
     logger.info("已写入联想日历专属规则 (scope=app) #2: 单滚轮选择器")
 
     # ── 条目三：课程时间设置弹窗（双时间轴拾取器）──
-    kb.save_curated_rule(
+    _save(
+        kb,
         app_package="com.zui.calendar",
+        knowledge_type="semantic_hint",
         content=(
             "课程时间设置弹窗（编辑小节时间）包含双时间轴拾取器，均为 Canvas 自绘，view tree 无节点。\n"
             "结构：左侧 = 开始时间（小时列 + 分钟列），右侧 = 结束时间（小时列 + 分钟列）。\n"
@@ -84,15 +109,17 @@ def main() -> None:
             "3) 如需减少分钟值，定位到分钟列「上方值」的位置，同样用 repeat=N 批量连点"
         ),
         scope="app",
+        reviewed_by="dev",
         domain="ui_interaction",
         scenario="time_picker",
-        reviewed_by="dev",
     )
     logger.info("已写入联想日历专属规则 (scope=app) #3: 双时间轴拾取器")
 
     # ── 条目四：时间间隔计算规则 ──
-    kb.save_curated_rule(
+    _save(
+        kb,
         app_package="com.zui.calendar",
+        knowledge_type="semantic_hint",
         content=(
             "「修改时间间隔为 N 分钟」的正确操作方式：\n"
             "时间间隔 = 结束时间 - 开始时间。\n"
@@ -109,15 +136,17 @@ def main() -> None:
             "  同时修改开始和结束时间 → 间隔不变，白操作"
         ),
         scope="app",
+        reviewed_by="dev",
         domain="ui_interaction",
         scenario="time_picker",
-        reviewed_by="dev",
     )
     logger.info("已写入联想日历专属规则 (scope=app) #4: 时间间隔计算")
 
     # ── 条目五：时间冲突红色提示规则 ──
-    kb.save_curated_rule(
+    _save(
+        kb,
         app_package="com.zui.calendar",
+        knowledge_type="semantic_hint",
         content=(
             "课程时间设置中时间冲突的红色提示行为：\n"
             "当某小节的结束时间晚于下一小节的开始时间时，产生时间冲突。\n"
@@ -127,15 +156,17 @@ def main() -> None:
             "不要因为序号是黑色就认为验证失败。"
         ),
         scope="app",
+        reviewed_by="dev",
         domain="ui_interaction",
         scenario="visual_verification",
-        reviewed_by="dev",
     )
     logger.info("已写入联想日历专属规则 (scope=app) #5: 时间冲突红色提示")
 
     # ── 条目六：Toast 捕获策略 ──
-    kb.save_curated_rule(
+    _save(
+        kb,
         app_package="com.zui.calendar",
+        knowledge_type="semantic_hint",
         content=(
             "Toast 提示捕获策略：\n"
             "Toast 显示时间极短（约 2 秒），普通 visual_check 截图时 toast 已消失。\n"
@@ -143,18 +174,20 @@ def main() -> None:
             "示例：click_and_check('完成', '屏幕底部是否出现toast提示') \n"
             "如果没有 click_and_check 工具，可用 detect_overlay 或 get_screen_info 快速检测。\n"
             "如果多种方式都无法捕获 toast，但 visual_check 已确认时间显示为红色，\n"
-            "可认为冲突提示已生效（红色本身就是冲突的视觉提示），report_done 时注明 toast 未捕获。"
+            "可认为冲突提示已生效（红色本身就是冲突的视觉提示），由 evaluator 记录 toast 未捕获。"
         ),
         scope="app",
+        reviewed_by="dev",
         domain="ui_interaction",
         scenario="toast_capture",
-        reviewed_by="dev",
     )
     logger.info("已写入联想日历专属规则 (scope=app) #6: Toast 捕获策略")
 
     # ── 条目七：课程表导航路径（TimetableActivity → TimetableListActivity）──
-    kb.save_curated_rule(
+    _save(
+        kb,
         app_package="com.zui.calendar",
+        knowledge_type="semantic_hint",
         content=(
             "课程表创建/管理的导航路径：\n"
             "1) 从 AllInOneActivity（日历主页）进入课程表：\n"
@@ -172,13 +205,15 @@ def main() -> None:
             "   点击后弹出「拍照导入课程表 / 图库导入课程表」面板，不是新建入口"
         ),
         scope="app",
+        reviewed_by="dev",
         domain="ui_interaction",
         scenario="navigation",
-        reviewed_by="dev",
     )
     logger.info("已写入联想日历专属规则 (scope=app) #7: 课程表导航路径")
 
-    logger.info("RAG 知识写入完成。重启服务后规则将在首轮/App 切换时自动注入 agent prompt。")
+    logger.info(
+        "RAG 知识写入完成。重启服务后规则将在首轮/App 切换时自动注入 agent prompt。"
+    )
 
 
 if __name__ == "__main__":

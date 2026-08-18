@@ -16,20 +16,172 @@ logger = logging.getLogger(__name__)
 
 
 def _rag_ctx(kb, app_package: str, user_request: str = "") -> str:
-    """查询 RAG 获取上下文：人工知识 + 操作经验（2 sections）。"""
+    """Inject only reviewed v2 semantic knowledge; task plans live in the relational store."""
     if not kb:
         return ""
     parts = []
-    # 1. 人工知识（一次查询，Python 侧自动分组为全局知识 + App 操作前提）
-    rules = kb.query_curated_rules(app_package, top_k=20)
-    if rules:
-        parts.append("## 人工知识\n" + rules)
-    # 2. 操作经验
-    if user_request:
-        exp = kb.query_experience(app_package, user_request[:50], top_k=3)
-        if exp:
-            parts.append("## 操作经验\n" + "\n".join(f"- {e['content']}" for e in exp))
+    del user_request
+    headings = {
+        "constraint": "## 执行约束",
+        "negative_knowledge": "## 已知禁止/失败模式",
+        "semantic_hint": "## 语义提示（不得覆盖验收）",
+    }
+    for knowledge_type, entries in kb.query_semantic_knowledge(
+        app_package, top_k=20
+    ).items():
+        if entries:
+            parts.append(
+                headings[knowledge_type]
+                + "\n"
+                + "\n".join(f"- {entry}" for entry in entries)
+            )
     return "\n\n".join(parts)
+
+
+def retrieve_knowledge(
+    *,
+    app_package: str,
+    purpose: str,
+    query: str = "",
+    page_signature: str = "",
+    verification_fingerprint: str = "",
+    environment_key: str = "",
+    task_signature: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Single structured v2 knowledge entry (Plan 4.3 / 5.6).
+
+    Framework nodes and LLM-facing tools read each knowledge source through this one
+    boundary, so the retrieval purpose is explicit and every result carries its source.
+    """
+    if purpose == "task_plan":
+        from agents.graph import _relational_db
+        from tools import get_tool_context
+
+        db = _relational_db
+        kb = None
+        try:
+            from tools import get_tool_context
+
+            ctx = get_tool_context()
+            kb = getattr(ctx, "knowledge_base", None) if ctx else None
+        except RuntimeError:
+            kb = None
+
+        if not db:
+            return {"purpose": purpose, "source": "none", "items": []}
+
+        # Prefer vector semantic recall + relational filtering when possible.
+        if kb and task_signature:
+            candidates = kb.query_task_plan_summaries(
+                app_package=app_package,
+                query=query or task_signature.get("user_request_template", "") or "",
+                top_k=5,
+            )
+            compatible_items: list[dict[str, Any]] = []
+            from agents.plan_extractor import (
+                environment_compatibility_score,
+                task_signatures_compatible,
+            )
+
+            for candidate in candidates or []:
+                metadata = candidate.get("metadata", {}) or {}
+                plan_id = metadata.get("plan_id")
+                if not plan_id:
+                    continue
+                full_plan = db.get_full_execution_plan(str(plan_id))
+                if not full_plan:
+                    continue
+                cand_signature = full_plan.get("task_signature", {}) or {}
+                # Verification fingerprint safety gate.
+                cand_vf = cand_signature.get("verification_fingerprint", "")
+                if (
+                    verification_fingerprint
+                    and cand_vf
+                    and verification_fingerprint != cand_vf
+                ):
+                    continue
+                if not task_signatures_compatible(task_signature, cand_signature):
+                    continue
+                # Environment compatibility: scored instead of exact equality.
+                cand_env = full_plan.get("environment_key", "")
+                env_score = environment_compatibility_score(cand_env, environment_key)
+                if not env_score["compatible"]:
+                    continue
+                full_plan["environment_compatibility_score"] = env_score["score"]
+                full_plan["environment_compatibility_reasons"] = env_score["reasons"]
+                compatible_items.append(full_plan)
+            if compatible_items:
+                # Prefer highest environment compatibility, then quality.
+                compatible_items.sort(
+                    key=lambda p: (
+                        float(p.get("environment_compatibility_score", 0.0) or 0.0),
+                        float(p.get("quality_score", 0.0) or 0.0),
+                    ),
+                    reverse=True,
+                )
+                best = compatible_items[0]
+                return {
+                    "purpose": purpose,
+                    "source": "vector_then_relational",
+                    "items": [best],
+                    "candidates": len(candidates),
+                    "environment_compatibility_score": best.get(
+                        "environment_compatibility_score"
+                    ),
+                    "environment_compatibility_reasons": best.get(
+                        "environment_compatibility_reasons"
+                    ),
+                }
+
+        # Fallback to relational exact/semantic match.
+        plan = db.find_matching_execution_plan(
+            app_package,
+            query,
+            verification_fingerprint=verification_fingerprint,
+            environment_key=environment_key,
+            task_signature=task_signature,
+        )
+        return {
+            "purpose": purpose,
+            "source": "relational",
+            "items": [plan] if plan else [],
+            "environment_compatibility_score": plan.get(
+                "environment_compatibility_score"
+            )
+            if plan
+            else None,
+            "environment_compatibility_reasons": plan.get(
+                "environment_compatibility_reasons"
+            )
+            if plan
+            else None,
+        }
+    if purpose == "locator":
+        from agents.graph import _relational_db
+        from tools import get_tool_context
+
+        ctx = get_tool_context()
+        db = getattr(ctx, "relational_db", None) or _relational_db
+        if not db:
+            return {"purpose": purpose, "source": "none", "items": []}
+        rows = db.query_locator_knowledge(
+            app_package, alias=query, page_signature=page_signature
+        )
+        return {"purpose": purpose, "source": "relational", "items": rows}
+    if purpose == "semantic":
+        from tools import get_tool_context
+
+        ctx = get_tool_context()
+        kb = getattr(ctx, "knowledge_base", None)
+        if not kb:
+            return {"purpose": purpose, "source": "none", "items": []}
+        grouped = kb.query_semantic_knowledge(app_package, top_k=5)
+        return {"purpose": purpose, "source": "vector", "items": grouped}
+    if purpose == "action":
+        # Action knowledge is carried by the selected plan actions in state; there is
+        # no independent action-retrieval source yet.
+        return {"purpose": purpose, "source": "none", "items": []}
+    raise ValueError(f"unknown knowledge purpose: {purpose!r}")
 
 
 def _apply_click_preferences(
@@ -81,7 +233,7 @@ def _should_include_rag(state: TestState, effective_app_package: str) -> bool:
     return False
 
 
-def _should_force_query_app_knowledge(
+def _should_force_request_knowledge(
     state: TestState, include_rag: bool, rag_summary: str
 ) -> bool:
     """在高风险轮次给出明确知识查询指令（仅触发时）。"""

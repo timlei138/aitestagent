@@ -252,9 +252,7 @@ def open_app_permission_settings(package: str) -> str:
     return f"OK: 已打开应用权限设置 || package={package.strip()}; result={result}"
 
 
-def _settle_after_action(
-    ctx, max_wait_ms: int = 1500, poll_ms: int = 100
-) -> None:
+def _settle_after_action(ctx, max_wait_ms: int = 1500, poll_ms: int = 100) -> None:
     """Poll general foreground state until it remains stable after an action.
 
     This intentionally does not encode application-specific knowledge.  Perception is
@@ -300,8 +298,6 @@ def launch_app(
     force_fresh: 启动前先 force-stop 应用，确保从主 Activity 冷启动，
     而非把已有 task 带到前台。回放 entry 对齐时建议为 True。
     """
-    # 延迟 import 避免加载期循环依赖（click 相关 helper 仍在 tools/__init__.py）
-    from tools import _capture_page_id, _record_page_transition
     from tools.results import ERROR, OK, make_result
 
     requested_package = (package or "").strip()
@@ -317,12 +313,12 @@ def launch_app(
             },
         )
 
-    _pre_page = _capture_page_id(ctx)
     # force_fresh: 先强制停止应用，再启动，确保从主 Activity 冷启动
     if force_fresh:
         try:
             ctx.device.app_stop(requested_package)
             import time as _t
+
             _t.sleep(0.3)  # 等待进程完全退出
         except Exception:
             pass
@@ -370,8 +366,6 @@ def launch_app(
     # 不单独硬卡。activity 不匹配才判定未到达；package 字符串不等但 activity 对
     # 仍视为到达（避免把「打开了别的 Activity/包名别名」误判为失败）。
     arrival_confirmed = activity_matched if target_activity else package_matched
-    _record_page_transition(ctx, _pre_page, f"launch_app({requested_package})")
-
     evidence = {
         "requested_package": requested_package,
         "requested_activity": target_activity,

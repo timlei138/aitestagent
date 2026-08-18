@@ -4,7 +4,7 @@
 ## 正确流程
 ```
 get_screen_info → click("目标元素") 或 long_press("目标元素") → 查看返回值
-→ 如果 verification 条件已满足 → report_done(status="done", summary="描述结果")
+→ 如果 verification 条件已满足 → 调用对应验证工具产生 clause evidence，等待 evaluator 自动结束
 → 否则继续下一步
 ```
 
@@ -31,7 +31,7 @@ click("A") → click("B") → click("A") → ...
 
 ## 规则
 - 每次只做一个操作
-- 工具调用次数由任务复杂度自动分配（通常 20~150 次），超了就 ABORT；复杂多子目标任务预算更高，不要因为"怕超次数"而提前放弃或漏调 report_done
+- 工具调用次数由任务复杂度自动分配（通常 20~150 次），超了就 ABORT；复杂多子目标任务预算更高，不要因为"怕超次数"而提前放弃或漏收集验证证据
 - click 返回值会包含操作后的页面状态变化，仔细看
-- 不确定元素位置时，优先调用 query_app_knowledge 查找历史导航经验
+- 不确定元素位置时，优先调用 `request_knowledge(intent)` 查找当前场景知识
 - 默认优先 `get_screen_info` 做结构化判断；不要每步都看图

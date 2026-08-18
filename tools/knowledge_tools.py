@@ -22,14 +22,14 @@ except Exception:
 
 
 @tool
-def query_app_knowledge(query: str, app_package: str = "") -> str:
-    """Query operation experience and curated rules for the given app."""
+def request_knowledge(intent: str) -> str:
+    """Request reviewed semantic constraints, negative knowledge, and hints for the current app."""
     from tools import _capture_page_id  # 延迟 import 避免加载期循环依赖
 
     ctx = get_tool_context()
     if not ctx.knowledge_base:
         return "未启用知识库"
-    package = app_package or ctx.device.current_app().get("package", "")
+    package = ctx.device.current_app().get("package", "")
 
     # 埋点：统计 RAG 查询次数
     ctx._rag_query_count = int(getattr(ctx, "_rag_query_count", 0) or 0) + 1
@@ -43,56 +43,31 @@ def query_app_knowledge(query: str, app_package: str = "") -> str:
     if _cache is None:
         _cache = {}
         ctx._rag_query_cache = _cache
-    query_norm = (query or "").strip().lower()
+    query_norm = (intent or "").strip().lower()
     run_tag = getattr(ctx, "_run_tag", "") or ""
     cache_key = f"{run_tag}|{package}|{query_norm}|{page_sig}"
     if cache_key in _cache:
         return _cache[cache_key]
 
-    parts = []
-    # 并行召回：质量 + 语义双路，合并 rerank
-    strong = ctx.knowledge_base.query_experience(package, query, top_k=10) if package else []
-    semantic = ctx.knowledge_base.query(
-        query, app_package=package, knowledge_type="experience", top_k=5
+    grouped = ctx.knowledge_base.query_semantic_knowledge(package, top_k=5)
+    available = sum(len(items) for items in grouped.values())
+    ctx._rag_same_app_count = (
+        int(getattr(ctx, "_rag_same_app_count", 0) or 0) + available
     )
-
-    seen = set()
-    merged = []
-    for r in strong + semantic:
-        rid_val = str(r.get("id", "") or "")
-        if rid_val:
-            key = rid_val
-        else:
-            key = hashlib.sha1(
-                str(r.get("content", "") or "").strip().lower().encode("utf-8")
-            ).hexdigest()[:12]
-        if key not in seen:
-            seen.add(key)
-            merged.append(r)
-
-    if merged and query.strip():
-        merged.sort(
-            key=lambda r: _experience_relevance(r, query.strip().lower()), reverse=True
-        )
-        merged = merged[:5]
-
-    # RAG 来源标记（用于观测）
-    n_same = sum(1 for r in merged if (r.get("metadata", {}) or {}).get("app_package", "") == package)
-    ctx._rag_same_app_count = int(getattr(ctx, "_rag_same_app_count", 0) or 0) + n_same
-    ctx._rag_cross_app_count = int(getattr(ctx, "_rag_cross_app_count", 0) or 0) + (len(merged) - n_same)
-    if not merged:
+    if not available:
         ctx._rag_empty_hit_count = int(getattr(ctx, "_rag_empty_hit_count", 0) or 0) + 1
 
-    if merged:
-        parts.append("## 操作经验")
-        parts.extend(f"- {r['content']}" for r in merged)
-
-    rule_text = ctx.knowledge_base.query_curated_rules(package, top_k=3)
-    if rule_text:
-        parts.append("## 人工知识")
-        parts.append(rule_text)
-
-    result = "\n".join(parts) if parts else f"未找到 '{query}' 的相关知识"
+    headings = {
+        "constraint": "## 执行约束",
+        "negative_knowledge": "## 已知禁止/失败模式",
+        "semantic_hint": "## 语义提示（不得覆盖验收）",
+    }
+    parts = [
+        headings[knowledge_type] + "\n" + "\n".join(f"- {item}" for item in items)
+        for knowledge_type, items in grouped.items()
+        if items
+    ]
+    result = "\n\n".join(parts) if parts else f"未找到 '{intent}' 的已审核知识"
     _cache[cache_key] = result
     return result
 
@@ -131,8 +106,8 @@ def _experience_relevance(entry: dict, query_lower: str) -> int:
 
 
 @tool
-def query_element_identity(alias: str, app_package: str = "") -> str:
-    """Query stored element identities for given alias. Returns resource_id, class, role, region from previous successful clicks."""
+def query_locator_knowledge(alias: str, app_package: str = "") -> str:
+    """Query current-page locator knowledge from previous successful clicks."""
     ctx = get_tool_context()
     package = app_package or ctx.device.current_app().get("package", "")
     sig = ""
@@ -155,16 +130,16 @@ def query_element_identity(alias: str, app_package: str = "") -> str:
         db = create_relational_db(TestConfig())
 
     try:
-        rows = db.query_element_identity(package, alias, sig)
+        rows = db.query_locator_knowledge(package, alias=alias, page_signature=sig)
         if not rows:
-            return f"No known identity for '{alias}' on {package}"
-        lines = [f"Known identities for '{alias}' on {package}:"]
+            return f"No known locator for '{alias}' on {package}"
+        lines = [f"Known locators for '{alias}' on {package}:"]
         for r in rows:
             lines.append(
                 f"  rid={r['resource_id']} class={r['class_name']} "
                 f"role={r['role']} region={r['region']} "
-                f"clicks={r['click_count']} candidates={r['candidates_count']}"
+                f"successes={r['success_count']} failures={r['failure_count']}"
             )
         return chr(10).join(lines)
     except Exception as exc:
-        return f"Element identity query failed: {exc}"
+        return f"Locator knowledge query failed: {exc}"

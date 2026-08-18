@@ -24,7 +24,6 @@ from agents.orchestrator import TestOrchestrator
 from config import TestConfig as AppTestConfig
 from tools.context import ToolContext
 
-
 # ── 工具：安装 fake ctx 到 get_tool_context ──
 
 
@@ -124,8 +123,8 @@ def test_stop_or_continue_returns_command_when_flag_set(monkeypatch):
     ctx = ToolContext(device=None, perceiver=None)
     ev = threading.Event()
     ev.set()
-    orch_mod.TestOrchestrator._attach_stop_event = (
-        lambda self, c, e: setattr(c, "_stop_event", e)
+    orch_mod.TestOrchestrator._attach_stop_event = lambda self, c, e: setattr(
+        c, "_stop_event", e
     )
     ctx._stop_event = ev  # 直接挂
 
@@ -158,14 +157,7 @@ def test_stop_or_continue_tolerates_missing_ctx():
 
 def test_reporter_stop_overrides_v1_passed_to_completed(monkeypatch):
     """即使全部验证项通过，stop 仍强制 execution_status="cancelled"。"""
-    fake_ctx = SimpleNamespace(
-        _verifications=[
-            {"item": "v1", "result": "passed", "detail": "", "screenshot": ""},
-            {"item": "v2", "result": "passed", "detail": "", "screenshot": ""},
-        ],
-        _verification_key_map={},
-        _verification_items_by_key={},
-    )
+    fake_ctx = SimpleNamespace()
     ev = threading.Event()
     ev.set()
     fake_ctx._stop_event = ev
@@ -190,13 +182,7 @@ def test_reporter_stop_overrides_v1_passed_to_completed(monkeypatch):
 
 def test_reporter_stop_marks_inconclusive_even_if_partial(monkeypatch):
     """stop 时即便只有部分验证项通过，也标 cancelled + inconclusive。"""
-    fake_ctx = SimpleNamespace(
-        _verifications=[
-            {"item": "v1", "result": "passed", "detail": "", "screenshot": ""},
-        ],
-        _verification_key_map={},
-        _verification_items_by_key={},
-    )
+    fake_ctx = SimpleNamespace()
     ev = threading.Event()
     ev.set()
     fake_ctx._stop_event = ev
@@ -216,35 +202,6 @@ def test_reporter_stop_marks_inconclusive_even_if_partial(monkeypatch):
     )
     assert cmd.update["execution_status"] == "cancelled"
     assert cmd.update["test_verdict"] == "inconclusive"
-
-
-def test_reporter_normal_v1_passed_to_completed_still_works(monkeypatch):
-    """无 stop 信号时，V1 全过归正仍正常工作（回归保护）。"""
-    fake_ctx = SimpleNamespace(
-        _verifications=[
-            {"item": "v1", "result": "passed", "detail": "", "screenshot": ""},
-            {"item": "v2", "result": "passed", "detail": "", "screenshot": ""},
-        ],
-        _verification_key_map={},
-        _verification_items_by_key={},
-    )
-    fake_ctx._stop_event = None
-    _install_fake_ctx(monkeypatch, fake_ctx)
-
-    state = {
-        "status": "fail",
-        "conclusion": "ABORT: MAX_TURNS_EXHAUSTED",
-        "goal_description": {"verification": ["v1", "v2"]},
-        "step_history": [{"index": i} for i in range(6)],
-        "messages": [],
-        "budget_violation_count": 0,
-    }
-    cmd = graph.reporter_node(
-        state, {"configurable": {"test_config": AppTestConfig(write_run_trace=False)}}
-    )
-    # 走原 V1 路径：exhausted + 全过 → completed
-    assert cmd.update["execution_status"] == "completed"
-    assert cmd.update["test_verdict"] == "passed"
 
 
 # ── llm_runtime USER_STOPPED 分支 ──
@@ -324,8 +281,8 @@ def test_run_completes_normally_without_stop():
     assert len(state_with_history["step_history"]) == 2
 
 
-def test_route_after_agent_treats_stopped_as_terminal():
-    """route_after_agent 必须把 'stopped' 视作终止态（防御 _stop_or_continue 的 goto 被忽略）。"""
+def test_route_after_evaluator_treats_stopped_as_terminal():
+    """Evaluator 路由必须把 'stopped' 视作终止态。"""
     # 全过 + status=stopped → reporter
     state = {
         "status": "stopped",
@@ -333,15 +290,19 @@ def test_route_after_agent_treats_stopped_as_terminal():
         "goal_description": {"target_pages": ["p1"], "verification": ["v1"]},
         "step_history": [{"index": i} for i in range(2)],
     }
-    assert graph.route_after_agent(state) == "reporter"
+    state["verification_contract"] = {"status": "approved"}
+    state["clause_state"] = {"verdict": "inconclusive"}
+    assert graph.route_after_evaluator(state) == "reporter"
     # 不全过 + status=stopped + 未到 max → 仍走 reporter（不走 agent 死循环）
     state_partial = {
         "status": "stopped",
         "conclusion": "ABORT: USER_STOPPED",
         "goal_description": {"target_pages": ["p1"], "verification": ["v1"]},
         "step_history": [{"index": 1}],
+        "verification_contract": {"status": "approved"},
+        "clause_state": {"verdict": "inconclusive"},
     }
-    assert graph.route_after_agent(state_partial) == "reporter"
+    assert graph.route_after_evaluator(state_partial) == "reporter"
 
 
 def test_plan_review_node_stops_when_flag_set(monkeypatch):
@@ -362,6 +323,7 @@ def test_plan_review_node_stops_when_flag_set(monkeypatch):
 
     # 防御：如果 stop 检查失效、走到了 interrupt()，这里的 spy 会被触发
     import langgraph.types as _lg_types
+
     interrupt_called = {"v": False}
 
     def _spy_interrupt(*args, **kwargs):

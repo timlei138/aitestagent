@@ -19,18 +19,14 @@ logger = logging.getLogger(__name__)
 
 
 def _reset_run_scoped(ctx) -> None:
-    """重置 run 级累加器：验证结果 / 可交互事实去重 / M4 确定性核实 /
+    """重置 run 级累加器：可交互事实去重 /
     O1 token 统计 / RAG 缓存。每次新执行前调用，避免跨 run 数据串扰。绝不抛异常。"""
     if not ctx:
         return
     try:
-        if isinstance(getattr(ctx, "_verifications", None), list):
-            ctx._verifications.clear()
         interactive_seen = getattr(ctx, "_verification_interactive_facts_seen", None)
         if isinstance(interactive_seen, set):
             interactive_seen.clear()
-        if isinstance(getattr(ctx, "_deterministic_checks", None), list):
-            ctx._deterministic_checks.clear()
         tu = getattr(ctx, "_token_usage", None)
         if isinstance(tu, dict):
             for k in list(tu.keys()):
@@ -49,6 +45,10 @@ def _reset_run_scoped(ctx) -> None:
             ctx._rag_query_cache.clear()
         if hasattr(ctx, "_run_tag"):
             ctx._run_tag = ""
+        if hasattr(ctx, "_evidence_events"):
+            ctx._evidence_events.clear()
+        if hasattr(ctx, "_action_events"):
+            ctx._action_events.clear()
         for _rag_attr in (
             "_rag_query_count",
             "_rag_same_app_count",
@@ -216,11 +216,6 @@ class TestOrchestrator:
         app_name: str = "",
         thread_id: str = "",
         goal_description: dict | None = None,
-        reuse_plan: bool = False,
-        run_type: str = "normal",
-        source_run_id: str | None = None,
-        source_case_id: str | None = None,
-        execution_plan_revision: int = 0,
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
         logger.info(
@@ -248,30 +243,6 @@ class TestOrchestrator:
         ctx = get_tool_context()
         _reset_run_scoped(ctx)
 
-        # R20: 复跑时检查应用是否已安装（仅在 reuse_plan=True 且设备在线时）
-        if reuse_plan and app_package and getattr(ctx, "device", None) is not None:
-            try:
-                import subprocess as _sp
-
-                _r = _sp.run(
-                    ["adb", "shell", "pm", "list", "packages", app_package],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if app_package not in (_r.stdout or ""):
-                    logger.warning(
-                        "R20: 应用 %s 在设备上未安装，复跑将注入事实提示 LLM",
-                        app_package,
-                    )
-                    if goal_description is None:
-                        goal_description = {}
-                    facts = goal_description.get("_device_facts", [])
-                    facts.append(f"应用 {app_package} 在当前设备上未安装/无法启动")
-                    goal_description["_device_facts"] = facts
-            except Exception as exc:
-                logger.error("R20: 应用可启动性检查失败: %s", exc)
-
         if getattr(ctx, "device", None) is None:
             msg = "Android 设备未连接，请检查 USB/ADB 连接后重试"
             self._emit("error", {"message": msg})
@@ -289,6 +260,7 @@ class TestOrchestrator:
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         logger.info("[stop-debug] start() resolved thread_id=%s", thread_id)
+        ctx._run_tag = thread_id
 
         # 注册 stop flag + 挂到 ctx（让节点 / _run_agent 子图能检查）
         _stop_ev = self._register_run(thread_id)
@@ -322,15 +294,6 @@ class TestOrchestrator:
             "_knowledge_query_hint_injected": False,
             "_last_page_app_key": "",
             "_last_clickable_count": 0,
-            "_run_type": run_type or "normal",
-            "_source_run_id": source_run_id,
-            "_source_case_id": source_case_id,
-            "_execution_plan_revision": int(execution_plan_revision or 0),
-            "_replay_step_idx": 0,
-            "_replay_mode": "",
-            "_replay_input_actuals": {},
-            "_replay_recovery_used": 0,
-            "_replay_nav_streak": 0,
         }
 
         config_ctx = {
@@ -425,11 +388,6 @@ class TestOrchestrator:
         app_name: str = "",
         thread_id: str = "",
         goal_description: dict | None = None,
-        reuse_plan: bool = False,
-        run_type: str = "normal",
-        source_run_id: str | None = None,
-        source_case_id: str | None = None,
-        execution_plan_revision: int = 0,
     ) -> AsyncIterator[dict[str, Any]]:
         """流式执行测试 — 通过 astream_events 实时推送每个事件。"""
         if not thread_id:
@@ -441,6 +399,7 @@ class TestOrchestrator:
 
         _sctx = _gtc()
         _reset_run_scoped(_sctx)
+        _sctx._run_tag = thread_id
 
         if getattr(_sctx, "device", None) is None:
             yield {
@@ -481,15 +440,6 @@ class TestOrchestrator:
             "_knowledge_query_hint_injected": False,
             "_last_page_app_key": "",
             "_last_clickable_count": 0,
-            "_run_type": run_type or "normal",
-            "_source_run_id": source_run_id,
-            "_source_case_id": source_case_id,
-            "_execution_plan_revision": int(execution_plan_revision or 0),
-            "_replay_step_idx": 0,
-            "_replay_mode": "",
-            "_replay_input_actuals": {},
-            "_replay_recovery_used": 0,
-            "_replay_nav_streak": 0,
         }
 
         config_ctx = {
@@ -652,6 +602,7 @@ class TestOrchestrator:
 
         _sctx = _gtc()
         _reset_run_scoped(_sctx)
+        _sctx._run_tag = thread_id
         # resume 同样支持 stop：复用同 thread_id 的 flag（若仍存在），
         # 不存在则新建一个，让用户能中断刚点完「确认」后继续运行的图。
         _stop_ev = self._stop_flags.get(thread_id) or self._register_run(thread_id)
@@ -833,16 +784,25 @@ class TestOrchestrator:
             state.get("_tool_calls_log", []),
         )
         conclusion = state.get("conclusion", "")
-        # Command 更新不传播新增 key，从 conclusion 文本推断
-        import re
+        terminal_verdict = state.get("_terminal_verdict", "")
+        # 结构化 verdict 优先，避免依赖 Agent 文本前缀
+        if terminal_verdict == "passed":
+            is_done = True
+            is_abort = False
+        elif terminal_verdict == "failed":
+            is_done = False
+            is_abort = True
+        else:
+            # Command 更新不传播新增 key，从 conclusion 文本推断
+            import re
 
-        _m = re.search(
-            r"^(?:#{1,3}\s*)?(DONE|ABORT)\s*[:：]",
-            conclusion,
-            re.IGNORECASE | re.MULTILINE,
-        )
-        is_done = bool(_m and _m.group(1).upper() == "DONE")
-        is_abort = bool(_m and _m.group(1).upper() == "ABORT")
+            _m = re.search(
+                r"^(?:#{1,3}\s*)?(DONE|ABORT)\s*[:：]",
+                conclusion,
+                re.IGNORECASE | re.MULTILINE,
+            )
+            is_done = bool(_m and _m.group(1).upper() == "DONE")
+            is_abort = bool(_m and _m.group(1).upper() == "ABORT")
         exec_status = state.get("execution_status", "")
         verdict = state.get("test_verdict", "")
         if not exec_status:

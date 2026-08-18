@@ -15,10 +15,6 @@
           <el-icon><i class="nav-icon">📊</i></el-icon>
           <span>报告中心</span>
         </el-menu-item>
-        <el-menu-item index="cases">
-          <el-icon><i class="nav-icon">📋</i></el-icon>
-          <span>用例中心</span>
-        </el-menu-item>
         <el-menu-item index="apps">
           <el-icon><i class="nav-icon">📱</i></el-icon>
           <span>APP 管理</span>
@@ -73,7 +69,7 @@
       <el-header class="topbar">
         <el-breadcrumb separator="/">
           <el-breadcrumb-item>AI 测试平台</el-breadcrumb-item>
-          <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'cases' ? '用例中心' : activeMenu === 'apps' ? 'APP 管理' : activeMenu === 'settings' ? '设置' : '知识库' }}</el-breadcrumb-item>
+          <el-breadcrumb-item>{{ activeMenu === 'workspace' ? '工作台' : activeMenu === 'reports' ? '报告中心' : activeMenu === 'apps' ? 'APP 管理' : activeMenu === 'settings' ? '设置' : '知识库' }}</el-breadcrumb-item>
         </el-breadcrumb>
         <div class="header-tags">
           <el-tag :type="wsConnected ? 'success' : 'info'" size="small" effect="light" round>
@@ -99,42 +95,26 @@
               <template #default="{ row }">{{ (row.created_at || '').replace('T', ' ').substring(0, 19) }}</template>
             </el-table-column>
             <el-table-column prop="user_request" label="测试用例" min-width="180" show-overflow-tooltip />
-            <el-table-column label="类型" width="80">
-              <template #default="{ row }">
-                <el-tag v-if="row.run_type === 'rerun'" size="small" color="#6366F1" effect="dark">复跑</el-tag>
-                <el-tag v-else size="small" type="info" effect="plain">普通</el-tag>
-              </template>
+            <el-table-column prop="execution_mode" label="模式" width="82">
+              <template #default="{ row }">{{ modeLabel(row.execution_mode) }}</template>
             </el-table-column>
-            <el-table-column prop="total_steps" label="步骤" width="60" />
-            <el-table-column prop="duration_seconds" label="耗时(s)" width="80" />
-            <el-table-column prop="llm_call_count" label="LLM" width="60" />
-            <el-table-column label="Token" width="85">
-              <template #default="{ row }">{{ fmtTokens(row.total_tokens) }}</template>
-            </el-table-column>
-            <el-table-column label="状态" width="90">
+            <el-table-column label="阶段" width="90">
               <template #default="{ row }">
-                <el-tag :type="execStatusType(row.execution_status)" size="small">
-                  {{ execStatusLabel(row.execution_status) }}
+                <el-tag :type="lifecycleType(row.lifecycle_state)" size="small">
+                  {{ lifecycleLabel(row.lifecycle_state) }}
                 </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="结论" width="80">
               <template #default="{ row }">
-                <el-tag :type="verdictType(row.test_verdict)" size="small">
-                  {{ verdictLabel(row.test_verdict) }}
+                <el-tag :type="verdictType(row.verdict)" size="small">
+                  {{ verdictLabel(row.verdict) }}
                 </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="操作" width="230" fixed="right">
               <template #default="{ row }">
                 <div style="white-space:nowrap">
-                <el-button size="small" text type="primary"
-                  :disabled="!hasGoal(row) || executing"
-                  :title="!hasGoal(row) ? '该报告无可用计划，请重新执行以生成计划' : executing ? '请等待当前运行结束' : ''"
-                  @click.stop="rerunReport(row)">复跑</el-button>
-                <el-button v-if="isSuccess(row) && row.run_type !== 'rerun'" size="small" text type="success"
-                  :disabled="executing"
-                  @click.stop="saveAsCase(row)">保存为用例</el-button>
                 <el-button size="small" text type="danger"
                   :disabled="executing"
                   @click.stop="deleteReport(row)">删除</el-button>
@@ -142,22 +122,6 @@
               </template>
             </el-table-column>
           </el-table>
-        </section>
-      </el-main>
-
-      <!-- ═══════════ 用例中心 ═══════════ -->
-      <el-main class="main-content" v-show="activeMenu === 'cases'">
-        <section class="panel">
-          <div class="panel-header">
-            <h3 class="panel-title">用例中心</h3>
-          </div>
-          <TestCasePanel
-            ref="testCasePanelRef"
-            :reports="reportTasks"
-            :executing="executing"
-            @run-case="runCase"
-            @refresh="loadReports"
-          />
         </section>
       </el-main>
 
@@ -218,11 +182,16 @@
                 <el-form-item label="模型名称">
                   <el-input v-model="configData.model" placeholder="如: deepseek-v4-pro, gpt-4o" />
                 </el-form-item>
+                <el-form-item>
+                  <el-checkbox v-model="configData.llm_vision_capable">
+                    主模型支持多模态/视觉
+                  </el-checkbox>
+                </el-form-item>
                 <el-form-item label="API Key">
-                  <el-input v-model="configData.api_key" placeholder="API Key" />
+                  <el-input v-model="configData.api_key" placeholder="主模型 API Key" />
                 </el-form-item>
                 <el-form-item label="Base URL">
-                  <el-input v-model="configData.base_url" placeholder="如: https://api.deepseek.com" />
+                  <el-input v-model="configData.base_url" placeholder="如: https://api.openai.com/v1" clearable />
                 </el-form-item>
                 <div class="model-test-row">
                   <el-button size="small" :loading="llmTesting" @click="testModelConnection('llm')">测试连接</el-button>
@@ -233,16 +202,8 @@
                   :type="llmTestResult.ok ? 'success' : 'error'"
                   :closable="false"
                   show-icon
-                  :title="llmTestResult.ok ? 'LLM 模型连接成功' : 'LLM 模型连接失败'"
+                  :title="llmTestResult.ok ? '主模型连接成功' : '主模型连接失败'"
                 >{{ llmTestResult.message }}</el-alert>
-                <el-form-item>
-                  <el-checkbox v-model="configData.llm_vision_capable">
-                    主模型支持多模态/视觉
-                    <el-tooltip content="开启后，即使不配置下方视觉备用模型，也会尝试用主模型处理图片（如 gpt-4o）；关闭时则必须配置视觉备用模型才启用视觉能力" placement="top">
-                      <span style="font-size:12px;color:var(--text-muted);cursor:help;margin-left:4px">ℹ️</span>
-                    </el-tooltip>
-                  </el-checkbox>
-                </el-form-item>
               </el-form>
             </div>
 
@@ -318,28 +279,6 @@
                     <el-option label="Relaxed（宽松）" value="relaxed" />
                   </el-select>
                 </el-form-item>
-                <el-form-item label="复跑执行器">
-                  <div style="display:flex;align-items:center;gap:8px;width:100%">
-                    <el-select v-model="configData.replay_executor" style="flex:1">
-                      <el-option label="direct（确定性直执行，推荐）" value="direct" />
-                      <el-option label="llm（LLM 软回放）" value="llm" />
-                    </el-select>
-                    <el-tooltip placement="top" :show-after="100">
-                      <template #content>
-                        <div style="max-width:320px;line-height:1.6">
-                          <strong>direct（确定性直执行，推荐）</strong><br />
-                          复跑时脚本步骤由代码直接执行对应工具（click / type_input 等），<br />
-                          不再调用主 LLM，速度更快、更稳定。仅在偏离脚本时由 LLM 接管恢复。
-                          <br /><br />
-                          <strong>llm（LLM 软回放）</strong><br />
-                          复跑时每一步仍由 LLM 按脚本指令执行，更保守灵活，<br />
-                          但更慢、且可能在稳定入口偏航。
-                        </div>
-                      </template>
-                      <span style="font-size:14px;color:var(--text-muted);cursor:help">❓</span>
-                    </el-tooltip>
-                  </div>
-                </el-form-item>
                 <el-form-item label="历史摘要步数">
                   <el-input-number v-model="configData.context_history_steps" :min="1" :max="20" :step="1" style="width:140px" />
                   <span style="font-size:12px;color:var(--text-muted);margin-left:8px">agent 每轮注入的摘要层历史步数</span>
@@ -368,6 +307,10 @@
 
     <div class="pr-body">
       <div class="pr-section">
+        <div class="pr-section-label">原始请求</div>
+        <div class="pr-request-text">{{ planReviewUserRequest || '（无）' }}</div>
+      </div>
+      <div class="pr-section">
         <div class="pr-section-label">目标</div>
         <el-input v-model="planReviewGoal" type="textarea" :rows="2" placeholder="测试目标" />
       </div>
@@ -382,12 +325,30 @@
         </div>
       </div>
       <div class="pr-section">
-        <div class="pr-section-label">验证条件</div>
-        <div v-for="(v, i) in planReviewVerifications" :key="i" style="display:flex;gap:6px;margin-bottom:4px">
-          <el-input v-model="planReviewVerifications[i]" size="small" />
-          <el-button size="small" type="danger" text @click="planReviewVerifications.splice(i,1)">×</el-button>
+        <div class="pr-section-label">验证条件与覆盖状态</div>
+        <div v-for="(v, i) in planReviewVerifications" :key="i" style="display:flex;gap:6px;margin-bottom:4px;align-items:flex-start">
+          <el-input v-model="planReviewVerifications[i]" size="small" @input="rebuildEditedContract" style="flex:1" />
+          <el-button size="small" type="danger" text @click="planReviewVerifications.splice(i,1); rebuildEditedContract()">×</el-button>
         </div>
-        <el-button size="small" @click="planReviewVerifications.push('')">+ 添加验证</el-button>
+        <el-button size="small" @click="planReviewVerifications.push(''); rebuildEditedContract()">+ 添加验证</el-button>
+        <div v-if="planReviewContract" class="pr-coverage-section">
+          <div v-for="verification in planReviewContract.verifications" :key="verification.key" class="pr-verification-item">
+            <div class="pr-verification-header">
+              <span>{{ verification.statement }}</span>
+              <el-tag size="small" :type="spanStatusType(verification)">{{ spanStatusText(verification) }}</el-tag>
+            </div>
+            <div class="pr-verification-meta">
+              <span>request span: {{ spanStyle(verification.request_source_span) }}</span>
+              <span>goal span: {{ spanStyle(verification.goal_source_span) }}</span>
+            </div>
+            <div v-for="clause in verification.clauses" :key="clause.id" class="pr-clause-item">
+              <span class="pr-clause-id">{{ clause.id }}</span>
+              <span class="pr-clause-claim">{{ clause.claim }}</span>
+              <span class="pr-clause-span">[{{ clause.goal_source_span[0] }}-{{ clause.goal_source_span[1] }}]</span>
+              <el-tag v-for="ch in clause.channels" :key="ch" size="small" type="info">{{ ch }}</el-tag>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="pr-section">
         <div class="pr-section-label">导航提示</div>
@@ -457,7 +418,7 @@
   <el-dialog v-model="kbDialogVisible" :title="kbDialogMode === 'add' ? '新增知识' : '编辑知识'" width="560px" :close-on-click-modal="false">
     <el-form :model="kbForm" label-width="90px" style="padding-right:12px">
       <el-form-item label="应用包名" required>
-        <el-input v-model="kbForm.app_package" :placeholder="kbForm.knowledge_type === 'curated_rule' ? '留空表示全局知识' : '如: com.android.settings'" />
+        <el-input v-model="kbForm.app_package" :placeholder="kbForm.knowledge_type === 'constraint' ? '留空表示全局约束' : '如: com.android.settings'" />
       </el-form-item>
       <el-form-item label="知识类型" required>
         <el-select v-model="kbForm.knowledge_type" style="width:100%" placeholder="请选择">
@@ -557,11 +518,9 @@ import ReportDetail from "./components/ReportDetail.vue";
 import KnowledgePanel from "./components/KnowledgePanel.vue";
 import WorkspacePanel from "./components/WorkspacePanel.vue";
 import DeviceFloat from "./components/DeviceFloat.vue";
-import TestCasePanel from "./components/TestCasePanel.vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 const activeMenu = ref("workspace");
-const testCasePanelRef = ref(null);
 const executing = ref(false);
 // 手动停止：UI 收到 stop_ack 或 run_stopped 后清回 false；重复点击时防抖
 const stopping = ref(false);
@@ -590,6 +549,9 @@ const planReviewPages = ref([]);
 const planReviewVerifications = ref([]);
 const planReviewHints = ref([]);
 const planReviewSubmitting = ref(false);
+const planReviewUserRequest = ref("");
+const planReviewContract = ref(null);
+const planReviewSpanStatus = ref({ valid: true, gaps: [], overlaps: [] });
 const newPageName = ref("");
 
 function addReviewPage() {
@@ -598,6 +560,173 @@ function addReviewPage() {
     planReviewPages.value.push(name);
   }
   newPageName.value = "";
+}
+
+// 与后端 _CLAUSE_BOUNDARY 保持一致：按显式连接词/标点拆分验证条件
+function splitClaims(statement) {
+  const parts = String(statement || "").split(/[，,；;]+|(?:并且|同时|以及|且)/g);
+  return parts.map(p => p.trim()).filter(p => p);
+}
+
+// 根据当前编辑的 verifications 重新计算 contract（保持 span 与后端一致）
+function rebuildEditedContract() {
+  const request = planReviewUserRequest.value || "";
+  const verifications = (planReviewVerifications.value || [])
+    .map((item, index) => {
+      const statement = String(item || "").trim();
+      if (!statement) return null;
+      const key = `v${index}`;
+      const claims = splitClaims(statement);
+      const clauses = [];
+      let cursor = 0;
+      claims.forEach((claim, ci) => {
+        let offset = statement.indexOf(claim, cursor);
+        if (offset < 0) offset = cursor;
+        cursor = offset + claim.length;
+        // 与后端 _default_channels_for_claim 对应：简单按关键词推断
+        const normalized = claim.toLowerCase();
+        let channels = ["ui_text", "vision_verify", "click_and_check", "behavior_effect"];
+        if (/颜色|红色|黑色|布局|图标|样式|视觉/.test(normalized)) {
+          channels = ["vision_verify"];
+        } else if (/文字|文本|提示|toast|显示/.test(normalized)) {
+          channels = ["ui_text", "click_and_check"];
+        } else if (/页面|activity|状态|开启|关闭|勾选|选中|打开|开关/.test(normalized)) {
+          channels = ["behavior_effect", "vision_verify"];
+        }
+        clauses.push({
+          id: `${key}.${ci}`,
+          claim,
+          goal_source_span: [offset, cursor],
+          channels,
+        });
+      });
+      return {
+        key,
+        statement,
+        request_source_span: [0, request.length],
+        goal_source_span: [0, statement.length],
+        context_spans: [],
+        clauses,
+      };
+    })
+    .filter(Boolean);
+
+  const contract = {
+    status: "contract_pending_review",
+    user_request: request,
+    verifications,
+  };
+  contract.coverage_map = buildCoverageMap(contract);
+  planReviewContract.value = contract;
+  planReviewSpanStatus.value = validateContractSpans(contract);
+}
+
+function buildCoverageMap(contract) {
+  const request = String(contract.user_request || "");
+  const goalSpans = {};
+  const conditionSpans = [];
+  const goals = {};
+  (contract.verifications || []).forEach(v => {
+    const key = v.key;
+    const reqSpan = v.request_source_span || [0, request.length];
+    conditionSpans.push([...reqSpan]);
+    goalSpans[key] = [...reqSpan];
+    const statement = String(v.statement || "");
+    const goalSourceSpan = v.goal_source_span || [0, statement.length];
+    goals[key] = {
+      goal_source_span: [...goalSourceSpan],
+      clause_spans: (v.clauses || []).map(c => ({
+        id: c.id,
+        span: [...(c.goal_source_span || [0, 0])],
+      })),
+      context_spans: (v.context_spans || []).map(s => [...s]),
+    };
+  });
+  return {
+    request: {
+      condition_spans: mergeSpans(conditionSpans),
+      goal_spans: goalSpans,
+    },
+    goals,
+  };
+}
+
+function validateContractSpans(contract) {
+  const gaps = [];
+  const overlaps = [];
+  (contract.verifications || []).forEach(v => {
+    const key = v.key;
+    const statement = String(v.statement || "");
+    const goalSpan = v.goal_source_span || [0, statement.length];
+    const clauses = (v.clauses || []).filter(c =>
+      Array.isArray(c.goal_source_span) &&
+      c.goal_source_span.length === 2 &&
+      c.goal_source_span[0] >= 0 &&
+      c.goal_source_span[1] <= statement.length &&
+      c.goal_source_span[0] < c.goal_source_span[1]
+    );
+    for (let i = 0; i < clauses.length; i++) {
+      for (let j = i + 1; j < clauses.length; j++) {
+        const a = clauses[i].goal_source_span;
+        const b = clauses[j].goal_source_span;
+        if (a[0] < b[1] && b[0] < a[1]) {
+          overlaps.push({ layer: "goal", key, span_a: { id: clauses[i].id, span: a }, span_b: { id: clauses[j].id, span: b } });
+        }
+      }
+    }
+    let pos = goalSpan[0];
+    const sorted = [...clauses].sort((a, b) => a.goal_source_span[0] - b.goal_source_span[0]);
+    for (const c of sorted) {
+      const [s, e] = c.goal_source_span;
+      if (s > pos) {
+        gaps.push({ layer: "goal", key, start: pos, end: s, reason: "clause coverage gap" });
+      }
+      pos = Math.max(pos, e);
+    }
+    if (pos < goalSpan[1]) {
+      gaps.push({ layer: "goal", key, start: pos, end: goalSpan[1], reason: "clause coverage gap" });
+    }
+  });
+  return { valid: gaps.length === 0 && overlaps.length === 0, gaps, overlaps };
+}
+
+function mergeSpans(spans) {
+  if (!spans.length) return [];
+  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
+  const merged = [[...sorted[0]]];
+  for (let i = 1; i < sorted.length; i++) {
+    const last = merged[merged.length - 1];
+    const cur = sorted[i];
+    if (cur[0] <= last[1]) {
+      last[1] = Math.max(last[1], cur[1]);
+    } else {
+      merged.push([...cur]);
+    }
+  }
+  return merged;
+}
+
+function spanStyle(span, totalLen) {
+  // 仅用于 tooltip/文本展示，不做复杂高亮
+  return `${span[0]}-${span[1]}`;
+}
+
+function spanStatusType(verification) {
+  const key = verification.key;
+  const hasGap = planReviewSpanStatus.value.gaps.some(g => g.key === key);
+  const hasOverlap = planReviewSpanStatus.value.overlaps.some(o => o.key === key);
+  if (hasOverlap) return "danger";
+  if (hasGap) return "warning";
+  return "success";
+}
+
+function spanStatusText(verification) {
+  const key = verification.key;
+  const hasGap = planReviewSpanStatus.value.gaps.some(g => g.key === key);
+  const hasOverlap = planReviewSpanStatus.value.overlaps.some(o => o.key === key);
+  if (hasOverlap) return "重叠";
+  if (hasGap) return "有缺口";
+  return "覆盖完整";
 }
 
 // 元素身份确认
@@ -637,23 +766,27 @@ const kbDialogMode = ref('add');  // 'add' | 'edit'
 const kbDetailVisible = ref(false);
 const kbDetailRow = ref(null);
 const kbSaving = ref(false);
-const kbForm = ref({ app_package: '', knowledge_type: 'experience', content: '' });
+const kbForm = ref({ app_package: '', knowledge_type: 'constraint', content: '' });
 const kbTypes = [
-  { value: 'experience', label: '操作经验' },
-  { value: 'curated_rule', label: '人工知识' },
+  { value: 'constraint', label: '约束规则' },
+  { value: 'negative_knowledge', label: '反例知识' },
+  { value: 'semantic_hint', label: '语义提示' },
 ];
 const kbTypeColorMap = {
-  experience: 'warning',
-  curated_rule: 'success',
+  constraint: 'danger',
+  negative_knowledge: 'warning',
+  semantic_hint: 'success',
 };
 // 旧类型兼容映射（前端显示用）
 const _legacyTypeMap = {
-  verified_plan: 'experience',
-  page_structure: 'experience',
-  navigation_path: 'experience',
-  test_experience: 'experience',
-  app_precondition: 'curated_rule',
-  global_knowledge: 'curated_rule',
+  verified_plan: 'semantic_hint',
+  page_structure: 'semantic_hint',
+  navigation_path: 'semantic_hint',
+  test_experience: 'semantic_hint',
+  experience: 'semantic_hint',
+  app_precondition: 'constraint',
+  global_knowledge: 'constraint',
+  curated_rule: 'constraint',
 };
 function kbTypeLabel(type) {
   const resolved = _legacyTypeMap[type] || type;
@@ -684,73 +817,16 @@ const verdictMap = {
   failed:       { label: '未通过', type: 'danger' },
   inconclusive: { label: '待人工复核', type: 'warning' },
 };
-function execStatusLabel(s) { return (execStatusMap[s] || execStatusMap.error).label; }
-function execStatusType(s)  { return (execStatusMap[s] || execStatusMap.error).type; }
+const lifecycleMap = {
+  Bootstrapping: { label: '准备中', type: 'info' }, Direct: { label: '直达', type: 'success' },
+  Guided: { label: '引导', type: 'warning' }, Explore: { label: '探索', type: 'warning' },
+  Terminal: { label: '已结束', type: 'info' },
+};
+function modeLabel(mode) { return ({ direct: '直达', guided: '引导', explore: '探索' })[mode] || '探索'; }
+function lifecycleLabel(state) { return (lifecycleMap[state] || lifecycleMap.Terminal).label; }
+function lifecycleType(state) { return (lifecycleMap[state] || lifecycleMap.Terminal).type; }
 function verdictLabel(s)    { return (verdictMap[s] || verdictMap.inconclusive).label; }
 function verdictType(s)     { return (verdictMap[s] || verdictMap.inconclusive).type; }
-
-function isSuccess(row) {
-  return row.execution_status === 'completed' && row.test_verdict === 'passed';
-}
-function hasGoal(row) {
-  if (!row) return false;
-  const gj = row.goal_json;
-  // 处理五种空值：undefined/null/""/"{}"/{}
-  if (gj === undefined || gj === null) return false;
-  if (gj === '""' || gj === '') return false;
-  try {
-    const g = typeof gj === 'string' ? JSON.parse(gj) : gj;
-    if (!g || (typeof g === 'object' && Object.keys(g).length === 0)) return false;
-    return !!(g.goal || (g.target_pages && g.target_pages.length) || (g.verification && g.verification.length));
-  } catch { return false; }
-}
-async function rerunReport(row) {
-  if (!hasGoal(row) || executing.value) return;
-  const goal = typeof row.goal_json === 'string' ? JSON.parse(row.goal_json) : row.goal_json;
-  if (!wsConnected.value || !ws || ws.readyState !== WebSocket.OPEN) {
-    ElMessage.error('请先连接 WebSocket 后再复跑');
-    return;
-  }
-  executing.value = true;
-  ws.send(JSON.stringify({ type: 'rerun', run_id: row.id, goal }));
-}
-async function saveAsCase(row) {
-  if (!isSuccess(row)) return;
-  try {
-    const res = await fetch('/api/test_cases', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ run_id: row.id, name: (row.user_request || '').substring(0, 40) }),
-    });
-    const data = await res.json();
-    if (data.status === 'ok') {
-      ElMessage.success('已保存为用例');
-      await testCasePanelRef.value?.fetchCases();
-      loadReports();
-    }
-    else { ElMessage.error(data.message || '保存失败'); }
-  } catch (e) { ElMessage.error('保存失败: ' + e); }
-}
-function runCase(caseId) {
-  if (executing.value) return;
-  if (!wsConnected.value || !ws || ws.readyState !== WebSocket.OPEN) {
-    ElMessage.error('请先连接 WebSocket 后再运行用例');
-    return;
-  }
-  executing.value = true;
-  ws.send(JSON.stringify({ type: 'run_case', case_id: caseId }));
-}
-
-function hasExtraConclusion(report) {
-  if (!report.conclusion) return false;
-  // 只有最后一个步骤有 observation，且结论与它不同时，才需要显示结论段
-  const steps = report.steps || [];
-  const lastObs = steps.length > 0 ? (steps[steps.length - 1].observation || '').trim() : '';
-  const conclusion = (report.conclusion || '').trim();
-  // 结论含 "已完成步骤:" 说明是失败摘要，必须显示
-  if (conclusion.includes('已完成步骤:')) return true;
-  // 结论与最后一步的 observation 相同则隐藏
-  return conclusion !== lastObs;
-}
 function fmtDuration(ms) {
   if (!ms || ms <= 0) return '';
   if (ms < 1000) return ms + 'ms';
@@ -813,7 +889,7 @@ function handleEvent(data) {
       }
       break;
     case "status": wp?.addEntry({ type: "log", text: typeof content === 'object' ? JSON.stringify(content) : String(content) }); refreshSnapshot(); break;
-    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
+    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewUserRequest.value = content.user_request || ""; planReviewContract.value = content.verification_contract || null; if (planReviewContract.value) { planReviewSpanStatus.value = validateContractSpans(planReviewContract.value); } else { rebuildEditedContract(); } planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
     case "stream_token": wp?.onToken(); break;
@@ -838,12 +914,9 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
-if (activeMenu.value === 'cases') loadReports();
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewUserRequest.value = intr.user_request || ""; planReviewContract.value = intr.verification_contract || null; if (planReviewContract.value) { planReviewSpanStatus.value = validateContractSpans(planReviewContract.value); } else { rebuildEditedContract(); } planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
       wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports();
-      // 如果在用例中心，运行结束后刷新用例列表（更新 last_run_status）
-      if (activeMenu.value === 'cases') testCasePanelRef.value?.fetchCases();
       break;
     case "error": wp?.addEntry({ type: "error", icon: "❌", text: typeof content === 'object' ? JSON.stringify(content) : String(content) }); executing.value = false; stopping.value = false; currentThreadId.value = ""; break;
     default: wp?.addEntry({ type: "log", text: "[" + type + "] " + JSON.stringify(content).substring(0, 200) });
@@ -1053,7 +1126,7 @@ async function confirmIdentities() {
     return;
   }
   try {
-    await fetch("/api/element_identities/confirm", {
+    await fetch("/api/locator_knowledge/confirm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ identities: confirmed }),
@@ -1071,12 +1144,16 @@ async function confirmPlan(action) {
   planReviewVisible.value = false;
   executing.value = true;
 
+  // 确保 contract 反映最终编辑状态
+  rebuildEditedContract();
+
   const resumePayload = action === "cancel" ? "cancel" : {
     action: "confirm",
     goal: planReviewGoal.value,
     target_pages: planReviewPages.value.filter(p => p.trim()),
     verification: planReviewVerifications.value.filter(v => v.trim()),
     hints: planReviewHints.value.filter(h => h.trim()),
+    verification_contract: planReviewContract.value,
   };
 
   if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", text: action === "cancel" ? "目标已取消" : `目标已确认: ${planReviewGoal.value}` });
@@ -1154,26 +1231,23 @@ async function loadReports() {
 }
 
 async function openReportDetail(row) {
-  if (!row?.id) return;
+  if (!row?.run_id) return;
   try {
-    const res = await fetch(`/api/reports/${encodeURIComponent(row.id)}?t=${Date.now()}`, { cache: "no-store" });
+    const res = await fetch(`/api/reports/${encodeURIComponent(row.run_id)}?t=${Date.now()}`, { cache: "no-store" });
     const data = await res.json();
     if (data.status !== "success") { ElMessage.error(data.message || "读取失败"); return; }
     selectedReport.value = data.report || null;
     reportDetailVisible.value = true;
-    // 自动展开失败步骤
-    const failIndices = ((data.report || {}).steps || []).filter(s => s.status === 'fail').map(s => s.index);
-    expandedSteps.value = new Set(failIndices);
   } catch (e) {
     ElMessage.error(`读取失败: ${e}`);
   }
 }
 
 async function deleteReport(row) {
-  if (!row?.id) return;
+  if (!row?.run_id) return;
   try {
     await ElMessageBox.confirm(
-      `确定删除测试报告 "${row.id}"？\n将同时清理关联截图、运行日志和数据库记录。`,
+      `确定删除测试报告 "${row.run_id}"？\n将同时清理关联截图、运行日志和数据库记录。`,
       "删除确认",
       { type: "warning", confirmButtonText: "删除", cancelButtonText: "取消" }
     );
@@ -1181,13 +1255,13 @@ async function deleteReport(row) {
     return;
   }
   try {
-    const res = await fetch(`/api/reports/${encodeURIComponent(row.id)}`, { method: "DELETE" });
+    const res = await fetch(`/api/reports/${encodeURIComponent(row.run_id)}`, { method: "DELETE" });
     const data = await res.json();
     if (!res.ok || data.status !== "success") {
       ElMessage.error(data.message || "删除失败");
       return;
     }
-    if (selectedReport.value && selectedReport.value.id === row.id) {
+    if (selectedReport.value && selectedReport.value.run_id === row.run_id) {
       reportDetailVisible.value = false;
       selectedReport.value = null;
     }
@@ -1337,7 +1411,7 @@ function resetKbFilter() {
 
 function openKbDialog() {
   kbDialogMode.value = 'add';
-  kbForm.value = { app_package: '', knowledge_type: 'experience', content: '' };
+  kbForm.value = { app_package: '', knowledge_type: 'constraint', content: '' };
   kbDialogVisible.value = true;
 }
 
@@ -1347,7 +1421,7 @@ function editKbFromDetail() {
   kbDialogMode.value = 'edit';
   kbForm.value = {
     app_package: (row.metadata && row.metadata.app_package) || '',
-    knowledge_type: (row.metadata && row.metadata.knowledge_type) || 'experience',
+    knowledge_type: (row.metadata && row.metadata.knowledge_type) || 'constraint',
     content: row.content || '',
   };
   kbDetailVisible.value = false;
@@ -1355,7 +1429,7 @@ function editKbFromDetail() {
 }
 
 async function saveKb() {
-  if (!kbForm.value.app_package.trim() && kbForm.value.knowledge_type !== 'curated_rule') {
+  if (!kbForm.value.app_package.trim() && kbForm.value.knowledge_type !== 'constraint') {
     ElMessage.warning('请输入应用包名'); return;
   }
   if (!kbForm.value.content.trim()) { ElMessage.warning('请输入知识内容'); return; }

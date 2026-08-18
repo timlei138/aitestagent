@@ -4,7 +4,6 @@ import xml.etree.ElementTree as ET
 
 from device.perceiver import SmartPerceiver, UIElement
 
-
 # ── UIElement.label 单元素口径 ──
 
 
@@ -42,82 +41,6 @@ def test_label_suppress_flag_forces_empty():
 def _parse(xml: str) -> list[UIElement]:
     # parse_elements 不依赖 device，可直接用 None 实例化 SmartPerceiver。
     return SmartPerceiver(None).parse_elements(xml)
-
-
-# ── rag_hint 经验推断富集（不污染 label） ──
-
-
-class _FakeKB:
-    """迷你知识库：按 rid 叶子名返回推断语义。"""
-
-    def __init__(self, mapping: dict[str, str]):
-        self._mapping = mapping
-
-    def query_element_semantic(self, app_package: str, rid_tail: str) -> str:
-        return self._mapping.get(rid_tail, "")
-
-
-_RAG_XML = """
-<hierarchy>
-  <node class="android.widget.FrameLayout" bounds="[0,0][2560,1600]">
-    <node class="android.widget.ImageView"
-          resource-id="com.zui.calendar:id/overflow"
-          content-desc="更多选项" clickable="true" bounds="[2371,131][2443,203]"/>
-    <node class="android.widget.ImageView"
-          resource-id="com.zui.calendar:id/action_add_all_event"
-          clickable="true" bounds="[2119,131][2245,203]"/>
-    <node class="android.widget.ImageView"
-          resource-id="com.zui.calendar:id/action_back_today"
-          clickable="true" bounds="[2245,131][2371,203]"/>
-  </node>
-</hierarchy>
-"""
-
-
-def test_rag_hint_enriches_unlabeled_icons_without_touching_label():
-    # 无屏上标签但有 rid 的图标 → 按 rid 查知识库填 rag_hint；
-    # 关键：label 仍为空（不污染），有真实 label 的元素 rag_hint 为空。
-    perceiver = SmartPerceiver(None)
-    perceiver.attach_knowledge(
-        _FakeKB(
-            {
-                "action_add_all_event": "添加事件",
-                "action_back_today": "回到今天",
-            }
-        ),
-        lambda: "com.zui.calendar",
-    )
-    elements = perceiver.parse_elements(_RAG_XML)
-    by_rid = {e.resource_id.split("/")[-1]: e for e in elements if e.resource_id}
-    perceiver._enrich_rag_hints(elements)
-
-    assert by_rid["action_add_all_event"].label == ""
-    assert by_rid["action_add_all_event"].rag_hint == "添加事件"
-    assert by_rid["action_back_today"].label == ""
-    assert by_rid["action_back_today"].rag_hint == "回到今天"
-    # 有真实 content-desc 的溢出菜单：label 保留，rag_hint 不覆盖
-    assert by_rid["overflow"].label == "更多选项"
-    assert by_rid["overflow"].rag_hint == ""
-
-
-def test_rag_hint_empty_when_kb_has_no_match():
-    # 知识库无该 rid 经验 → rag_hint 为空，行为与之前一致（仍靠 index 点）。
-    perceiver = SmartPerceiver(None)
-    perceiver.attach_knowledge(_FakeKB({}), lambda: "com.zui.calendar")
-    elements = perceiver.parse_elements(_RAG_XML)
-    by_rid = {e.resource_id.split("/")[-1]: e for e in elements if e.resource_id}
-    perceiver._enrich_rag_hints(elements)
-    assert by_rid["action_add_all_event"].rag_hint == ""
-    assert by_rid["action_back_today"].rag_hint == ""
-
-
-def test_rag_hint_noop_without_kb():
-    # 未挂载知识库时完全无副作用。
-    perceiver = SmartPerceiver(None)
-    elements = perceiver.parse_elements(_RAG_XML)
-    by_rid = {e.resource_id.split("/")[-1]: e for e in elements if e.resource_id}
-    perceiver._enrich_rag_hints(elements)
-    assert by_rid["action_add_all_event"].rag_hint == ""
 
 
 def test_duplicate_content_desc_all_suppressed():

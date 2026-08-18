@@ -26,10 +26,6 @@ class ToolContext:
     vision_base_url: str | None = None
     # 视觉调用超时秒数，对应 config.vision_timeout
     vision_timeout: int = 60
-    # M4：确定性断言（assert_page_contains/assert_element_exists）作为 ground truth
-    # 参与 assert_verification 结果核实。默认「仅证据」（annotate 不改判定）；
-    # 置 True 时开启「硬核实」——代码核实与模型判定冲突时按代码结果修正。
-    deterministic_verification_override: bool = False
     # L3 kill switch：点击策略分流
     # legacy: 精确参数不存在时走语义搜索；native_strict: 精确参数不存在→AMBIGUOUS
     click_mode: str = "legacy"
@@ -40,9 +36,7 @@ class ToolContext:
     _click_preferences: dict[str, Any] = field(
         default_factory=dict, repr=False
     )  # RAG 解析出的点击偏好（仅当前 run）
-    _last_screenshot_path: str = (
-        ""  # perceive() cache miss 时自动存盘的截图路径，assert_verification 失败时回退
-    )
+    _last_screenshot_path: str = ""  # perceive() cache miss 时自动存盘的截图路径
     # RAG 查询缓存与观测计数器
     _rag_query_cache: dict[str, str] = field(default_factory=dict, repr=False)
     _rag_query_count: int = 0
@@ -59,9 +53,13 @@ class ToolContext:
     # 格式：{"permission": "camera", "action": "deny", "set_time": <monotonic>}
     # 空 dict = 未设置；TTL 120s 自动过期（click.py 内部检查）。
     _permission_intent: dict = field(default_factory=dict, repr=False)
-    # M4：确定性断言结果记录（{"text","kind","result": "pass"/"fail"}），
-    # assert_verification 反查最近一条与验证项匹配的确定性核实作为 ground truth。
-    _deterministic_checks: list = field(default_factory=list, repr=False)
+    # Phase 1: current-run typed evidence consumed by verification contracts.
+    _evidence_events: list = field(default_factory=list, repr=False)
+    _verification_contract: dict = field(default_factory=dict, repr=False)
+    _clause_state: dict = field(default_factory=dict, repr=False)
+    # Current-run typed actions are the sole source for plan extraction.
+    _action_events: list = field(default_factory=list, repr=False)
+    _execution_mode: str = "explore"
     # unknown 验证返回过的当前页相关可交互事实签名，避免同页重复提示。
     _verification_interactive_facts_seen: set[str] = field(
         default_factory=set, repr=False
@@ -96,12 +94,11 @@ class ToolContext:
         repr=False,
     )
 
-
     @property
     def screen_size(self) -> tuple[int, int]:
         """懒加载并缓存屏幕分辨率。设备运行期分辨率不变，只需 snapshot() 一次。
         _query_known_identities 和 click 兜底都通过此属性获取当前屏幕尺寸，
-        用于 query_element_identity(target_screen=...) 的 bounds 百分比换算。
+        用于当前屏幕元素定位与点击兜底。
         """
         if self._screen_size is None:
             try:

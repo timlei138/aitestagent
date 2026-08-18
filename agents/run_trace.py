@@ -22,6 +22,39 @@ from tools.results import parse_status
 logger = logging.getLogger(__name__)
 
 
+def compute_resolution_metrics(tool_log: list[dict[str, Any]] | None) -> dict[str, int]:
+    """Phase 4 locator 解析指标：从工具日志汇总 exact/semantic 解析次数 + 标签错配次数。
+
+    - resolution_type == "exact"    → exact_resolution_count
+    - resolution_type == "semantic"  → semantic_resolution_count
+    - fuzzy_match (标签错配) 且请求/命中 label 都非空 → label_mismatch_count
+
+    空 label 不计入 mismatch（修复「空 label 被当作 mismatch」的统计偏差；
+    click 工具已保证双方非空才置 fuzzy_match）。
+    """
+    exact_resolution_count = 0
+    semantic_resolution_count = 0
+    label_mismatch_count = 0
+    for e in tool_log or []:
+        if not isinstance(e, dict) or e.get("name") != "click":
+            continue
+        rtype = e.get("resolution_type", "")
+        if rtype == "exact":
+            exact_resolution_count += 1
+        elif rtype == "semantic":
+            semantic_resolution_count += 1
+        # 标签错配：仅当请求 label 与命中 label 都非空且不一致。
+        req = e.get("requested_label", "") or ""
+        res = e.get("resolved_label", "") or ""
+        if req and res and req != res:
+            label_mismatch_count += 1
+    return {
+        "exact_resolution_count": exact_resolution_count,
+        "semantic_resolution_count": semantic_resolution_count,
+        "label_mismatch_count": label_mismatch_count,
+    }
+
+
 def build_run_trace(
     *,
     run_id: str,
@@ -52,14 +85,19 @@ def build_run_trace(
             "observation": obs,
             "screenshot": e.get("screenshot_path", ""),
             "tool_input": e.get("tool_input", {}),
-            "replay_source": e.get("replay_source", ""),
-            "replay_step_idx": e.get("replay_step_idx", -1),
         }
         if e.get("name") == "click":
             step["match_mode"] = e.get("match_mode", "")
             step["fallback_used"] = bool(e.get("fallback_used", False))
+            step["resolution_type"] = e.get("resolution_type", "")
+            step["requested_label"] = e.get("requested_label", "")
+            step["resolved_label"] = e.get("resolved_label", "")
+            step["fuzzy_match"] = bool(e.get("fuzzy_match", False))
         steps.append(step)
 
+    # Phase 4 locator 解析指标：exact/semantic 解析次数 + 标签错配次数。
+    # 复用 compute_resolution_metrics（reporter 持久化同一份，避免逻辑分叉）。
+    resolution_metrics = compute_resolution_metrics(tool_log)
     return {
         "run_id": run_id,
         "created_at": datetime.now().isoformat(),
@@ -71,6 +109,7 @@ def build_run_trace(
             "duration_seconds": round(float(duration_seconds or 0), 2),
         },
         "metrics": metrics or {},
+        "resolution_metrics": resolution_metrics,
         "token_usage": token_usage or {},
         "verifications": verification_results or [],
         "step_count": len(steps),

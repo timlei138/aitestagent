@@ -136,6 +136,41 @@
 }
 .pr-footer { display: flex; justify-content: flex-end; gap: 10px; }
 
+.pr-request-text {
+  font-size: 14px; color: var(--text-secondary);
+  padding: 10px 12px; background: #f5f7fa;
+  border-radius: var(--radius-sm); line-height: 1.5;
+}
+.pr-coverage-section {
+  margin-top: 12px; padding: 10px 12px;
+  background: #fafbfc; border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+}
+.pr-verification-item { margin-bottom: 12px; }
+.pr-verification-item:last-child { margin-bottom: 0; }
+.pr-verification-header {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 14px; font-weight: 600; color: var(--text-primary);
+  margin-bottom: 6px;
+}
+.pr-verification-meta {
+  display: flex; gap: 12px; font-size: 12px; color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.pr-clause-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; margin-bottom: 4px;
+  background: #fff; border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.pr-clause-id {
+  font-family: monospace; color: var(--text-muted); min-width: 42px;
+}
+.pr-clause-claim { flex: 1; color: var(--text-secondary); }
+.pr-clause-span {
+  font-family: monospace; font-size: 12px; color: var(--text-muted);
+}
+
 /* ═══════════ Report Detail ═══════════ */
 .report-detail { max-height: 70vh; overflow-y: auto; }
 .report-header { margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid var(--line); }

@@ -3,11 +3,23 @@ base_url: https://api.deepseek.com
 perception_mode: ui_tree
 safety_level: strict
 click_mode: legacy
-# 回放执行器: llm=由 LLM 按脚本指令执行; direct=代码确定性直执行(默认)
-replay_executor: direct
 context_history_steps: 5
 llm_vision_capable: false
 # 视觉备用模型（当主模型不是多模态时启用）
 vision_model: qwen3.7-plus
 vision_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 vision_timeout: 60
+
+# Phase 3: 计划执行与环境兼容
+# fixture 指纹占位符；真实 fixture 生命周期指纹接入前保持默认值。
+fixture_profile: default
+# 动作质量每日衰减系数（0 表示不衰减）。
+quality_decay_lambda: 0.01
+# plan action 平均质量低于此值时撤销 direct 准入。
+direct_quality_threshold: 0.5
+# 环境兼容分不低于此值时才允许进入 guided（1.0 等价于精确匹配）。
+environment_guided_threshold: 0.7
+# 同一兼容键下至少累计成功运行 N 次，才允许进入 direct（Plan 4.1 连续 N 次准入）。
+direct_min_runs: 2
+# 每个动作 postcondition 通过率不低于此值时，才满足 direct 全动作对齐闸门。
+direct_postcond_rate_threshold: 0.8

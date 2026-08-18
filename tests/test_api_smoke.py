@@ -1,12 +1,15 @@
+import pytest
+
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
-from pathlib import Path
-import json
 import uuid
 
 from api.server import app, _get_relational_db
 import app_paths
 
 client = TestClient(app)
+client.get("/")
 
 
 def test_run_endpoint_returns_result():
@@ -33,8 +36,7 @@ def test_ws_run_flow():
     with client.websocket_connect("/ws/chat") as ws:
         ws.send_json({"type": "run", "message": "检查 Settings 的 Wi-Fi 开关"})
         msg = ws.receive_json()
-        # 至少收到 status 或 result 类型的消息
-        assert msg.get("type") in {"status", "result", "error"}
+        assert msg.get("type") in {"run_started", "status", "result", "error"}
 
 
 def test_reports_list_endpoint():
@@ -52,38 +54,18 @@ def test_report_delete_endpoint_cleans_artifacts():
     shot_abs = app_paths.SCREENSHOT_DIR / run_id / "1_test.png"
     shot_abs.parent.mkdir(parents=True, exist_ok=True)
     shot_abs.write_bytes(b"fakepng")
-    shot_rel = f"storage/screenshots/{run_id}/1_test.png"
-
     log_abs = app_paths.LOG_RUN_DIR / f"000000_{run_id}_langchain.log"
     log_abs.parent.mkdir(parents=True, exist_ok=True)
     log_abs.write_text("fake log", encoding="utf-8")
 
-    db.record_test_run(
+    db.record_execution_run(
         run_id=run_id,
         user_request="pytest cleanup",
         app_package="com.demo.app",
-        app_name="demo",
-        status="fail",
-        conclusion="ABORT: pytest",
-        steps=[
-            {
-                "index": 1,
-                "action_type": "click",
-                "status": "fail",
-                "screenshot_path": shot_rel,
-            }
-        ],
-        duration_seconds=1.0,
-        execution_status="error",
-        test_verdict="inconclusive",
-        verification_json=json.dumps(
-            [{"item": "x", "result": "failed", "screenshot": shot_rel}],
-            ensure_ascii=False,
-        ),
-    )
-    db.insert(
-        "human_decisions",
-        {"run_id": run_id, "step_index": 1, "question": "q", "decision": "d", "created_at": "pytest"},
+        goal={"goal": "pytest cleanup"},
+        verification_contract={"status": "approved", "verifications": []},
+        verdict="inconclusive",
+        terminal_reason="pytest",
     )
 
     response = client.delete(f"/api/reports/{run_id}")
@@ -93,8 +75,4 @@ def test_report_delete_endpoint_cleans_artifacts():
 
     assert not shot_abs.exists()
     assert not log_abs.exists()
-    assert db.get_test_run(run_id) is None
-    left = db.execute(
-        "SELECT COUNT(*) FROM human_decisions WHERE run_id = ?", (run_id,)
-    ).fetchone()[0]
-    assert left == 0
+    assert db.get_execution_run(run_id) is None

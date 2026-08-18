@@ -55,18 +55,17 @@ from tools.device_ops import (
 )
 from tools.knowledge_tools import (
     _experience_relevance,
-    query_app_knowledge,
-    query_element_identity,
+    request_knowledge,
+    query_locator_knowledge,
 )
 from tools.verify import (
-    _normalize_verification_text,
-    _resolve_verification_key,
     assert_element_exists,
+    assert_behavior_effect,
+    assert_page_state,
     assert_page_contains,
-    assert_verification,
     log_step,
-    report_done,
     save_screenshot,
+    terminate_run,
 )
 from tools.perceive_tools import (
     check_page_health,
@@ -94,11 +93,9 @@ from tools.click import (
     _has_meaningful_ui_elements,
     _is_expected_destination,
     _is_target_consistent,
-    _maybe_promote_exact_rule,
     _post_click_snapshot,
     _query_known_by_rid,
     _query_known_identities,
-    _record_page_transition,
     _rid_matches,
     _save_click_identity,
     _score_known_identity,
@@ -245,7 +242,9 @@ def _append_panel_summary(
             if getattr(element, "region", "main_content") == name
         ]
         panel_clickables = [
-            element for element in panel_elements if getattr(element, "clickable", False)
+            element
+            for element in panel_elements
+            if getattr(element, "clickable", False)
         ]
         panel_indexes = [
             index
@@ -272,9 +271,9 @@ def _append_panel_summary(
         if name == "right_content" and unlabeled:
             example = unlabeled[0]
             example_index = indexed_clickables.index(example)
-            example_class = (
-                (getattr(example, "class_name", "") or "").split(".")[-1] or "?"
-            )
+            example_class = (getattr(example, "class_name", "") or "").split(".")[
+                -1
+            ] or "?"
             example_path = getattr(example, "context_path", "") or "?"
             lines.append(
                 f"  ! 右侧存在 {len(unlabeled)} 个无文本可点击元素；"
@@ -285,9 +284,7 @@ def _append_panel_summary(
                 f"bounds={getattr(example, 'bounds', ())} path={example_path}"
             )
         elif name == "right_content" and panel_elements and not panel_clickables:
-            lines.append(
-                "  ! 右侧内容区没有真实可点击元素；不要改用左侧导航的 [n]。"
-            )
+            lines.append("  ! 右侧内容区没有真实可点击元素；不要改用左侧导航的 [n]。")
 
 
 def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
@@ -315,9 +312,6 @@ def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
         extra += f" switch_state={state}"
     if ctx_path:
         extra += f" path='{ctx_path}'"
-    rag_hint = getattr(item, "rag_hint", "") or ""
-    if rag_hint and rag_hint != item.label:
-        extra += f" (经验推断:{rag_hint})"
     idx_prefix = f"[{clickable_index}] " if clickable_index is not None else ""
     label = (getattr(item, "label", "") or "").strip() or "<无文本>"
     return (
@@ -370,13 +364,13 @@ def find_element(description: str) -> str:
 
 PLANNER_TOOLS: list[Any] = [
     get_screen_info,
-    query_app_knowledge,
+    request_knowledge,
 ]
 
 AGENT_TOOLS: list[Any] = [
     get_screen_info,
-    query_app_knowledge,
-    query_element_identity,
+    request_knowledge,
+    query_locator_knowledge,
     click,
     navigate_to,
     scroll_find_and_click,
@@ -411,8 +405,9 @@ AGENT_TOOLS: list[Any] = [
     recover_from_anomaly,
     assert_page_contains,
     assert_element_exists,
-    assert_verification,
-    report_done,
+    assert_behavior_effect,
+    assert_page_state,
+    terminate_run,
 ]
 
 # ── 内部辅助 ──

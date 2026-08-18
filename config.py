@@ -82,10 +82,19 @@ class TestConfig:
     #   是下线 ~500 行 legacy 语义匹配代码的前置开关。
     click_mode: str = "legacy"
 
-    # ── 回放执行器 ──
-    # llm:    脚本步骤由 LLM 按指令执行（保守，先用于验证状态机与闸门）。
-    # direct: 脚本步骤由代码确定性直执（不调主 LLM），LLM 仅在 recovery 接管。
-    replay_executor: str = "direct"
+    # ── Phase 3: 计划执行与环境兼容 ──
+    # fixture 指纹占位符；真实 fixture 生命周期指纹接入前使用稳定配置值。
+    fixture_profile: str = "default"
+    # 动作质量每日衰减系数（0 表示不衰减）。
+    quality_decay_lambda: float = 0.01
+    # plan action 平均质量低于此值时撤销 direct 准入。
+    direct_quality_threshold: float = 0.5
+    # 环境兼容分不低于此值时才允许进入 guided（1.0 等价于精确匹配）。
+    environment_guided_threshold: float = 0.7
+    # 同一兼容键下至少累计成功运行 N 次，才允许进入 direct（Plan 4.1 连续 N 次准入）。
+    direct_min_runs: int = 2
+    # 每个动作 postcondition 通过率不低于此值时，才满足 direct 全动作对齐闸门。
+    direct_postcond_rate_threshold: float = 0.8
 
     # ──────────────── YAML 加载 ────────────────
 
@@ -118,7 +127,7 @@ class TestConfig:
 
         # 回退到 app_paths 默认路径
         if not config.rag_persist_dir:
-            config.rag_persist_dir = app_paths.KNOWLEDGE_DIR_STR
+            config.rag_persist_dir = app_paths.KNOWLEDGE_V2_DIR_STR
         elif not os.path.isabs(config.rag_persist_dir):
             # 相对路径 → 转为 AppData 下的绝对路径
             config.rag_persist_dir = str(app_paths.DATA_DIR / config.rag_persist_dir)

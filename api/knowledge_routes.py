@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+SEMANTIC_KNOWLEDGE_TYPES = {"constraint", "negative_knowledge", "semantic_hint"}
 
 # 全局 KnowledgeBase 实例由 server.py 注入
 _kb_instance = None
@@ -50,40 +51,11 @@ class SearchRequest(BaseModel):
     top_k: int = 10
 
 
-def _normalized_curated_args(entry: KnowledgeEntry) -> dict[str, Any]:
-    if entry.knowledge_type == "curated_rule":
-        scope = (entry.metadata or {}).get("scope", "")
-        if not scope:
-            scope = "universal" if not entry.app_package else "app"
-        try:
-            quality_score = float((entry.metadata or {}).get("quality_score", 1.0))
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="quality_score 必须是数字") from exc
-        return {
-            "app_package": entry.app_package,
-            "content": entry.content,
-            "scope": scope,
-            "reviewed_by": (entry.metadata or {}).get("reviewed_by", "api"),
-            "domain": (entry.metadata or {}).get("domain", ""),
-            "scenario": (entry.metadata or {}).get("scenario", ""),
-            "quality_score": quality_score,
-            "app_version": (entry.metadata or {}).get("app_version", ""),
-            "last_verified_at": (entry.metadata or {}).get("last_verified_at", ""),
-            "applicable_domains": (entry.metadata or {}).get("applicable_domains"),
-        }
-    return {}
-
-
 def _save_entry(kb, entry: KnowledgeEntry) -> None:
     from data.knowledge import UIKnowledge
 
-    if entry.knowledge_type == "curated_rule":
-        args = _normalized_curated_args(entry)
-        try:
-            kb.save_curated_rule(**args)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return
+    if entry.knowledge_type not in SEMANTIC_KNOWLEDGE_TYPES:
+        raise HTTPException(status_code=400, detail="不支持的 knowledge_type")
 
     knowledge = UIKnowledge(
         app_package=entry.app_package,
@@ -108,12 +80,15 @@ def get_count():
 def search_knowledge(req: SearchRequest):
     """语义搜索知识库。"""
     kb = _get_kb()
-    results = kb.query(
-        req.query,
-        app_package=req.app_package,
-        knowledge_type=req.knowledge_type,
-        top_k=req.top_k,
-    )
+    try:
+        results = kb.query(
+            req.query,
+            app_package=req.app_package,
+            knowledge_type=req.knowledge_type,
+            top_k=req.top_k,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "success", "results": results, "total": len(results)}
 
 
@@ -126,11 +101,14 @@ def list_knowledge(
 ):
     """列出知识（默认返回最多 50 条，支持过滤）。"""
     kb = _get_kb()
-    results = kb.list_entries(
-        app_package=app_package,
-        knowledge_type=knowledge_type,
-        top_k=top_k,
-    )
+    try:
+        results = kb.list_entries(
+            app_package=app_package,
+            knowledge_type=knowledge_type,
+            top_k=top_k,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if query and query != "*":
         q = query.strip().lower()
         results = [r for r in results if q in str(r.get("content", "")).lower()]
@@ -139,7 +117,7 @@ def list_knowledge(
 
 @router.post("")
 def add_knowledge(entry: KnowledgeEntry):
-    """手动新增一条知识。curated_rule 类型走 save_curated_rule 以保证 scope 校验。"""
+    """手动新增一条已审核 v2 语义知识。"""
     kb = _get_kb()
     _save_entry(kb, entry)
     return {"status": "success", "message": "知识已添加"}
@@ -201,6 +179,8 @@ def delete_knowledge(
     - 批量删除：仅提供 app_package 和/或 knowledge_type。
     """
     kb = _get_kb()
+    if knowledge_type and knowledge_type not in SEMANTIC_KNOWLEDGE_TYPES:
+        raise HTTPException(status_code=400, detail="不支持的 knowledge_type")
     if entry_id:
         deleted = kb.backend.delete_by_ids([entry_id])
         return {"status": "success", "deleted": deleted}
@@ -254,7 +234,8 @@ async def get_knowledge_types():
     return {
         "status": "success",
         "types": [
-            {"value": "experience", "label": "操作经验"},
-            {"value": "curated_rule", "label": "人工知识"},
+            {"value": "constraint", "label": "执行约束"},
+            {"value": "negative_knowledge", "label": "已知禁止/失败模式"},
+            {"value": "semantic_hint", "label": "语义提示"},
         ],
     }

@@ -35,7 +35,9 @@ except Exception:
 
 
 @tool
-def visual_check(description: str) -> str:
+def visual_check(
+    description: str, verification_key: str = "", clause_id: str = ""
+) -> str:
     """基于截图进行视觉判断，返回结构化 JSON：decision/reason/evidence/confidence。"""
     from tools import _run_multimodal_from_context  # 延迟 import 避免循环依赖
 
@@ -68,14 +70,34 @@ def visual_check(description: str) -> str:
         strict_json=True,
         timeout_sec=getattr(ctx, "vision_timeout", 60),
     )
+    raw_data = result.get("data") or {}
+    confidence = str(raw_data.get("confidence", "") or "").lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "medium" if result.get("ok") else "low"
     payload = {
         "decision": (
             result.get("decision", "unknown") if result.get("ok") else "unknown"
         ),
         "reason": result.get("reason", "vision unavailable"),
         "evidence": result.get("evidence", ""),
-        "confidence": "medium" if result.get("ok") else "low",
+        "confidence": confidence,
     }
+    if verification_key and clause_id:
+        decision = str(payload["decision"] or "unknown").lower()
+        ctx._evidence_events.append(
+            {
+                "verification_key": verification_key,
+                "clause_id": clause_id,
+                "channel": "vision_verify",
+                "status": (
+                    "YES"
+                    if decision == "yes"
+                    else "NO" if decision == "no" else "UNKNOWN"
+                ),
+                "authoritative": decision == "no" and payload["confidence"] == "high",
+                "fact": payload,
+            }
+        )
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -939,7 +961,13 @@ def _parse_cell_response(data: dict, cols: int, rows: int) -> tuple[str, int] | 
 
 
 @tool
-def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
+def vision_tap(
+    description: str,
+    repeat: int = 1,
+    verify: str = "",
+    verification_key: str = "",
+    clause_id: str = "",
+) -> str:
     """基于截图让 vision 模型定位目标区域并点击。
 
     专用于 Canvas 绘制、滚轮选择器等 view tree 无法访问的 UI 元素。
@@ -1262,6 +1290,26 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
         "verify_decision": verify_decision,
         "verify_evidence": verify_evidence,
     }
+    if verification_key and clause_id and verify:
+        ctx._evidence_events.append(
+            {
+                "verification_key": verification_key,
+                "clause_id": clause_id,
+                "channel": "vision_verify",
+                "status": (
+                    "YES"
+                    if verify_decision == "yes"
+                    else "NO" if verify_decision == "no" else "UNKNOWN"
+                ),
+                "authoritative": False,
+                "fact": {
+                    "description": description,
+                    "verify": verify,
+                    "decision": verify_decision,
+                    "evidence": verify_evidence,
+                },
+            }
+        )
     return make_result(OK, base_msg, evidence)
 
 
@@ -1269,7 +1317,13 @@ def vision_tap(description: str, repeat: int = 1, verify: str = "") -> str:
 
 
 @tool
-def click_and_check(label: str, check_description: str, wait_ms: int = 500) -> str:
+def click_and_check(
+    label: str,
+    check_description: str,
+    wait_ms: int = 500,
+    verification_key: str = "",
+    clause_id: str = "",
+) -> str:
     """点击元素后立即截图并用 vision 验证。专用于捕获 toast 等瞬态 UI 提示。
 
     普通 visual_check 流程太慢（LLM 思考 + vision 推理 >> toast 显示时长），
@@ -1334,6 +1388,23 @@ def click_and_check(label: str, check_description: str, wait_ms: int = 500) -> s
     decision = data.get("decision", "unknown")
     reason = data.get("reason", "")
     evidence = data.get("evidence", "")
+
+    if verification_key and clause_id:
+        ctx._evidence_events.append(
+            {
+                "verification_key": verification_key,
+                "clause_id": clause_id,
+                "channel": "click_and_check",
+                "status": "PASS" if decision == "yes" else "UNKNOWN",
+                "authoritative": False,
+                "fact": {
+                    "label": label,
+                    "decision": decision,
+                    "reason": reason,
+                    "evidence": evidence,
+                },
+            }
+        )
 
     _logger.info(
         "[click_and_check] '%s' → decision=%s reason=%s",

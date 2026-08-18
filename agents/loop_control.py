@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from typing import Any
 
 
@@ -39,20 +40,64 @@ def _build_call_signature(name: str, args: dict, page_sig: str) -> str:
     return f"{name}|{args_norm}|{page_sig}"
 
 
-def _cooldown_group(name: str, args: dict, target: str = "") -> str:
+def _cooldown_group(name: str, args: dict, target: str = "", page_sig: str = "") -> str:
+    """Return a cooldown group key for semantically repeating actions.
+
+    The group key is ``tool|normalized_target|page_sig``. When ``page_sig`` is
+    ``unknown`` we return an empty group so that actions on different pages are
+    not accidentally collapsed into the same cooldown bucket.
+    """
+    if page_sig == "unknown":
+        return ""
     if name == "press_key" and str(args.get("key", "")).lower() == "back":
         return "nav_back"
     if name in ("swipe", "scroll_panel"):
         return "browse"
+
+    def _norm_text(value: Any) -> str:
+        return re.sub(r"\s+", "", str(value or "").lower())
+
     if name == "click":
-        txt = " ".join(
-            [
-                str(args.get("label", "") or ""),
-                str(args.get("target", "") or ""),
-                str(args.get("alternatives", "") or ""),
-                str(target or ""),
-            ]
+        parts = [
+            _norm_text(args.get(k, "") or "")
+            for k in ("label", "target", "alternatives")
+        ]
+        txt = "|".join(p for p in parts if p) or _norm_text(target)
+        if txt:
+            return f"click|{txt}|{page_sig}"
+        return ""
+
+    if name == "scroll_find_and_click":
+        txt = _norm_text(args.get("label", "") or args.get("target", "") or target)
+        if txt:
+            return f"scroll_find_and_click|{txt}|{page_sig}"
+        return ""
+
+    if name == "type_input":
+        txt = _norm_text(args.get("label", "") or args.get("target", "") or target)
+        if txt:
+            return f"type_input|{txt}|{page_sig}"
+        return ""
+
+    return ""
+
+
+def _cooldown_group_from_evidence(
+    name: str, args: dict, target: str, page_sig: str, evidence: dict[str, Any]
+) -> str:
+    """Post-invocation cooldown group for actions whose fuzzy/semantic nature
+    is only known after execution (e.g. click fuzzy_match).
+    """
+    if name == "click" and evidence.get("fuzzy_match"):
+        parts = [
+            re.sub(r"\s+", "", str(args.get(k, "") or "").lower())
+            for k in ("label", "target", "alternatives")
+        ]
+        txt = "|".join(p for p in parts if p) or re.sub(
+            r"\s+", "", str(target or "").lower()
         )
+        if txt and page_sig != "unknown":
+            return f"fuzzy_click|{txt}|{page_sig}"
     return ""
 
 
@@ -98,6 +143,43 @@ _DONE_PATTERN = re.compile(
     r"^(?:#{1,3}\s*)?(?:\*{1,2}|_{1,2})?(DONE|ABORT)\s*[:\uff1a]",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+def _detect_toggle_loop(
+    action_history: list[dict[str, Any]], window: int = 8, threshold: int = 3
+) -> tuple[bool, str]:
+    """Detect destructive toggle loops such as open/close/open on the same switch.
+
+    Unlike the consecutive-signature detector, this looks at the recent ``window``
+    actions and flags any target that is clicked ``threshold`` or more times on the
+    same page. Interleaved asserts/sensing do not hide the pattern.
+    """
+    recent = action_history[-window:] if action_history else []
+    keys: list[str] = []
+    for entry in recent:
+        name = entry.get("name") or entry.get("tool_name") or ""
+        if name != "click":
+            continue
+        args = entry.get("tool_input") or entry.get("args") or {}
+        page_sig = (
+            entry.get("page_after_signature")
+            or entry.get("page_after", {}).get("signature")
+            or ""
+        )
+        parts = [
+            re.sub(r"\s+", "", str(args.get(k, "") or "").lower())
+            for k in ("label", "target", "alternatives")
+        ]
+        txt = "|".join(p for p in parts if p)
+        if txt:
+            keys.append(f"click|{txt}|{page_sig}")
+    if not keys:
+        return (False, "")
+    counts = Counter(keys)
+    most_common = counts.most_common(1)[0]
+    if most_common[1] >= threshold:
+        return (True, most_common[0])
+    return (False, "")
 
 
 def _detect_termination(result: str) -> tuple[bool, bool]:

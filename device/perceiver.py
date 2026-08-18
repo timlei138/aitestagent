@@ -50,8 +50,9 @@ class UIElement:
     context_path: str = ""  # 上下文路径，例如 'right_content > WLAN > toggle_switch'
     is_container: bool = False  # 是否为结构性容器（LinearLayout/ViewGroup 等）
     has_switch_child: bool = False  # 是否包裹 Switch 类子控件（合并标记）
-    suppress_label: bool = False  # 同页面出现重复 label 时置 True，强制不给 label（不可信就不给）
-    rag_hint: str = ""  # 经验推断语义（按 rid 查知识库所得，非当前界面真实所见，仅供参考）
+    suppress_label: bool = (
+        False  # 同页面出现重复 label 时置 True，强制不给 label（不可信就不给）
+    )
 
     @property
     def label(self) -> str:
@@ -68,7 +69,6 @@ class UIElement:
         data = asdict(self)
         data["bounds"] = list(self.bounds)
         data["label"] = self.label
-        data["rag_hint"] = self.rag_hint
         return data
 
 
@@ -112,18 +112,31 @@ _SYSTEM_UI_PACKAGES = (
 )
 # 兜底：resource_id 后缀 / class 名（应对包名前缀缺失的边缘情况，
 # 同时覆盖 com.zui.launcher 下的任务栏/导航栏噪声——按后缀精确匹配，不误杀桌面图标）
-_SYSTEM_UI_RESOURCE_IDS = frozenset({
-    # systemui 常见后缀（包名前缀已覆盖，此处双重保险）
-    "status_bar", "system_icons", "notificationIcons",
-    "nav_buttons", "navigation_bar", "recent_apps",
-    # zui.launcher 任务栏噪声（桌面图标 rid 后缀不在此列，故安全）
-    "taskbar_container", "taskbar_scrim", "taskbar_bubbles_container",
-    "navbuttons_view", "stashed_handle", "start_contextual_buttons",
-})
-_SYSTEM_UI_CLASSES = frozenset({
-    "StatusBarWindowView", "NavigationBarWindowView",
-    "SystemBarsWindowView",
-})
+_SYSTEM_UI_RESOURCE_IDS = frozenset(
+    {
+        # systemui 常见后缀（包名前缀已覆盖，此处双重保险）
+        "status_bar",
+        "system_icons",
+        "notificationIcons",
+        "nav_buttons",
+        "navigation_bar",
+        "recent_apps",
+        # zui.launcher 任务栏噪声（桌面图标 rid 后缀不在此列，故安全）
+        "taskbar_container",
+        "taskbar_scrim",
+        "taskbar_bubbles_container",
+        "navbuttons_view",
+        "stashed_handle",
+        "start_contextual_buttons",
+    }
+)
+_SYSTEM_UI_CLASSES = frozenset(
+    {
+        "StatusBarWindowView",
+        "NavigationBarWindowView",
+        "SystemBarsWindowView",
+    }
+)
 
 
 def _is_system_ui_noise(el) -> bool:
@@ -159,15 +172,9 @@ class SmartPerceiver:
         settle_stable_count: int = 2,
         settle_poll_interval: float = 0.3,
         screenshot_async: bool = True,
-        knowledge_base: Any | None = None,
-        get_app_package: Callable[[], str] | None = None,
     ):
         self.device = device
         self._vision_call = vision_call
-        # 经验推断富集：knowledge_base 可为实例或惰性 callable（避免构造顺序问题）；
-        # get_app_package 返回当前 App 包名。两者均按需、非强制。
-        self._kb = knowledge_base
-        self._get_app_package = get_app_package
         self._screenshot_sink = screenshot_sink
         # R5: cache-miss 截图写盘放到后台线程，移出感知关键路径（降单步延迟/缩小 R1 竞态窗口）
         self._screenshot_async = screenshot_async
@@ -202,10 +209,7 @@ class SmartPerceiver:
         xml = self.device.dump_hierarchy()
         last_hash = hashlib.md5(xml.encode()).hexdigest()
         consecutive = 1
-        while (
-            consecutive < self._settle_stable_count
-            and time.monotonic() < deadline
-        ):
+        while consecutive < self._settle_stable_count and time.monotonic() < deadline:
             time.sleep(self._settle_poll_interval)
             xml = self.device.dump_hierarchy()
             h = hashlib.md5(xml.encode()).hexdigest()
@@ -215,61 +219,6 @@ class SmartPerceiver:
                 consecutive = 1
                 last_hash = h
         return xml
-
-    def attach_knowledge(
-        self,
-        knowledge_base: Any | None,
-        get_app_package: Callable[[], str] | None = None,
-    ) -> None:
-        """延后挂载知识库（避免与 KB/device 的构造顺序耦合）。
-
-        knowledge_base 可为 KnowledgeBase 实例，或返回实例的惰性 callable。
-        """
-        self._kb = knowledge_base
-        if get_app_package is not None:
-            self._get_app_package = get_app_package
-
-    def _resolve_kb(self) -> Any | None:
-        kb = self._kb
-        if callable(kb):
-            try:
-                kb = kb()
-            except Exception:
-                kb = None
-        return kb
-
-    def _enrich_rag_hints(self, elements: list[UIElement]) -> None:
-        """经验推断补充：对「无屏上标签但有 resource-id」的控件，按 rid 叶子名查知识库，
-
-        给出「经验推断」语义（如 action_add_all_event → 添加事件）。
-
-        关键约束：这是 *推断*，不是当前界面真实所见，绝不写入 label
-        （label 仍严格等于屏上真实语义，为空即「没有就不给」）。只填 rag_hint，
-        供 LLM 按 index 识别，不参与自动点击匹配。知识库缺数据或查询失败时
-        rag_hint 为空，行为与现在完全一致。
-        """
-        kb = self._resolve_kb()
-        if kb is None or not callable(self._get_app_package):
-            return
-        try:
-            package = self._get_app_package() or ""
-        except Exception:
-            return
-        if not package:
-            return
-        for el in elements:
-            if el.label or not el.resource_id:
-                continue
-            rid_tail = el.resource_id.split("/")[-1]
-            if not rid_tail:
-                continue
-            try:
-                hint = kb.query_element_semantic(package, rid_tail)
-            except Exception:
-                hint = ""
-            if hint:
-                el.rag_hint = hint
-                self.logger.debug("rag 提示 | rid=%s → '%s'", el.resource_id, hint)
 
     def perceive(self, force_vision: bool = False) -> PageUnderstanding:
         # 短时缓存：相同页面+相同mode + 3秒内直接返回
@@ -288,12 +237,9 @@ class SmartPerceiver:
         # T6: 过滤系统 UI 噪声（状态栏/导航栏/通知栏等），只按元素自身
         # resource-id/class 判断，不影响挂在系统容器下的 App 内容与权限弹窗。
         elements = [e for e in elements if not _is_system_ui_noise(e)]
-        # 经验推断补充：无屏上标签但有 rid 的控件，按 rid 查知识库填充 rag_hint
-        # （不污染 label，仅供 LLM 参考）。知识库缺数据时无副作用。
-        self._enrich_rag_hints(elements)
         page_title = self._extract_page_title(xml)
         snapshot = self.device.snapshot()
-        # ── 截图存盘：perceive cache miss 时顺带存磁盘，供 assert_verification 复用（零额外截图调用）
+        # ── 截图存盘：perceive cache miss 时顺带存盘（零额外截图调用）
         try:
             if snapshot.image_base64:
                 app_paths.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -340,9 +286,7 @@ class SmartPerceiver:
             import hashlib as _hashlib
 
             img_hash = (
-                _hashlib.md5(vision_b64.encode()).hexdigest()
-                if vision_b64
-                else ""
+                _hashlib.md5(vision_b64.encode()).hexdigest() if vision_b64 else ""
             )
             if (
                 img_hash
@@ -699,10 +643,7 @@ class SmartPerceiver:
             return []
 
         centers = sorted(
-            {
-                int((element.bounds[0] + element.bounds[2]) / 2)
-                for element in candidates
-            }
+            {int((element.bounds[0] + element.bounds[2]) / 2) for element in candidates}
         )
         if len(centers) < 2:
             return []
@@ -1179,7 +1120,11 @@ class SmartPerceiver:
                 # 提升语义信息到父（向后兼容）
                 if not parent_el.associated_label and switch_el.associated_label:
                     parent_el.associated_label = switch_el.associated_label
-                if parent_el.checked is None and switch_el.checked is not None:
+                # 只要子 Switch 有 checked，就覆盖父——部分 ROM 会在父容器上残留
+                # 硬编码的 checked="false"（如 Lenovo 设置页的 WLAN 行），若只按
+                # parent_el.checked is None 才复制，父会永远停在 false，导致
+                # switch_state 与真实开关状态相反。
+                if switch_el.checked is not None:
                     parent_el.checked = switch_el.checked
                 parent_el.has_switch_child = True
                 # 保留子 Switch：让 LLM 能精确点击 + _check_switch_state 直接读原生 checked
