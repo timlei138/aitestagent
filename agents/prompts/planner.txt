@@ -36,6 +36,20 @@
 - 每个子场景在 verification 中对应独立验证项
 - hints 中说明各场景的先后顺序
 
+## 最小化验证原则（重要）
+verification 只验证「用户预期结果中声明的目标状态是否达成」，不要把目标状态自然隐含的「可交互性」拆成额外的具体操作验证：
+- 当预期结果是「打开/进入/弹出/显示某界面或选择器」时，该界面出现即视为达成，**不要**再生成「并实际选择/点击进入下一页/完成后续动作」之类的子验证点。例如「打开相机」只需验证相机界面出现；「从图库导入弹出照片选择器」只需验证照片选择器出现且显示缩略图，不要要求真的选一张照片并进入裁剪页。
+- 每个验证项的 clause 应描述「终态/可见状态」，而非「需要执行的操作序列」。避免用「并能…」「并点击…」「并进入…」这类诱导额外步骤的措辞。
+- 若用户原文确实要求完成某后续动作（如「选择某张照片并完成导入」），才生成对应子验证点。
+- 目的：避免 Agent 为证明「可交互」而过做无关步骤，也避免把简单用例复杂化。
+
+## UI Tree 优先，避免视觉（重要）
+视觉模型（VLM）调用**又贵又慢**，只在 UI Tree 确实无法判定时才允许使用：
+- 验证「界面已打开 / 进入某页面 / 弹出某选择器 / 当前 activity」这类目标时，**首选 UI Tree 的 page_state（activity 名称或页面关键节点）断言**，例如 `assert_page_state` / 检查当前 activity，而**不要**生成依赖 `visual_check` 的验证点。图库选择器、相机、权限弹窗等系统界面都能通过 activity 名直接从 UI Tree 判定，绝不需要视觉确认。
+- 只有当目标状态依赖**自绘/渲染内容 UI Tree 无法表达**（如某图标是否点亮、某图片是否显示正确、颜色/样式变化）时，才允许使用 `visual_check`。
+- planner 生成验证点时，默认把证据通道排成「page_state / element_state / behavior_effect 优先，vision_verify 殿后」；不要让 vision_verify 成为某 clause 的唯一或首选证据通道。
+- 目的：降低 token 成本与单步耗时，同时避免 VLM 偶发调用失败导致可见即达成的目标被误判为未达成。
+
 ## 开关/状态切换类验收（重要）
 
 当验证对象是「开关 / 勾选 / 选中 / 开关类状态」这类**可切换**功能时，验收要以**当前状态为基准**，不要写死方向：
@@ -45,13 +59,16 @@
 - **hints 用对称流程**，两个方向都覆盖，不要只写一个方向：
   1. 先读当前开关状态（get_screen_info 的 switch_state / checked）
   2. 点击开关切到相反状态
-  3. 等待 3-4 秒让开关稳定（部分设备关→开需要 3-4 秒才能真正生效），再用 assert_behavior_effect 的 toggled(开关, on|off) 验证相反状态成立
-- 例：当前是关就验证「切到开」，当前是开就验证「切到关」。
+  3. 等待 3-4 秒让开关稳定（部分设备关→开需要 3-4 秒才能真正生效），再用 `assert_behavior_effect` 验证相反状态成立。**必须写完整 DSL 形式，label 填该开关在界面上的真实名称（如 WLAN），并带 on/off**：例如 `assert_behavior_effect("toggled(WLAN, on)")` 或 `assert_behavior_effect("toggled(WLAN, off)")`。**严禁使用裸 `toggled` 或 `toggled(开关, on|off)` 这类占位形式**——裸 `toggled` 会被工具拒绝并报错（回退到 visual_check），占位 `开关` 不是真实控件名会导致验证失败。
+- 例：当前是关就验证「切到开」→ `assert_behavior_effect("toggled(WLAN, on)")`；当前是开就验证「切到关」→ `assert_behavior_effect("toggled(WLAN, off)")`。
 
 ## 权限双分支拆分（重要）
 
 **全局初始化（必须最先执行，不可省略）：**
-Agent 进入 App 后、在任何交互操作之前，第一步必须调 `set_permission_intent(action="deny")` 建立「全部未授予」的干净基线。
+Agent 进入 App 后、在任何交互操作之前，按以下顺序执行：
+1. `launch_app("包名", force_fresh=True)` 先冷启动到 App 首页，确保从干净起点出发（消除上一轮/异常残留页面栈）。这一步由 Agent 自行调度，不要依赖外部预启动。
+2. 再调 `set_permission_intent(action="deny")` 建立「全部未授予」的干净基线。
+- **禁止在初始化阶段使用 `set_runtime_permission(grant)` 预授权**——它会一刀切 grant 所有权限（含 camera/storage），污染后续拒绝路径的前提，导致"测拒绝但权限已被授"的雪崩。
 - **禁止在初始化阶段使用 `set_runtime_permission(grant)` 预授权**——它会一刀切 grant 所有权限（含 camera/storage），污染后续拒绝路径的前提，导致"测拒绝但权限已被授"的雪崩。
 - 初始化阶段如遇 App 基础权限弹窗（如"日历需要使用以下权限"），deny intent 会让 auto-handler 自动拒绝；如遇系统 GrantPermissionsActivity 弹窗，同样被 auto-deny 接住。
 - 允许分支在该分支测试点才授予（intent=grant 或 set_runtime_permission(grant) 兑底），不在初始化阶段提前授。
@@ -88,7 +105,7 @@ Agent 进入 App 后、在任何交互操作之前，第一步必须调 `set_per
 
 ## Agent 可用工具
 Agent 有以下快捷工具，hints 中应直接提示使用工具名，不要建议手动操作：
-- `launch_app("名称")` — 直接启动应用（最快）
+- `launch_app("名称", force_fresh=True)` — **每轮用例开头先用它冷启动到首页**，建立干净起点；后续如需重启 App 也用它（不要依赖外部预启动）
 - `paste()` — 粘贴剪贴板内容（系统CTRL+V，无需操作弹窗）
 - `long_press("元素")` — 长按触发菜单
 - `open_quick_settings()` — 打开控制中心

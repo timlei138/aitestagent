@@ -64,11 +64,14 @@ def test_contract_ignores_undeclared_or_free_text_evidence():
 
 
 def test_default_channels_for_switch_state_claims():
-    """状态/开关类 claim 优先用行为 + 视觉验证，避免 element_state/page_state。
+    """状态/开关类 claim 用行为 + 视觉 + 页面态 + 元素态验证。
 
-    element_state/page_state 依赖 Accessibility ``checked`` 属性，在不同 ROM 上不可靠，
-    且容易诱导 agent 反复开关同一个控件去「补证据」。因此 state claim 的默认通道只保留
-    behavior_effect（操作是否产生预期结果）和 vision_verify（视觉状态）。
+    说明（修订自原设计）：原设计刻意排除 page_state/element_state，理由是 Accessibility
+    ``checked`` 属性在不同 ROM 上不可靠、易诱导 agent 反复开关补证据。但 ``checked`` 不可靠
+    只是 element_state 的一种取值（开关勾选）；而 page_state（落到预期 Activity/包）与
+    element_exists（目标元素存在）是可靠的正向证据。评估器只负责「承认已观测到的证据」，
+    并不驱动 agent 去收集——因此把这两个通道纳入评估匹配，可避免「前端显示已通过、但
+    run 被判 inconclusive」的不一致（见 2026-08-18 日志复盘）。
     """
     switch_claims = [
         "Wi-Fi开关可正常打开",
@@ -82,8 +85,9 @@ def test_default_channels_for_switch_state_claims():
         channels = _default_channels_for_claim(claim)
         assert "vision_verify" in channels, f"{claim!r} 缺少 vision_verify"
         assert "behavior_effect" in channels, f"{claim!r} 缺少 behavior_effect"
-        assert "element_state" not in channels, f"{claim!r} 不应包含 element_state"
-        assert "page_state" not in channels, f"{claim!r} 不应包含 page_state"
+        # page_state / element_state 现作为可靠正向证据被纳入（非 checked 属性本身）
+        assert "page_state" in channels, f"{claim!r} 应纳入 page_state"
+        assert "element_state" in channels, f"{claim!r} 应纳入 element_state"
 
 
 def test_default_channels_for_text_claims():
@@ -94,11 +98,16 @@ def test_default_channels_for_text_claims():
 
 
 def test_default_fallback_channels_have_producers():
-    """完全无 marker 命中的 claim，fallback 只能包含有生产者的通道。"""
+    """完全无 marker 命中的 claim，fallback 包含全部有生产者的通道（含 page/element_state）。"""
     channels = _default_channels_for_claim("something totally unknown xyz")
-    assert set(channels) == {"ui_text", "vision_verify", "click_and_check", "behavior_effect"}
-    assert "element_state" not in channels
-    assert "page_state" not in channels
+    assert set(channels) == {
+        "ui_text",
+        "vision_verify",
+        "click_and_check",
+        "behavior_effect",
+        "page_state",
+        "element_state",
+    }
 
 
 def test_contract_authoritative_failure_is_failed():
@@ -152,7 +161,9 @@ def test_generated_contract_requires_review_before_execution():
 def test_visual_claim_requires_vision_evidence():
     contract = build_verification_contract({"verification": ["时间文本为红色"]})
     clause = contract["verifications"][0]["clauses"][0]
-    assert clause["channels"] == ["vision_verify"]
+    # 视觉 claim 仍以 vision_verify 为核心，同时接受 page_state/element_state 作为可靠正向证据
+    assert "vision_verify" in clause["channels"]
+    assert set(clause["channels"]) == {"vision_verify", "page_state", "element_state"}
 
     result = evaluate_verification(
         {**contract, "status": "approved"},
@@ -180,7 +191,8 @@ def test_composite_claim_requires_each_subclaim_evidence():
     )
     clauses = contract["verifications"][0]["clauses"]
     assert len(clauses) == 2
-    assert clauses[0]["channels"] == ["vision_verify"]
+    # 第一个子句为视觉类，核心仍是 vision_verify（并接纳 page/element_state 作为正向证据）
+    assert "vision_verify" in clauses[0]["channels"]
     assert "click_and_check" in clauses[1]["channels"]
 
     result = evaluate_verification(
@@ -345,6 +357,25 @@ def test_assert_behavior_effect_unsupported_predicate_lists_supported(monkeypatc
     assert "element_state" not in result
 
 
+def test_assert_behavior_effect_toggled_bad_format_gives_example(monkeypatch):
+    """P0 第 2 点补强：以 toggled 开头但格式不对（裸 toggled / 缺 on|off）时，
+    返回完整格式示例（toggled(label,on|off)），而非只走通用 unsupported 报错。
+    防止换了模型又把裸 toggled 传进来。"""
+    _make_context_with_elements([], monkeypatch)
+
+    for bad in ("toggled", "toggled(WLAN)", "toggled(WLAN,on,extra)", "toggled WLAN on"):
+        result = assert_behavior_effect.invoke(
+            {
+                "expected": bad,
+                "verification_key": "v1",
+                "clause_id": "v1.0",
+            }
+        )
+        assert result.startswith("ERROR"), f"{bad} 应报错: {result}"
+        assert "toggled(label,on|off)" in result, f"{bad} 应给出完整格式示例: {result}"
+        assert "例如" in result, f"{bad} 应含示例: {result}"
+
+
 def test_assert_behavior_effect_toggled_on_passes_when_switch_is_on(monkeypatch):
     """toggled(WLAN,on) 应在开关已切到 on 时 PASS。"""
     context = _make_context_with_elements(
@@ -394,7 +425,11 @@ def test_assert_behavior_effect_toggled_off_passes(monkeypatch):
 
 
 def test_assert_behavior_effect_toggled_emits_behavior_effect_channel(monkeypatch):
-    """toggled() 产出 behavior_effect 通道证据（状态类 claim 的默认通道），而非 element_state。"""
+    """toggled() 产出 behavior_effect 通道证据（状态类 claim 的默认通道），而非 element_state。
+
+    注意：toggled 读实时 checked，属当前态检查，其证据 authoritative=False（见 Plan §5.3.2
+    权威不变量）——本测试只验证通道归属，不再断言 authoritative=True。
+    """
     context = _make_context_with_elements(
         [FakeElement("rid_wifi", "WLAN", checked=True)], monkeypatch
     )
@@ -408,7 +443,7 @@ def test_assert_behavior_effect_toggled_emits_behavior_effect_channel(monkeypatc
     )
     assert len(context._evidence_events) == 1
     assert context._evidence_events[0]["channel"] == "behavior_effect"
-    assert context._evidence_events[0]["authoritative"] is True
+    assert context._evidence_events[0]["authoritative"] is False
 
 
 def test_assert_page_state_matches_simple_activity_name(monkeypatch):
@@ -515,3 +550,248 @@ def test_assert_behavior_effect_still_on_activity_matches_simple_name(monkeypatc
         }
     )
     assert result.startswith("PASS"), result
+
+
+# ---------------------------------------------------------------------------
+# authoritative 语义回归（Plan P0 第 3 点 / §5.3.2 权威不变量）
+#   当前态检查谓词（element_present/element_absent/toggled）FAIL → authoritative=False
+#   (unknown, 可重试, 不触发 fail-fast)
+#   确定性 before/after 谓词（still_on_activity/no_page_change/list_count_unchanged）FAIL
+#   → authoritative=True（保留 §5.4 fail-fast 保障）
+# ---------------------------------------------------------------------------
+
+
+class FakeDeviceWithActivity:
+    def current_app(self):
+        return {"package": "com.android.settings", "activity": ".Settings$WifiSettingsActivity"}
+
+
+def _context_with_activity(elements, monkeypatch):
+    class FakePerceiverWithActivity:
+        def perceive(self):
+            class U:
+                pass
+            u = U()
+            u.elements = elements
+            return u
+
+    class Context:
+        _evidence_events: list[dict] = []
+        _deterministic_checks: list[dict] = []
+        perceiver = FakePerceiverWithActivity()
+        device = FakeDeviceWithActivity()
+
+    context = Context()
+    monkeypatch.setattr("tools.verify.get_tool_context", lambda: context)
+    return context
+
+
+def test_behavior_effect_toggled_failure_is_non_authoritative(monkeypatch):
+    """toggled(WLAN,on) 在开关仍为 off（过渡态）时 FAIL，但其 FAIL 必须 authoritative=False，
+    不得触发 fail-fast（由 evaluate_verification 判 unknown）。"""
+    context = _context_with_activity(
+        [FakeElement("rid_wifi", "WLAN", checked=False)], monkeypatch
+    )
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "toggled(WLAN,on)",
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+        }
+    )
+    assert result.startswith("FAIL"), result
+    assert context._evidence_events, "应写入 evidence event"
+    ev = context._evidence_events[-1]
+    assert ev["channel"] == "behavior_effect"
+    assert ev["status"] == "FAIL"
+    assert ev["authoritative"] is False, "toggled 是当前态检查，FAIL 必须非权威"
+
+
+def test_behavior_effect_element_present_failure_is_non_authoritative(monkeypatch):
+    """element_present(label) 缺失时 FAIL，必须 authoritative=False（当前态检查）。"""
+    context = _make_context_with_elements([], monkeypatch)
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "element_present(missing_label)",
+            "verification_key": "v1",
+            "clause_id": "v1.0",
+        }
+    )
+    assert result.startswith("FAIL"), result
+    ev = context._evidence_events[-1]
+    assert ev["status"] == "FAIL"
+    assert ev["authoritative"] is False, "element_present 是当前态检查，FAIL 必须非权威"
+
+
+def test_behavior_effect_element_absent_failure_is_non_authoritative(monkeypatch):
+    """element_absent(label) 仍存在时 FAIL，必须 authoritative=False（当前态检查）。"""
+    context = _make_context_with_elements(
+        [FakeElement("rid_x", "present_label")], monkeypatch
+    )
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "element_absent(present_label)",
+            "verification_key": "v1",
+            "clause_id": "v1.0",
+        }
+    )
+    assert result.startswith("FAIL"), result
+    ev = context._evidence_events[-1]
+    assert ev["status"] == "FAIL"
+    assert ev["authoritative"] is False, "element_absent 是当前态检查，FAIL 必须非权威"
+
+
+def test_behavior_effect_still_on_activity_failure_is_authoritative(monkeypatch):
+    """still_on_activity 在 Activity 不符时 FAIL，必须 authoritative=True（确定性 before/after）。"""
+    context = _context_with_activity(
+        [FakeElement("rid_wifi", "WLAN", checked=True)], monkeypatch
+    )
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "still_on_activity(OtherActivity)",
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+        }
+    )
+    assert result.startswith("FAIL"), result
+    ev = context._evidence_events[-1]
+    assert ev["status"] == "FAIL"
+    assert ev["authoritative"] is True, "still_on_activity 是 before/after 比较，FAIL 必须权威"
+
+
+def test_behavior_effect_list_count_unchanged_failure_is_authoritative(monkeypatch):
+    """list_count_unchanged 在计数不符时 FAIL，必须 authoritative=True（确定性 before/after）。"""
+    context = _make_context_with_elements(
+        [FakeElement("rid", "Item A"), FakeElement("rid2", "Item B")], monkeypatch
+    )
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "list_count_unchanged(Item,5)",
+            "verification_key": "v2",
+            "clause_id": "v2.0",
+        }
+    )
+    assert result.startswith("FAIL"), result
+    ev = context._evidence_events[-1]
+    assert ev["status"] == "FAIL"
+    assert ev["authoritative"] is True, "list_count_unchanged 是 before/after 比较，FAIL 必须权威"
+
+
+def test_behavior_effect_no_page_change_failure_is_authoritative(monkeypatch):
+    """no_page_change 在 screen_signature 不符时 FAIL，必须 authoritative=True
+    （确定性 before/after 比较，与 still_on_activity/list_count_unchanged 同属权威侧）。
+    补齐权威侧三类谓词的单独回归。"""
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(elements=[])
+
+        def screen_signature(self):
+            return "sig_actual_abc"
+
+    class FakeDevice:
+        def current_app(self):
+            return {
+                "package": "com.android.settings",
+                "activity": ".Settings",
+            }
+
+    class Context:
+        _evidence_events: list[dict] = []
+        _deterministic_checks: list[dict] = []
+        device = FakeDevice()
+
+    context = Context()
+    context.perceiver = _Perceiver()
+    monkeypatch.setattr("tools.verify.get_tool_context", lambda: context)
+
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "no_page_change(sig_expected_xyz)",
+            "verification_key": "v3",
+            "clause_id": "v3.0",
+        }
+    )
+    assert result.startswith("FAIL"), result
+    ev = context._evidence_events[-1]
+    assert ev["channel"] == "behavior_effect"
+    assert ev["status"] == "FAIL"
+    assert ev["authoritative"] is True, "no_page_change 是 before/after 比较，FAIL 必须权威"
+
+
+# ---------------------------------------------------------------------------
+# 集成级回归：过渡态 FAIL 经 evaluate_verification 后 verdict=unknown，
+# 不触发 llm_runtime.py:649 的 fail-fast（对照 before/after FAIL → failed 会触发）。
+# 直接用真实 evaluate_verification，不 mock，确保端到端契约闭环。
+# ---------------------------------------------------------------------------
+
+
+def _contract_with_behavior_clause(key="v0", clause_id="v0.0"):
+    return {
+        "status": "approved",
+        "verifications": [
+            {
+                "key": key,
+                "clauses": [
+                    {
+                        "id": clause_id,
+                        "claim": "Wi-Fi 开关状态可切换",
+                        "channels": ["behavior_effect"],
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def test_toggled_transient_failure_is_unknown_not_failed(monkeypatch):
+    """toggled 过渡态 FAIL（authoritative=False）→ evaluate_verification 判 inconclusive，
+    而非 failed → llm_runtime.py:649 的 {passed, failed} 不命中 → 不触发 fail-fast。
+
+    注：evaluate_verification 顶层 verdict 取值为 failed/passed/inconclusive；
+    非权威 FAIL 使 clause status=unknown → verification result=unknown → verdict=inconclusive。
+    """
+    from agents.verification import evaluate_verification
+
+    contract = _contract_with_behavior_clause()
+    events = [
+        {
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+            "channel": "behavior_effect",
+            "status": "FAIL",
+            "authoritative": False,  # toggled 当前态检查，非权威
+            "fact": {"expected": "toggled(WLAN,on)", "checked": False},
+        }
+    ]
+    state = evaluate_verification(contract, events)
+    assert state["verdict"] == "inconclusive", (
+        f"过渡态 FAIL 必须 inconclusive(可重试)，实际={state['verdict']}——"
+        f"若变 failed 将误触发 fail-fast"
+    )
+    # 模拟 llm_runtime.py:649 的 break 条件：inconclusive 不命中 → 不 break
+    assert state.get("verdict") not in {"passed", "failed"}
+
+
+def test_before_after_failure_is_failed_triggers_failfast(monkeypatch):
+    """对照：before/after 谓词 FAIL（authoritative=True）→ evaluate_verification 判 failed，
+    会触发 llm_runtime.py:649 的 fail-fast（保留 §5.4 保障）。"""
+    from agents.verification import evaluate_verification
+
+    contract = _contract_with_behavior_clause()
+    events = [
+        {
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+            "channel": "behavior_effect",
+            "status": "FAIL",
+            "authoritative": True,  # still_on_activity / list_count_unchanged 等 before/after 谓词
+            "fact": {"expected": "list_count_unchanged(Item,5)", "count": 2},
+        }
+    ]
+    state = evaluate_verification(contract, events)
+    assert state["verdict"] == "failed", (
+        f"确定性 before/after FAIL 必须 failed(触发 fail-fast)，实际={state['verdict']}"
+    )
+    # 模拟 llm_runtime.py:649 的 break 条件：failed 命中 → 会 break
+    assert state.get("verdict") in {"passed", "failed"}

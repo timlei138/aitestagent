@@ -357,6 +357,14 @@ class TestOrchestrator:
                 "run_stopped",
                 {"thread_id": thread_id, "reason": "user_requested"},
             )
+            # 用户手动停止也要落库，否则报告中心看不到该用例
+            self._persist_terminal_record(
+                thread_id,
+                config_ctx,
+                "cancelled",
+                "inconclusive",
+                "ABORT: USER_STOPPED — 用户手动停止当前运行",
+            )
             return {
                 "thread_id": thread_id,
                 "status": "cancelled",
@@ -368,6 +376,13 @@ class TestOrchestrator:
                 "verification_results": [],
             }
         except Exception as exc:
+            self._persist_terminal_record(
+                thread_id,
+                config_ctx,
+                "error",
+                "inconclusive",
+                "EXCEPTION: " + str(exc)[:1900],
+            )
             return self._handle_exception(thread_id, exc)
         finally:
             self._cleanup_run(thread_id)
@@ -419,6 +434,7 @@ class TestOrchestrator:
             {"thread_id": thread_id, "started_at": datetime.now().isoformat()},
         )
 
+        # 冷启动交由 Agent 调度：进入 graph 前不再强制冷启动，理由同 start()。
         initial_state: TestState = {
             "user_request": user_request,
             "app_package": app_package,
@@ -708,6 +724,13 @@ class TestOrchestrator:
                             "run_stopped",
                             {"thread_id": thread_id, "reason": "user_requested"},
                         )
+                        self._persist_terminal_record(
+                            thread_id,
+                            config_ctx,
+                            "cancelled",
+                            "inconclusive",
+                            "ABORT: USER_STOPPED — 用户手动停止当前运行",
+                        )
                         yield {
                             "type": "run_stopped",
                             "content": {
@@ -765,6 +788,13 @@ class TestOrchestrator:
                         },
                     }
             except Exception as exc:
+                self._persist_terminal_record(
+                    thread_id,
+                    config_ctx,
+                    "error",
+                    "inconclusive",
+                    "EXCEPTION: " + str(exc)[:1900],
+                )
                 yield {"type": "error", "content": str(exc)}
         finally:
             self._cleanup_run(thread_id)
@@ -874,6 +904,93 @@ class TestOrchestrator:
             "test_verdict": "inconclusive",
             "verification_results": [],
         }
+
+    def _persist_terminal_record(
+        self,
+        thread_id: str,
+        config_ctx: dict,
+        execution_status: str,
+        test_verdict: str,
+        reason: str,
+    ) -> None:
+        """兜底落库：当 graph 在 reporter_node 之前因异常/取消而中断、未走正常
+        记录路径时，补一条终态 execution_run 记录，确保报告中心能看到该用例。
+
+        need_human（GraphInterrupt 等待人工）不在此落库——那不是终态。
+        """
+        try:
+            from agents.graph import _relational_db
+
+            if not _relational_db:
+                return
+            # 取中断前的最新 state；取不到则用空字典，仅保证主记录存在
+            state: dict = {}
+            try:
+                _snap = self.graph.get_state(config_ctx)
+                state = dict(getattr(_snap, "values", {}) or {})
+            except Exception:
+                state = {}
+            from agents.nodes import compute_resolution_metrics
+
+            _tool_log = state.get("_tool_calls_log", []) or []
+            _resolution_metrics = compute_resolution_metrics(_tool_log)
+            _resolution_metrics["rag_query_count"] = int(
+                getattr(self, "_sctx_rag_count", 0) or 0
+            )
+            _relational_db.record_execution_run(
+                run_id=thread_id,
+                user_request=state.get("user_request", "") or "",
+                app_package=state.get("app_package", "") or "",
+                goal=state.get("goal_description") or {},
+                verification_contract=(
+                    state.get("verification_contract")
+                    if isinstance(state.get("verification_contract"), dict)
+                    else {}
+                ),
+                execution_mode=str(state.get("execution_mode", "explore") or "explore"),
+                lifecycle_state="Terminal",
+                plan_id=state.get("plan_id") or "",
+                plan_trust=str(state.get("plan_trust", "") or ""),
+                verdict=test_verdict,
+                terminal_reason=str(reason)[:2000],
+                resolution_metrics=_resolution_metrics,
+                duration_seconds=0.0,
+                llm_call_count=int(state.get("llm_call_count", 0) or 0),
+                token_usage=None,
+            )
+            logger.info(
+                "兜底终态记录已落库 tid=%s status=%s",
+                thread_id,
+                execution_status,
+            )
+        except Exception as _e:
+            logger.warning("兜底终态记录失败 tid=%s: %s", thread_id, _e)
+
+    def _cold_start_app(self, ctx, app_package: str, thread_id: str) -> None:
+        """每轮用例的确定性前置：强制杀掉 App 并冷启动到主 Activity（不清数据）。
+
+        目的：消除上一轮（或异常中断）残留的页面栈，保证每轮都从 App 首页这个
+        干净起点出发，避免 v0 导航链路被"残留页面"伪造性满足。方案 2：无条件冷启动。
+        """
+        if not app_package:
+            return
+        _dev = getattr(ctx, "device", None)
+        if _dev is None:
+            return
+        try:
+            _dev.app_stop(app_package)
+            import time as _t
+
+            _t.sleep(0.5)  # 等进程完全退出
+            _dev.app_start(app_package)
+            _t.sleep(1.0)  # 等主 Activity 就绪
+            logger.info("冷启动完成 tid=%s pkg=%s", thread_id, app_package)
+            self._emit(
+                "status",
+                f"已冷启动应用 {app_package}（确保从首页干净起点开始）",
+            )
+        except Exception as _e:
+            logger.warning("冷启动失败 tid=%s pkg=%s: %s", thread_id, app_package, _e)
 
 
 def _extract_interrupt_info(exc: Exception) -> dict[str, Any]:

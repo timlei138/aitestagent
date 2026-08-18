@@ -7,6 +7,8 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 SEMANTIC_KNOWLEDGE_TYPES = {"constraint", "negative_knowledge", "semantic_hint"}
+# 任务规划摘要也走知识库（由 save_task_plan_summary 写入），删除/列出时需放行。
+ALLOWED_KNOWLEDGE_TYPES = SEMANTIC_KNOWLEDGE_TYPES | {"task_plan_summary"}
 
 # 全局 KnowledgeBase 实例由 server.py 注入
 _kb_instance = None
@@ -179,7 +181,7 @@ def delete_knowledge(
     - 批量删除：仅提供 app_package 和/或 knowledge_type。
     """
     kb = _get_kb()
-    if knowledge_type and knowledge_type not in SEMANTIC_KNOWLEDGE_TYPES:
+    if knowledge_type and knowledge_type not in ALLOWED_KNOWLEDGE_TYPES:
         raise HTTPException(status_code=400, detail="不支持的 knowledge_type")
     if entry_id:
         deleted = kb.backend.delete_by_ids([entry_id])

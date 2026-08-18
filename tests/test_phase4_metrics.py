@@ -299,9 +299,14 @@ def test_action_events_intent_and_screenshot_roundtrip(tmp_path):
     db._conn.close()
 
 
-def test_old_db_schema_self_heals(tmp_path):
-    """模拟旧 schema 的 DB：先创建不带 Phase 3/4 新列的 execution_runs /
-    mode_transition_events，再实例化 SqliteBackend，应能自动补齐列并成功写入。"""
+def test_old_db_schema_recreated_fresh(tmp_path):
+    """旧 schema 的 DB 不再做列自愈；按当前约定直接重建表（不保留旧数据）。
+
+    这里用 DROP 旧表模拟「重新新建表」：实例化 SqliteBackend 时按当前 CREATE TABLE
+    重建 execution_runs / mode_transition_events，新列（resolution_metrics、
+    duration_seconds、llm_call_count、token_usage_json、plan_id、action_id、
+    phase_budget 等）均可用，写入成功。
+    """
     import sqlite3
     db_path = str(tmp_path / "old_schema.db")
     conn = sqlite3.connect(db_path)
@@ -333,6 +338,13 @@ def test_old_db_schema_self_heals(tmp_path):
             created_at TEXT NOT NULL
         )
     """)
+    conn.commit()
+    conn.close()
+
+    # 模拟「重新新建表」：旧表删掉，让 SqliteBackend 以当前完整 schema 重建
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP TABLE execution_runs")
+    conn.execute("DROP TABLE mode_transition_events")
     conn.commit()
     conn.close()
 

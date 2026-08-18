@@ -112,9 +112,18 @@
                 </el-tag>
               </template>
             </el-table-column>
+            <el-table-column label="耗时" width="90" align="right">
+              <template #default="{ row }">{{ fmtDuration((row.duration_seconds || 0) * 1000) || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="Token" width="100" align="right">
+              <template #default="{ row }">{{ (row.token_usage && row.token_usage.total_tokens) ? fmtTokens(row.token_usage.total_tokens) : '—' }}</template>
+            </el-table-column>
             <el-table-column label="操作" width="230" fixed="right">
               <template #default="{ row }">
                 <div style="white-space:nowrap">
+                <el-button size="small" text type="primary"
+                  :disabled="executing || !isReportCompleted(row)"
+                  @click.stop="rerunReport(row)">复跑</el-button>
                 <el-button size="small" text type="danger"
                   :disabled="executing"
                   @click.stop="deleteReport(row)">删除</el-button>
@@ -296,76 +305,83 @@
   </el-container>
   
   <!-- ═══════════ 测试目标确认对话框（可编辑）═══════════ -->
-  <el-dialog v-model="planReviewVisible" width="560px" :close-on-click-modal="false"
+  <el-dialog v-model="planReviewVisible" width="720px" top="5vh" :close-on-click-modal="false"
              :close-on-press-escape="false" class="plan-review-dialog">
     <template #header>
       <div class="pr-title">
         <span class="pr-title-icon">🎯</span>
-        <span>测试目标确认（可编辑）</span>
+        <span>测试目标确认</span>
+        <span class="pr-title-badge">可编辑</span>
       </div>
     </template>
 
     <div class="pr-body">
       <div class="pr-section">
-        <div class="pr-section-label">原始请求</div>
+        <div class="pr-section-label"><span class="pr-label-ico">📝</span>原始请求</div>
         <div class="pr-request-text">{{ planReviewUserRequest || '（无）' }}</div>
       </div>
       <div class="pr-section">
-        <div class="pr-section-label">目标</div>
+        <div class="pr-section-label"><span class="pr-label-ico">🎯</span>目标</div>
         <el-input v-model="planReviewGoal" type="textarea" :rows="2" placeholder="测试目标" />
       </div>
       <div class="pr-section">
-        <div class="pr-section-label">目标页面</div>
-        <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px">
+        <div class="pr-section-label"><span class="pr-label-ico">📄</span>目标页面</div>
+        <div class="pr-tag-row">
           <el-tag v-for="(p, i) in planReviewPages" :key="i" size="small" closable @close="planReviewPages.splice(i,1)">{{ p }}</el-tag>
         </div>
-        <div style="display:flex;gap:6px">
-          <el-input v-model="newPageName" size="small" placeholder="添加页面" @keyup.enter="addReviewPage" style="flex:1" />
+        <div class="pr-inline-add">
+          <el-input v-model="newPageName" size="small" placeholder="添加页面" @keyup.enter="addReviewPage" />
           <el-button size="small" @click="addReviewPage">+</el-button>
         </div>
       </div>
       <div class="pr-section">
-        <div class="pr-section-label">验证条件与覆盖状态</div>
-        <div v-for="(v, i) in planReviewVerifications" :key="i" style="display:flex;gap:6px;margin-bottom:4px;align-items:flex-start">
-          <el-input v-model="planReviewVerifications[i]" size="small" @input="rebuildEditedContract" style="flex:1" />
+        <div class="pr-section-label"><span class="pr-label-ico">✅</span>验证条件与覆盖状态</div>
+        <div v-for="(v, i) in planReviewVerifications" :key="i" class="pr-verify-edit-row">
+          <el-input v-model="planReviewVerifications[i]" size="small" @input="rebuildEditedContract" />
           <el-button size="small" type="danger" text @click="planReviewVerifications.splice(i,1); rebuildEditedContract()">×</el-button>
         </div>
-        <el-button size="small" @click="planReviewVerifications.push(''); rebuildEditedContract()">+ 添加验证</el-button>
+        <el-button size="small" class="pr-add-btn" @click="planReviewVerifications.push(''); rebuildEditedContract()">+ 添加验证</el-button>
         <div v-if="planReviewContract" class="pr-coverage-section">
-          <div v-for="verification in planReviewContract.verifications" :key="verification.key" class="pr-verification-item">
-            <div class="pr-verification-header">
-              <span>{{ verification.statement }}</span>
-              <el-tag size="small" :type="spanStatusType(verification)">{{ spanStatusText(verification) }}</el-tag>
+          <div v-for="verification in planReviewContract.verifications" :key="verification.key" class="pr-verification-card">
+            <div class="pr-verification-head">
+              <span class="pr-verification-key">{{ verification.key }}</span>
+              <span class="pr-verification-statement">{{ verification.statement }}</span>
+              <el-tag size="small" :type="spanStatusType(verification)" class="pr-verify-status">{{ spanStatusText(verification) }}</el-tag>
             </div>
             <div class="pr-verification-meta">
-              <span>request span: {{ spanStyle(verification.request_source_span) }}</span>
-              <span>goal span: {{ spanStyle(verification.goal_source_span) }}</span>
+              <span class="pr-meta-chip">Req {{ spanStyle(verification.request_source_span) }}</span>
+              <span class="pr-meta-chip">Goal {{ spanStyle(verification.goal_source_span) }}</span>
             </div>
             <div v-for="clause in verification.clauses" :key="clause.id" class="pr-clause-item">
-              <span class="pr-clause-id">{{ clause.id }}</span>
-              <span class="pr-clause-claim">{{ clause.claim }}</span>
-              <span class="pr-clause-span">[{{ clause.goal_source_span[0] }}-{{ clause.goal_source_span[1] }}]</span>
-              <el-tag v-for="ch in clause.channels" :key="ch" size="small" type="info">{{ ch }}</el-tag>
+              <div class="pr-clause-line">
+                <span class="pr-clause-badge">{{ clause.id }}</span>
+                <span class="pr-clause-claim">{{ clause.claim }}</span>
+                <span class="pr-clause-span">[{{ clause.goal_source_span[0] }}-{{ clause.goal_source_span[1] }}]</span>
+              </div>
+              <div class="pr-clause-channels">
+                <el-tag v-for="ch in clause.channels" :key="ch" size="small" type="info" effect="plain">{{ ch }}</el-tag>
+              </div>
             </div>
           </div>
         </div>
       </div>
       <div class="pr-section">
-        <div class="pr-section-label">导航提示</div>
-        <div v-for="(h, i) in planReviewHints" :key="i" style="display:flex;gap:6px;margin-bottom:4px">
+        <div class="pr-section-label"><span class="pr-label-ico">💡</span>导航提示</div>
+        <div v-for="(h, i) in planReviewHints" :key="i" class="pr-hint-edit-row">
           <el-input v-model="planReviewHints[i]" size="small" />
           <el-button size="small" type="danger" text @click="planReviewHints.splice(i,1)">×</el-button>
         </div>
-        <el-button size="small" @click="planReviewHints.push('')">+ 添加提示</el-button>
+        <el-button size="small" class="pr-add-btn" @click="planReviewHints.push('')">+ 添加提示</el-button>
       </div>
     </div>
 
     <template #footer>
       <div class="pr-footer">
-        <el-button size="large" @click="confirmPlan('cancel')">取消</el-button>
-        <el-button size="large" type="primary" @click="confirmPlan('confirm')">
-          确认并开始执行
-        </el-button>
+        <span class="pr-footer-hint">确认后将冷启动应用并从首页开始执行</span>
+        <div class="pr-footer-actions">
+          <el-button size="large" @click="confirmPlan('cancel')">取消</el-button>
+          <el-button size="large" type="primary" @click="confirmPlan('confirm')">确认并开始执行</el-button>
+        </div>
       </div>
     </template>
   </el-dialog>
@@ -1228,6 +1244,19 @@ async function loadReports() {
     const data = await res.json();
     if (data.status === "success") reportTasks.value = data.items || [];
   } catch (e) { /* ignore */ }
+}
+
+// 复跑：直接以原 user_request 再次执行，不做确认弹窗（用例已存在、意图明确）。
+function isReportCompleted(row) {
+  // 已结束（Terminal）或已有明确结论（passed/failed/inconclusive）即视为可复跑。
+  if (row.lifecycle_state === 'Terminal') return true;
+  return ['passed', 'failed', 'inconclusive'].includes(row.verdict);
+}
+
+async function rerunReport(row) {
+  if (!row?.user_request) return;
+  if (executing.value) return;
+  await startRun(row.user_request);
 }
 
 async function openReportDetail(row) {

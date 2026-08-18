@@ -448,6 +448,14 @@ def test_click_index_selects_unlabeled_clickable_by_bounds(monkeypatch):
             self.clicked_bounds.append(bounds)
             return True
 
+        def click_resource_id(self, rid):
+            self.clicked_bounds.append(rid)
+            return True
+
+        def click_text(self, text):
+            self.clicked_bounds.append(text)
+            return True
+
         def snapshot(self):
             return SimpleNamespace(width=1200, height=800)
 
@@ -518,6 +526,72 @@ def test_click_rejects_empty_label_without_locator():
             self.clicked_bounds.append(bounds)
             return True
 
+        def click_resource_id(self, rid):
+            self.clicked_bounds.append(rid)
+            return True
+
+        def click_text(self, text):
+            self.clicked_bounds.append(text)
+            return True
+
     tools_module.set_tool_context(ToolContext(device=_Device2(), perceiver=_Perceiver()))
     out_idx = tools_module.click.invoke({"index": 0})
     assert "label 不能为空" not in out_idx
+
+
+def test_empty_requested_label_never_counts_as_fuzzy():
+    # P0 第 4 点回归：空 requested_label 绝不能被记为 fuzzy_match=True。
+    # click.py:827-832 的 fuzzy_match 公式依赖「双方非空」约束（_q 与 _el_label
+    # 均非空），空 label 必须落空、绝不能污染模糊匹配指标统计。未来很容易悄悄把
+    # `bool(_q) and` 删掉改成「label 空也算 fuzzy」，故用三条测试锁死：
+    #   (1) 空 label（+ 定位依据）→ 不触发 fuzzy（被 AMBIGUOUS/ERROR 挡在成功路径外）；
+    #   (2) 精确匹配 label → 成功且 fuzzy_match=false（证明该 key 会被正常透出为 false）；
+    #   (3) 模糊 label（子串但不等价）→ 成功且 fuzzy_match=true（证明公式确实在跑）。
+    class _Device:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.MainActivity",
+            }
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+        def click_resource_id(self, rid):
+            self.clicked_bounds.append(rid)
+            return True
+
+        def click_text(self, text):
+            self.clicked_bounds.append(text)
+            return True
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.MainActivity",
+                page_title="",
+                primary_paths=[],
+                elements=[
+                    _el(
+                        label="新课程",
+                        rid="com.zui.calendar:id/new_course",
+                        bounds=(20, 120, 220, 180),
+                    )
+                ],
+            )
+
+    tools_module.set_tool_context(ToolContext(device=_Device(), perceiver=_Perceiver()))
+
+    # (1) 空 label + index 定位依据 → 不会进入成功路径，更不会冒出 fuzzy_match=true。
+    out_empty = tools_module.click.invoke({"index": 0, "label": ""})
+    assert "fuzzy_match=true" not in out_empty
+
+    # (2) 精确匹配 label → 成功且明确透出 fuzzy_match=false。
+    out_exact = tools_module.click.invoke({"index": 0, "label": "新课程"})
+    assert "已点击" in out_exact
+    assert "fuzzy_match=false" in out_exact
+    assert "fuzzy_match=true" not in out_exact

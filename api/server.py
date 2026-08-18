@@ -175,7 +175,6 @@ def rebuild_perceiver() -> dict:
         _perceiver = SmartPerceiver(
             _device,
             vision_call=_build_vision_call(config),
-            screenshot_sink=_bind_last_screenshot_path,
             mode=mode,
             auto_switch=auto_switch,
         )
@@ -205,7 +204,6 @@ if _device is not None:
         _perceiver = SmartPerceiver(
             _device,
             vision_call=_build_vision_call(config),
-            screenshot_sink=_bind_last_screenshot_path,
             mode=mode,
             auto_switch=auto_switch,
         )
@@ -312,7 +310,6 @@ def reconnect_device() -> dict:
         _perceiver = SmartPerceiver(
             _device,
             vision_call=_build_vision_call(config),
-            screenshot_sink=_bind_last_screenshot_path,
             mode=mode,
             auto_switch=auto_switch,
         )
@@ -814,9 +811,13 @@ async def delete_report(run_id: str):
 
     logs_dir = app_paths.LOG_RUN_DIR
     if logs_dir.exists() and logs_dir.is_dir():
-        for lf in logs_dir.glob(f"*{run_id}*langchain.log"):
-            if _safe_unlink(lf):
-                deleted_logs += 1
+        for lf in logs_dir.glob(f"*{run_id}*"):
+            _stem = lf.name.lower()
+            # 删除与该 run 关联的所有运行日志：langchain.log / trace.json 等
+            if _stem.endswith("langchain.log") or _stem.endswith("_trace.json") \
+                    or run_id in lf.name:
+                if _safe_unlink(lf):
+                    deleted_logs += 1
 
     deleted_db = False
     try:

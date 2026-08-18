@@ -3,26 +3,13 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
-import os
 import re
-import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from typing import Any, Callable
-
-import app_paths
-
-
-def _write_screenshot_bytes(path: str, image_base64: str) -> None:
-    """R5：把截图字节写盘。可在后台线程执行，绝不抛异常。"""
-    try:
-        with open(path, "wb") as _f:
-            _f.write(base64.b64decode(image_base64))
-    except Exception:
-        pass
 
 
 class PerceptionMode:
@@ -163,7 +150,6 @@ class SmartPerceiver:
         self,
         device,
         vision_call: Callable[[str, str, str, bool], dict[str, Any]] | None = None,
-        screenshot_sink: Callable[[str], None] | None = None,
         mode: str = PerceptionMode.HYBRID,
         auto_switch: bool = True,
         stuck_threshold: int = 2,
@@ -171,13 +157,9 @@ class SmartPerceiver:
         settle_timeout: float = 1.5,
         settle_stable_count: int = 2,
         settle_poll_interval: float = 0.3,
-        screenshot_async: bool = True,
     ):
         self.device = device
         self._vision_call = vision_call
-        self._screenshot_sink = screenshot_sink
-        # R5: cache-miss 截图写盘放到后台线程，移出感知关键路径（降单步延迟/缩小 R1 竞态窗口）
-        self._screenshot_async = screenshot_async
         self.mode = mode
         self.auto_switch = auto_switch
         self.stuck_threshold = stuck_threshold
@@ -239,30 +221,8 @@ class SmartPerceiver:
         elements = [e for e in elements if not _is_system_ui_noise(e)]
         page_title = self._extract_page_title(xml)
         snapshot = self.device.snapshot()
-        # ── 截图存盘：perceive cache miss 时顺带存盘（零额外截图调用）
-        try:
-            if snapshot.image_base64:
-                app_paths.SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-                from datetime import datetime as _dt
-
-                _shot_path = str(
-                    app_paths.SCREENSHOT_DIR
-                    / f"perceive_{_dt.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
-                )
-                # R5: 写盘移出关键路径——异步落盘（默认），失败/关闭时退回同步
-                if self._screenshot_async:
-                    threading.Thread(
-                        target=_write_screenshot_bytes,
-                        args=(_shot_path, snapshot.image_base64),
-                        daemon=True,
-                    ).start()
-                else:
-                    _write_screenshot_bytes(_shot_path, snapshot.image_base64)
-                if self._screenshot_sink is not None:
-                    # 发送绝对路径（同步即可用，字节由后台线程写入）
-                    self._screenshot_sink(_shot_path)
-        except Exception:
-            pass
+        # 截图只在内存中使用（UI Tree 解析 / 送 Vision 标注），不再自动落盘。
+        # 真正的步骤截图与验证证据截图由 llm_runtime / verify / perceive_tools 显式保存。
         understanding = self._heuristic_understand(
             elements=elements,
             package=snapshot.package,

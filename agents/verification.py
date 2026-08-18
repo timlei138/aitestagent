@@ -20,26 +20,38 @@ _CLAUSE_BOUNDARY = re.compile(r"[，,；;]+|(?:并且|同时|以及|且)")
 
 
 def _default_channels_for_claim(claim: str) -> list[str]:
-    """Choose the narrowest safe evidence channels for a generated claim.
+    """Choose the evidence channels for a generated claim.
 
     - Visual claims rely on vision_verify (screenshot + VLM).
     - Text claims rely on ui_text / click_and_check (OCR / UI-tree text).
-    - State/switch claims intentionally exclude element_state / page_state: the
-      Accessibility ``checked`` attribute is unreliable across ROMs and tends to
-      make the agent repeat open/close/open cycles just to collect evidence. We
-      instead use behavior_effect (did the action produce the expected result) and
-      vision_verify (does the screenshot show the switch on/off).
-    - The fallback only lists channels that have a real producer so a claim never
-      lands in a dead channel.
+    - State/switch claims use behavior_effect (did the action produce the expected
+      result) and vision_verify (does the screenshot show the switch on/off), and
+      also accept page_state / element_state: a page_state PASS (e.g. landed on the
+      expected activity) or element_state PASS (target element exists) is genuine
+      positive evidence and must be recognized by the evaluator, otherwise the run
+      is wrongly marked inconclusive while the frontend (which shows any PASS) looks
+      green. The original concern about Accessibility ``checked`` unreliability only
+      applied to the producer side (agent loop of open/close to collect evidence),
+      not to the evaluator accepting an observed state.
+    - The fallback lists channels that have a real producer so a claim never lands
+      in a dead channel.
     """
     normalized = str(claim or "").lower()
     if any(marker in normalized for marker in _VISUAL_CLAIM_MARKERS):
-        return ["vision_verify"]
+        return ["vision_verify", "page_state", "element_state"]
     if any(marker in normalized for marker in _TEXT_CLAIM_MARKERS):
-        return ["ui_text", "click_and_check"]
+        return ["ui_text", "click_and_check", "page_state", "element_state"]
     if any(marker in normalized for marker in _STATE_CLAIM_MARKERS):
-        return ["behavior_effect", "vision_verify"]
-    return ["ui_text", "vision_verify", "click_and_check", "behavior_effect"]
+        # UI Tree 能判定的状态/页面类断言优先走 UI Tree；视觉仅作为兜底。
+        return ["page_state", "element_state", "behavior_effect", "vision_verify"]
+    return [
+        "ui_text",
+        "vision_verify",
+        "click_and_check",
+        "behavior_effect",
+        "page_state",
+        "element_state",
+    ]
 
 
 def _split_claims(statement: str) -> list[str]:
@@ -434,6 +446,27 @@ def _subtract_spans(
     return result
 
 
+# UI Tree 已能证明的断言应直接跳过视觉通道，避免不必要的 VLM 调用。
+_UI_TREE_CHANNELS = {"page_state", "element_state", "behavior_effect"}
+
+
+def ui_tree_evidence_already_passes(ctx: Any, clause_id: str) -> bool:
+    """若 clause_id 已存在 UI Tree 类 PASS/YES 证据，则视觉通道可短路。"""
+    if not clause_id:
+        return False
+    for ev in getattr(ctx, "_evidence_events", []) or []:
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("clause_id", "") or "") != clause_id:
+            continue
+        if ev.get("channel") in _UI_TREE_CHANNELS and ev.get("status") in (
+            "PASS",
+            "YES",
+        ):
+            return True
+    return False
+
+
 def _merge_sorted_spans(spans: list[list[int]]) -> list[list[int]]:
     """Merge overlapping or adjacent spans and return sorted intervals."""
     if not spans:
@@ -498,6 +531,11 @@ def _determine_execution_status(state: dict) -> str:
     history = state.get("step_history", [])
     if len(history) >= budget["max_agent_iterations"]:
         return "exhausted"
+    # 兜底：若 Agent 已实际推进了较多步骤（自然结束但 conclusion 无标准前缀，
+    # 例如中途遇到可恢复的权限/系统弹窗被绕过后正常走完），不应误判为 error。
+    # 仅当几乎未推进（step 极少，疑似一进来就崩）才保留 error。
+    if len(history) >= 3:
+        return "completed"
     return "error"
 
 

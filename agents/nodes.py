@@ -1065,13 +1065,15 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             )
     logger.info("\n".join(_diag_lines))
 
-    # 给每个 clause 补充「决定性证据」：第一个 PASS/YES 事件及其通道，便于 reporter 展示。
+    # 给每个 clause 补充「决定性证据」：第一个 PASS/YES 或 FAIL/NO 事件及其通道，
+    # 便于 reporter 展示「为何通过 / 为何失败」。透出 authoritative 字段（Plan §5.3.2/§5.4）：
+    # 非权威 FAIL（如 toggled 过渡态）authoritative=False，可在 trace 中观测到它不会触发 fail-fast。
     _deciding_evidence: dict[tuple[str, str], dict[str, Any]] = {}
     for event in evidence_events:
         if not isinstance(event, dict):
             continue
         status = str(event.get("status", "") or "").upper()
-        if status not in {"PASS", "YES"}:
+        if status not in {"PASS", "YES", "FAIL", "NO"}:
             continue
         key = str(event.get("verification_key", "") or "")
         cid = str(event.get("clause_id", "") or "")
@@ -1079,6 +1081,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
             _deciding_evidence[(key, cid)] = {
                 "channel": str(event.get("channel", "") or ""),
                 "status": status,
+                "authoritative": bool(event.get("authoritative", False)),
                 "fact": event.get("fact", {}),
             }
 
@@ -1131,6 +1134,19 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     # exact_count / semantic_count 由 resolution_type 得出；旧逻辑误用 match_mode=="exact"
     # （click 的 match_mode 实际为 resource_id/element/...，永不命中），此处纠正。
     _resolution_metrics = compute_resolution_metrics(_tool_log)
+    rag_query_count = int(getattr(ctx, "_rag_query_count", 0) or 0)
+
+    # RAG same_app ratio: 统计 request_knowledge 调用中 same_app 回应的占比
+    _rag_same_app = int(getattr(ctx, "_rag_same_app_count", 0) or 0)
+    _rag_cross_app = int(getattr(ctx, "_rag_cross_app_count", 0) or 0)
+    _rag_empty = int(getattr(ctx, "_rag_empty_hit_count", 0) or 0)
+    rag_total_resolved = _rag_same_app + _rag_cross_app + _rag_empty
+    rag_same_app_ratio = round(_rag_same_app / max(rag_total_resolved, 1), 4)
+    rag_empty_hit_rate = round(_rag_empty / max(rag_total_resolved, 1), 4)
+    # 将 RAG 检索指标一并并入 resolution_metrics，便于报告接口一并返回
+    _resolution_metrics["rag_query_count"] = rag_query_count
+    _resolution_metrics["rag_same_app_ratio"] = round(rag_same_app_ratio, 3)
+    _resolution_metrics["rag_empty_hit_rate"] = round(rag_empty_hit_rate, 3)
     exact_count = _resolution_metrics["exact_resolution_count"]
     semantic_count = _resolution_metrics["semantic_resolution_count"]
     fuzzy_count = sum(
@@ -1141,15 +1157,15 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         for s in _tool_log
         if s.get("name") == "click" and s.get("match_mode") == "ambiguous"
     )
-    rag_query_count = int(getattr(ctx, "_rag_query_count", 0) or 0)
 
-    # RAG same_app ratio: 统计 request_knowledge 调用中 same_app 回应的占比
-    _rag_same_app = int(getattr(ctx, "_rag_same_app_count", 0) or 0)
-    _rag_cross_app = int(getattr(ctx, "_rag_cross_app_count", 0) or 0)
-    _rag_empty = int(getattr(ctx, "_rag_empty_hit_count", 0) or 0)
-    rag_total_resolved = _rag_same_app + _rag_cross_app + _rag_empty
-    rag_same_app_ratio = round(_rag_same_app / max(rag_total_resolved, 1), 4)
-    rag_empty_hit_rate = round(_rag_empty / max(rag_total_resolved, 1), 4)
+    # Phase 2/3 执行模式状态机透出（Plan §2）：字段由 mode_selection_node 写入 state，
+    # 此处仅读取并透出到 log / trace，不新增任何模式决策逻辑（契约收敛，不堆补丁）。
+    _exec_mode = str(state.get("execution_mode", "explore") or "explore")
+    _lifecycle = str(state.get("lifecycle_state", "") or "")
+    _plan_id = str(state.get("plan_id", "") or "")
+    _plan_trust = str(state.get("plan_trust", "") or "")
+    _mode_reason = str(state.get("mode_selection_reason", "") or "")
+    _mode_transitions = list(state.get("mode_transition_events", []) or [])
 
     # O1: 单次运行 token 消耗（纯观测）
     token_usage = dict(getattr(ctx, "_token_usage", {}) or {})
@@ -1295,6 +1311,17 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         int(token_usage.get("llm_calls", 0) or 0),
         str(conclusion)[:120],
     )
+    # 执行模式状态机观测（Plan §2 P2 验收用）：不放在长行里，单独打印保证清晰度。
+    logger.info(
+        "Reporter[mode]: execution_mode=%s lifecycle_state=%s plan_id=%s "
+        "plan_trust=%s mode_selection_reason=%s mode_transition_events=%d",
+        _exec_mode,
+        _lifecycle,
+        _plan_id or "-",
+        _plan_trust or "-",
+        _mode_reason or "-",
+        len(_mode_transitions),
+    )
     # 本地逐轮 trace 落盘（离线可观测；config 可关；绝不影响主流程）
     if getattr(cfg, "write_run_trace", True):
         try:
@@ -1328,6 +1355,12 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                     "rag_empty_hit_rate": rag_empty_hit_rate,
                     "evidence_event_counts": evidence_event_counts,
                 },
+                execution_mode=_exec_mode,
+                lifecycle_state=_lifecycle,
+                plan_id=_plan_id,
+                plan_trust=_plan_trust,
+                mode_selection_reason=_mode_reason,
+                mode_transition_events=_mode_transitions,
             )
             _trace_path = write_run_trace(_trace)
             if _trace_path:

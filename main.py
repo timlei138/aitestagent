@@ -114,14 +114,9 @@ def _init_tool_context(config: TestConfig) -> None:
                 timeout_sec=30,
             )
 
-        def _screenshot_sink(path: str) -> None:
-            if ctx_holder["ctx"] is not None:
-                ctx_holder["ctx"]._last_screenshot_path = path
-
         perceiver = SmartPerceiver(
             device,
             vision_call=_vision_call,
-            screenshot_sink=_screenshot_sink,
             mode=mode,
             auto_switch=auto_switch,
         )

@@ -21,7 +21,20 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 
 from tools.context import get_tool_context
-from tools.results import AMBIGUOUS, ERROR, NOT_FOUND, OK, make_result
+from tools.results import (
+    AMBIGUOUS,
+    ERROR,
+    NOT_FOUND,
+    OK,
+    UNSUPPORTED,
+    make_result,
+)
+
+import logging
+
+import app_paths
+
+logger = logging.getLogger(__name__)
 
 try:
     from langchain_core.tools import tool
@@ -52,7 +65,33 @@ def visual_check(
             },
             ensure_ascii=False,
         )
+    # UI Tree 已能证明该 clause 达成时，跳过视觉通道（UI Tree 优先，避免多余 VLM 调用）。
+    if verification_key and getattr(ctx, "llm_vision_enabled", True) is False:
+        from agents.verification import ui_tree_evidence_already_passes
+
+        if ui_tree_evidence_already_passes(ctx, clause_id):
+            return json.dumps(
+                {
+                    "decision": "unknown",
+                    "reason": "vision_disabled_but_ui_tree_proven",
+                    "evidence": "UI Tree 证据已证明该断言，无需视觉校验",
+                    "confidence": "high",
+                },
+                ensure_ascii=False,
+            )
+    if not getattr(ctx, "llm_vision_enabled", True):
+        return json.dumps(
+            {
+                "decision": "unsupported",
+                "reason": "vision 未启用",
+                "evidence": "",
+                "confidence": "low",
+            },
+            ensure_ascii=False,
+        )
     snap = ctx.device.snapshot_for_vision()
+    # 验证证据点显式保存截图（perceiver 已不再自动落盘）。
+    _save_perceive_evidence_screenshot(ctx, verification_key)
     prompt = (
         "请根据截图判断以下描述是否成立，并只返回 JSON。"
         "字段: decision(yes/no/unknown), reason, evidence, confidence(high/medium/low)。\n"
@@ -96,9 +135,26 @@ def visual_check(
                 ),
                 "authoritative": decision == "no" and payload["confidence"] == "high",
                 "fact": payload,
+                "artifact_ref": getattr(ctx, "_last_screenshot_path", "") or "",
             }
         )
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _save_perceive_evidence_screenshot(ctx, verification_key: str) -> None:
+    """视觉验证证据点显式截图：保存到 screenshots/{run_id}/evidence_{key}_vision.png。"""
+    try:
+        if ctx.device is None:
+            return
+        run_id = getattr(ctx, "_run_tag", "") or "unknown"
+        shot_dir = app_paths.SCREENSHOT_DIR / str(run_id)
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"evidence_{verification_key or 'v'}_vision.png"
+        path = str(shot_dir / filename)
+        ctx.device.screenshot().save(path)
+        ctx._last_screenshot_path = path
+    except Exception as exc:
+        logger.warning("perceive evidence screenshot failed: %s", exc)
 
 
 @tool
@@ -445,19 +501,52 @@ def set_permission_intent(permission: str = "", action: str = "") -> str:
         return make_result(OK, "权限测试意图已清除")
     if action not in ("grant", "deny"):
         return make_result(ERROR, "action 必须是 grant 或 deny")
-    # T2: 弹窗在屏却传空 permission → 结构化错误（确定性事实 + 正确工具名）
-    if action and not permission:
-        _popup = _permission_popup_buttons(ctx)
-        if _popup:
-            _activity, _controls = _popup
-            _btns = "|".join(t for t, _, _ in _controls)
+    # T2: 弹窗在屏 → 不硬报 ERROR（会卡住冷启动/基线建立流程），
+    # 而是按 action 自动响应弹窗，再平滑设立基线。
+    _popup = _permission_popup_buttons(ctx)
+    if _popup:
+        _activity, _controls = _popup
+        _btns = "|".join(t for t, _, _ in _controls)
+        # 按 action 选目标按钮文案：deny 优先「拒绝」（不误点「拒绝并不再询问」
+        # 以免永久污染后续用例）；grant 优先「允许」。
+        if action == "deny":
+            _candidates = ("拒绝并不再询问", "拒绝", "禁止", "Deny")
+        else:
+            _candidates = ("允许", "始终允许", "同意", "Allow")
+        _chosen = None
+        for _c in _candidates:
+            for _label, _rid, _b in _controls:
+                if _label == _c or _c in _label:
+                    _chosen = (_label, _b)
+                    break
+            if _chosen:
+                break
+        if _chosen:
+            _label, _b = _chosen
+            ctx.device.click_bounds(_b)
+            time.sleep(0.3)
+            # 响应成功后设立基线
+            ctx._permission_intent = {
+                "permission": permission.lower().strip(),
+                "action": action.strip(),
+                "set_time": time.monotonic(),
+            }
             return make_result(
-                ERROR,
-                f"当前屏幕存在权限弹窗({_activity})，请直接用 "
-                f'respond_to_permission_dialog(button="...") 响应（可见按钮: {_btns}）；'
-                f"或传入具体 permission 类型后再用 click() 自动处理。",
-                _permission_evidence(_activity, _controls),
+                OK,
+                f"检测到权限弹窗({_activity})已按 {action} 响应({_label})，"
+                f"并设立权限测试意图: permission={permission}, action={action}。"
+                f"后续 click() 将自动监听权限弹窗并按 {action} 响应。"
+                f"测试完当前分支后调用 set_permission_intent() 清除。",
+                {"permission": permission, "action": action, "popup_responded": _label},
             )
+        # 找不到匹配按钮（极端情况）→ 降级提示，由 Agent 显式决策
+        return make_result(
+            ERROR,
+            f"当前屏幕存在权限弹窗({_activity})，可见按钮: {_btns}，"
+            f"但未找到匹配 {action} 的按钮；请直接用 "
+            f'respond_to_permission_dialog(button="...") 显式响应。',
+            _permission_evidence(_activity, _controls),
+        )
     ctx._permission_intent = {
         "permission": permission.lower().strip(),
         "action": action.strip(),
@@ -1001,11 +1090,11 @@ def vision_tap(
     if ctx.device is None:
         return make_result(ERROR, "未连接 Android 设备")
 
-    # 2) vision 可用性：独立视觉模型优先，否则回退主模型
+    # 2) vision 可用性：独立视觉模型优先， 否则回退主模型
     actual_model = ctx.vision_model or ctx.llm_model
     if not (ctx.llm_vision_enabled and actual_model):
         return make_result(
-            ERROR,
+            UNSUPPORTED,
             "vision 未启用，请配置 vision_model 或使用多模态主模型",
         )
 
@@ -1240,6 +1329,7 @@ def vision_tap(
         time.sleep(0.3)  # 等滚轮动画
         try:
             snap2 = ctx.device.snapshot_for_vision()
+            _save_perceive_evidence_screenshot(ctx, verification_key)
             verify_prompt = (
                 f"请根据截图判断：{verify}。"
                 f'只返回 JSON: {{"decision": "yes/no", "reason": str, "evidence": str}}'
@@ -1308,6 +1398,7 @@ def vision_tap(
                     "decision": verify_decision,
                     "evidence": verify_evidence,
                 },
+                "artifact_ref": getattr(ctx, "_last_screenshot_path", "") or "",
             }
         )
     return make_result(OK, base_msg, evidence)
@@ -1348,7 +1439,7 @@ def click_and_check(
 
     actual_model = ctx.vision_model or ctx.llm_model
     if not (ctx.llm_vision_enabled and actual_model):
-        return make_result(ERROR, "vision 未启用")
+        return make_result(UNSUPPORTED, "vision 未启用，无法执行 click_and_check")
 
     # 1) 点击元素
     clicked = ctx.device.click_text(label)
@@ -1359,9 +1450,10 @@ def click_and_check(
     # 2) 等待 toast/动画出现
     time.sleep(max(0, wait_ms) / 1000.0)
 
-    # 3) 立即截图（压缩，toast 通常 2 秒内可见）
+    # 3) 立即截图（压缩，toast 通常 2 秒内可见）；同时作为验证证据落盘
     try:
         snap = ctx.device.snapshot_for_vision()
+        _save_perceive_evidence_screenshot(ctx, verification_key)
     except Exception as exc:
         return make_result(ERROR, f"截图失败: {exc}")
 
@@ -1403,6 +1495,7 @@ def click_and_check(
                     "reason": reason,
                     "evidence": evidence,
                 },
+                "artifact_ref": getattr(ctx, "_last_screenshot_path", "") or "",
             }
         )
 

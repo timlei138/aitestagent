@@ -68,6 +68,14 @@ def build_run_trace(
     verification_results: list[dict[str, Any]] | None,
     token_usage: dict[str, Any] | None,
     metrics: dict[str, Any] | None,
+    # Phase 2/3 执行模式状态机透出（Plan §2）：字段由 mode_selection_node 写入 state，
+    # 这里只做观测层透出，不新增任何模式决策逻辑（契约收敛，不堆补丁）。
+    execution_mode: str = "",
+    lifecycle_state: str = "",
+    plan_id: str = "",
+    plan_trust: str = "",
+    mode_selection_reason: str = "",
+    mode_transition_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """把运行期产物汇总为一份结构化 trace（纯数据转换，绝不抛异常）。"""
     steps: list[dict[str, Any]] = []
@@ -107,6 +115,16 @@ def build_run_trace(
             "execution_status": execution_status,
             "test_verdict": test_verdict,
             "duration_seconds": round(float(duration_seconds or 0), 2),
+        },
+        # 执行模式状态机（Plan §2）：仅观测透出，供 Gap Plan P2 验收「trace 中可见
+        # execution_mode 且至少有一次 run 进入 direct/guided」使用。
+        "execution": {
+            "mode": str(execution_mode or "explore"),
+            "lifecycle_state": str(lifecycle_state or ""),
+            "plan_id": str(plan_id or ""),
+            "plan_trust": str(plan_trust or ""),
+            "mode_selection_reason": str(mode_selection_reason or ""),
+            "mode_transition_events": list(mode_transition_events or []),
         },
         "metrics": metrics or {},
         "resolution_metrics": resolution_metrics,

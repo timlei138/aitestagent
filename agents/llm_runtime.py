@@ -464,6 +464,9 @@ def _run_agent(
                     _run_id = s.get("_run_id", "unknown")
                     _tool_seq = len(_current_log) + 1
                     _screenshot_path = _take_step_screenshot(_ctx, _run_id, _tool_seq)
+                    # 写回 ctx，作为后续验证点的兜底截图（perceiver 已不再自动落盘）。
+                    if _screenshot_path:
+                        _ctx._last_screenshot_path = _screenshot_path
                 except Exception as e:
                     logger.warning("Step screenshot failed for %s: %s", name, e)
                     _screenshot_path = ""

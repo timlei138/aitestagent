@@ -29,9 +29,41 @@
         <span class="rd-metric-label">总体耗时</span>
         <b class="rd-metric-value">{{ formatDuration(report.duration_seconds) }}</b>
       </div>
-      <div class="rd-metric-item" v-if="tokenTotal">
-        <span class="rd-metric-label">Token 消耗</span>
-        <b class="rd-metric-value" :title="tokenTooltip">{{ tokenTotal }}</b>
+      <div class="rd-metric-item" v-if="tokenDisplay !== null">
+        <span class="rd-metric-label">Token 消耗 (入/出/缓存)</span>
+        <b class="rd-metric-value" :title="tokenTooltip">{{ tokenDisplay }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">工具 400 错误</span>
+        <b class="rd-metric-value">{{ report.tool_call_400_count || 0 }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">预算违例</span>
+        <b class="rd-metric-value">{{ report.budget_violation_count || 0 }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">精确解析</span>
+        <b class="rd-metric-value">{{ resolutionMetrics.exact_resolution_count || 0 }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">语义解析</span>
+        <b class="rd-metric-value">{{ resolutionMetrics.semantic_resolution_count || 0 }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">标签错配</span>
+        <b class="rd-metric-value">{{ resolutionMetrics.label_mismatch_count || 0 }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">RAG 检索</span>
+        <b class="rd-metric-value">{{ resolutionMetrics.rag_query_count || 0 }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">RAG 同应用命中率</span>
+        <b class="rd-metric-value">{{ resolutionMetrics.rag_same_app_ratio != null ? formatRate(resolutionMetrics.rag_same_app_ratio) : '—' }}</b>
+      </div>
+      <div class="rd-metric-item">
+        <span class="rd-metric-label">RAG 空命中率</span>
+        <b class="rd-metric-value">{{ resolutionMetrics.rag_empty_hit_rate != null ? formatRate(resolutionMetrics.rag_empty_hit_rate) : '—' }}</b>
       </div>
     </div>
 
@@ -45,6 +77,7 @@
         <div class="rd-verify-main">
           <span class="rd-verify-text">{{ clauseText(v) }} · {{ channelLabel(v.channel) }}</span>
           <div v-if="v.fact && Object.keys(v.fact).length" class="rd-verify-reason">{{ JSON.stringify(v.fact) }}</div>
+          <img v-if="v.artifact_ref" class="step-shot verify-shot" :src="screenshotUrl(v.artifact_ref)" @click="openLightbox(v.artifact_ref)" />
         </div>
       </div>
     </div>
@@ -83,8 +116,6 @@
   <div v-if="lightboxUrl" class="rd-lightbox" @click.self="lightboxUrl = ''">
     <img :src="lightboxUrl" />
   </div>
-
-  <div v-else class="rd-empty">加载中...</div>
 </template>
 
 <script setup>
@@ -96,15 +127,30 @@ const evidence = computed(() => props.report?.evidence || [])
 const modeTransitions = computed(() => props.report?.mode_transitions || [])
 
 const tokenUsage = computed(() => props.report?.token_usage || {})
-const tokenTotal = computed(() => {
-  const t = tokenUsage.value?.total_tokens || 0
-  return t ? t.toLocaleString() : ''
+function fmtM(n) {
+  const v = Number(n || 0)
+  if (!v) return null
+  return `${(v / 1_000_000).toFixed(2)}M`
+}
+// 单格显示三项明细：输入/输出/缓存（单位 M），如 0.25/0.1/0.2M
+const tokenDisplay = computed(() => {
+  const t = tokenUsage.value
+  const inp = Number(t?.input_tokens || 0)
+  const out = Number(t?.output_tokens || 0)
+  const cache = Number(t?.cached_input_tokens || 0)
+  if (!inp && !out && !cache) return null
+  return `${fmtM(inp)}/${fmtM(out)}/${fmtM(cache)}`
 })
 const tokenTooltip = computed(() => {
   const t = tokenUsage.value
   if (!t) return ''
-  return `输入: ${t.input_tokens || 0}\n输出: ${t.output_tokens || 0}\n缓存输入: ${t.cached_input_tokens || 0}`
+  return `输入: ${t.input_tokens || 0}\n输出: ${t.output_tokens || 0}\n缓存输入: ${t.cached_input_tokens || 0}\n合计: ${t.total_tokens || 0}`
 })
+const resolutionMetrics = computed(() => props.report?.resolution_metrics || {})
+function formatRate(rate) {
+  const r = Number(rate || 0)
+  return `${(r * 100).toFixed(1)}%`
+}
 function formatDuration(sec) {
   const s = Number(sec || 0)
   if (s < 60) return `${s.toFixed(1)}s`
@@ -154,10 +200,17 @@ function clauseText(v) {
   return ver.statement || v.verification_key
 }
 
-// 截图相对路径拼成 /storage/ 静态资源 URL。
+// 截图路径拼成 /storage/ 静态资源 URL。
+// 兼容两种来源：① 相对 DATA_DIR 的路径（screenshots/...png）；
+// ② 历史数据中的绝对路径（D:/.../storage/screenshots/...png），
+// 需剥去盘符与 storage 前缀，只保留 screenshots/ 之后的部分。
 function screenshotUrl(path) {
   if (!path) return ''
-  const p = String(path).replace(/\\/g, '/').replace(/^\/+/, '')
+  let p = String(path).replace(/\\/g, '/')
+  // 绝对路径：截到最后一个 "storage/" 之后
+  const m = p.match(/storage\/(.+)$/i)
+  if (m) p = m[1]
+  p = p.replace(/^\/+/, '')
   return `/storage/${p}`
 }
 </script>

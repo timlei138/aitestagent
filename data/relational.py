@@ -251,43 +251,6 @@ class SqliteBackend(RelationalBackend):
                 ON evidence_events(run_id, verification_key, clause_id);
         """)
         self._conn.commit()
-        # 自愈式 schema 补齐：允许 dev/测试用的旧 DB 在新增列后自动追上当前 schema，
-        # 不是版本化迁移脚本，只是避免旧 DB 文件导致写入炸掉。
-        self._ensure_columns("execution_runs", [
-            ("resolution_metrics", "TEXT NOT NULL DEFAULT '{}'"),
-            ("duration_seconds", "REAL NOT NULL DEFAULT 0.0"),
-            ("llm_call_count", "INTEGER NOT NULL DEFAULT 0"),
-            ("token_usage_json", "TEXT NOT NULL DEFAULT '{}'"),
-        ])
-        self._ensure_columns("mode_transition_events", [
-            ("plan_id", "TEXT NOT NULL DEFAULT ''"),
-            ("action_id", "TEXT NOT NULL DEFAULT ''"),
-            ("phase_budget", "REAL NOT NULL DEFAULT 0.0"),
-        ])
-        self._ensure_columns("action_events", [
-            ("intent_text", "TEXT NOT NULL DEFAULT ''"),
-            ("screenshot_path", "TEXT NOT NULL DEFAULT ''"),
-        ])
-
-    def _ensure_columns(
-        self,
-        table: str,
-        columns: list[tuple[str, str]],
-    ) -> None:
-        """如表缺少指定列则 ADD COLUMN；重复列会自动被 SQLite 忽略并抛错，我们吞掉。"""
-        for col_name, col_type in columns:
-            try:
-                self._conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}"
-                )
-                self._conn.commit()
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" in str(exc).lower():
-                    continue
-                # 其它错误不静默，但如果是 schema 不存在的表也忽略（CREATE TABLE IF NOT EXISTS 已处理）
-                if "no such table" in str(exc).lower():
-                    continue
-                raise
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
         return self._conn.execute(sql, params)

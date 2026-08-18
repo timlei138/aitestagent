@@ -349,9 +349,9 @@ evaluate_verification(contract: VerificationContract, events: list[EvidenceEvent
 
 事件生产责任：`assert_page_contains`/元素状态工具生产 `ui_text`/`element_state`；`visual_check` 与 `vision_tap.verify` 生产 `vision_verify`；`click_and_check` 生产同一 tool call 关联的 `click_and_check`；框架在每次工具前后快照时生产 `page_state`；新增 `assert_behavior_effect(before, after, expected)` 工具生产 `behavior_effect`。没有生产者的通道不可在 contract 中声明。
 
-`behavior_effect.expected` 第一版只允许有限 DSL：`still_on_activity(activity)`、`no_page_change(page_fingerprint)`、`list_count_unchanged(list_anchor)`、`element_present(locator)` 与 `element_absent(locator)`；每个谓词必须绑定稳定 anchor、before/after artifact 和比较范围。只有这些 DSL 谓词实现了确定性 before/after 比较时，`behavior_effect` 的 FAIL 才是权威反证；其他自然语言效果说明只能产生 unknown，不能进入权威证据路径。
+`behavior_effect.expected` 第一版只允许有限 DSL：`still_on_activity(activity)`、`no_page_change(page_fingerprint)`、`list_count_unchanged(list_anchor)`、`element_present(locator)` 与 `element_absent(locator)`；**后续 phase4 增补 `toggled(label,on|off)`**（读实时 `checked`，属当前态检查，非 before/after 比较）。每个谓词必须绑定稳定 anchor、before/after artifact 和比较范围。**`authoritative` 判定规则（确定性不变量）**：`authoritative=True` 仅授予确定性 before/after 反证（`still_on_activity`/`no_page_change`/`list_count_unchanged`）；`authoritative=False`（默认 unknown，可重试）授予所有当前态检查谓词（`element_present`/`element_absent`/`toggled`）——因为实时/瞬态读取在过渡期不可靠，其 FAIL 可能是过渡态误报，不能触发 fail-fast。只有这些 DSL 谓词实现了确定性 before/after 比较时，`behavior_effect` 的 FAIL 才是权威反证；其他自然语言效果说明只能产生 unknown，不能进入权威证据路径。
 
-反证语义是通道特定的：`element_state`、具备稳定页面锚点的 `page_state`、以及已声明明确副作用的 `behavior_effect` 的 FAIL 可作为权威反证；`ui_text`/`assert_element_exists` 的 FAIL 默认只能产生 unknown，因为无文本 UI、图标和 canvas 场景不可反证；`vision_verify=no` 仅在截图完整、目标区域可见且模型返回高置信反证时才可失败，否则 unknown。一个 verification 只有所有 clause 通过才可 passed；任一 clause failed 则 failed；其余为 unknown + review_required。历史 plan、RAG、旧截图和 LLM `detail` 只能附加解释，不能作为 clause 证据。
+反证语义是通道特定的：`behavior_effect` 中仅确定性 before/after 谓词（`still_on_activity`/`no_page_change`/`list_count_unchanged`）的 FAIL 可作为权威反证；当前态检查谓词（`element_present`/`element_absent`/`toggled`）的 FAIL 默认产生 unknown（可重试，不触发 fail-fast）；`page_state` 仅 FAIL + 显式 `package/activity` 时权威；`vision_verify=no` 仅在截图完整、目标区域可见且模型返回高置信反证时才可失败（此时权威），否则 unknown。一个 verification 只有所有 clause 通过才可 passed；任一 clause failed（仅来自 `authoritative=True` 的 FAIL）则 failed；其余为 unknown + review_required。历史 plan、RAG、旧截图和 LLM `detail` 只能附加解释，不能作为 clause 证据。
 
 
 ### 5.4 Evaluator 节点与终止契约
@@ -361,6 +361,11 @@ evaluator 分为两个层次，避免假设一个工具调用等于一个 graph 
 graph 层保留无 LLM 的 `evaluator_node`，但它只在 agent 一轮返回后读取聚合的 `clause_state` 与 terminal request，并做路由裁决：全部 clauses 通过路由到 reporter；任一 clause 失败、已确认 abort 或终止故障路由到 reporter；其他情况回到当前 execution mode。权威 clause failure 是有意的 fail-fast：立即结束 run，不继续收集其余 clauses 的完整结果；最终报告必须标识 `terminated_on_authoritative_failure` 与尚未评估的 clauses。这样 clause 状态的粒度是每工具调用，graph 路由的粒度仍是一轮 agent 执行。
 
 删除旧 `route_after_agent` 基于 LLM 自报结果的全过判断。保留最小工具 `terminate_run(reason)` 供 agent 在明确无法继续时请求 abort；该调用只产生 `agent_abort_requested` 事件，由 evaluator/状态机确认并以可解释 `Terminal` 原因结束，不能自行给出 passed。
+
+**`authoritative` 标签语义约束（fail-fast 的准入门槛）**：fail-fast 只应由**确定性已稳定**的反证触发，`authoritative=True` 的授予必须收敛，不可泛化。
+- **`authoritative=True`**：仅授予「前后对比、状态已被框架确认稳定」的反证，典型如 `still_on_activity` / `list_count_unchanged` 这类确定性谓词。这类 FAIL 才是真·权威失败，立即终止 run。
+- **`authoritative=False`（默认 unknown，可重试）**：读实时/瞬态状态的谓词（如 `element_present`、`element_absent`、`toggled(WLAN,on)`）其 FAIL **默认不授权**，因为它可能是过渡态（开关尚未稳定、页面刚切换、元素刚加载）。除非框架能证明状态已稳定（如稳定等待后二次回读一致），否则不应标 `authoritative=True`。
+- 这一约束保证 §5.4 的 fail-fast 不变量**只杀真·权威失败**，而「过渡态误报」回落为 unknown，agent 仍可重试 / 换方式 / abort，不触发过早终止。当前 `assert_behavior_effect` 对所有结果一律 `authoritative=True` 违反本约束，需收紧（详见 Gap Plan P0 第 3 点）。
 
 ### 5.5 观测与预算
 

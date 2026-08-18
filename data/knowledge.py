@@ -46,6 +46,14 @@ class KnowledgeBase:
                 "knowledge_type 必须是 constraint、negative_knowledge 或 semantic_hint"
             )
 
+    @classmethod
+    def _validate_type_or_plan(cls, knowledge_type: str) -> None:
+        """查询/列出时允许 task_plan_summary（由 save_task_plan_summary 写入）。"""
+        if knowledge_type not in cls._SEMANTIC_TYPES and knowledge_type != cls._PLAN_TYPE:
+            raise ValueError(
+                "knowledge_type 必须是 constraint、negative_knowledge、semantic_hint 或 task_plan_summary"
+            )
+
     def save_knowledge(self, knowledge: UIKnowledge) -> None:
         self._validate_type(knowledge.knowledge_type)
         metadata = dict(knowledge.metadata or {})
@@ -115,7 +123,7 @@ class KnowledgeBase:
         top_k: int = 5,
     ) -> list[dict[str, Any]]:
         if knowledge_type:
-            self._validate_type(knowledge_type)
+            self._validate_type_or_plan(knowledge_type)
         where: dict[str, Any] = {}
         if app_package:
             where["app_package"] = app_package
@@ -127,7 +135,7 @@ class KnowledgeBase:
         self, app_package: str = "", knowledge_type: str = "", top_k: int = 50
     ) -> list[dict[str, Any]]:
         if knowledge_type:
-            self._validate_type(knowledge_type)
+            self._validate_type_or_plan(knowledge_type)
         where: dict[str, Any] = {}
         if app_package:
             where["app_package"] = app_package

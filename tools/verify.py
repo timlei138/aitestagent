@@ -14,8 +14,11 @@ from datetime import datetime
 from typing import Any
 
 import app_paths
+import logging
 
 from tools.context import ToolContext, get_tool_context
+
+logger = logging.getLogger(__name__)
 
 try:
     from langchain_core.tools import tool
@@ -28,15 +31,45 @@ except Exception:
         return wrapper(func) if func else wrapper
 
 
-def _simple_activity_match(expected: str, actual: str) -> bool:
+def _simple_activity_match(expected: str, ual: str) -> bool:
     """按简单类名匹配 Activity，兼容包名前缀与内部类 $ 分隔。"""
     exp = expected.strip().lstrip(".")
-    act = actual.strip().lstrip(".")
+    act = ual.strip().lstrip(".")
     if not exp or not act:
         return False
     exp_simple = exp.rsplit("$", 1)[-1].rsplit(".", 1)[-1]
     act_simple = act.rsplit("$", 1)[-1].rsplit(".", 1)[-1]
     return exp_simple == act_simple
+
+
+def _save_evidence_screenshot(ctx, verification_key: str, seq: int) -> None:
+    """验证证据点显式截图：保存到 screenshots/{run_id}/evidence_{key}_{seq}.png
+    并写回 ctx._last_screenshot_path，便于 artifact_ref 引用。
+
+    perceiver 已不再自动落盘，因此所有验证证据截图必须由本函数显式产生。
+    """
+    try:
+        if ctx.device is None:
+            return
+        run_id = getattr(ctx, "_run_tag", "") or "unknown"
+        shot_dir = app_paths.SCREENSHOT_DIR / str(run_id)
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"evidence_{verification_key or 'v'}_{seq}.png"
+        path = str(shot_dir / filename)
+        ctx.device.screenshot().save(path)
+        ctx._last_screenshot_path = path
+    except Exception as exc:  # 截图失败不应中断验证流程
+        logger.warning("evidence screenshot failed: %s", exc)
+
+
+_evidence_seq = 0
+
+
+def verification_seq() -> int:
+    """递增生成验证证据截图序号，避免同 run 内文件名冲突。"""
+    global _evidence_seq
+    _evidence_seq += 1
+    return _evidence_seq
 
 
 def _record_deterministic_check(
@@ -67,6 +100,7 @@ def _record_deterministic_check(
             # Text/element lookup FAIL is intentionally non-authoritative.
             "authoritative": False,
             "fact": {"kind": kind, "text": str(text or "")},
+            "artifact_ref": getattr(ctx, "_last_screenshot_path", "") or "",
         }
     )
 
@@ -86,6 +120,10 @@ def assert_page_contains(
     返回: PASS 或 FAIL: <原因>
     """
     _result = _assert_page_contains_impl(text, pattern)
+    if verification_key and clause_id:
+        _save_evidence_screenshot(
+            get_tool_context(), verification_key, verification_seq()
+        )
     _record_deterministic_check(
         text,
         "page_contains",
@@ -175,6 +213,9 @@ def assert_element_exists(
     if ctx.perceiver is None:
         return "FAIL: Perceiver not available - no device"
     understanding = ctx.perceiver.perceive()
+    matched = any(label in (element.label or "") for element in understanding.elements)
+    if verification_key and clause_id:
+        _save_evidence_screenshot(ctx, verification_key, verification_seq())
     for element in understanding.elements:
         if label in (element.label or ""):
             _record_deterministic_check(
@@ -221,6 +262,7 @@ def assert_page_state(
     )
     fact = {"package": actual_package, "activity": actual_activity}
     if verification_key and clause_id:
+        _save_evidence_screenshot(ctx, verification_key, verification_seq())
         ctx._evidence_events.append(
             {
                 "verification_key": verification_key,
@@ -229,7 +271,8 @@ def assert_page_state(
                 "status": "PASS" if passed else "FAIL",
                 "authoritative": bool(package or activity) and not passed,
                 "fact": fact,
-            }
+                "artifact_ref": getattr(ctx, "_last_screenshot_path", "") or "",
+                }
         )
     return "PASS" if passed else f"FAIL: page state {fact}"
 
@@ -255,7 +298,15 @@ def assert_behavior_effect(
     expected = str(expected or "").strip()
     passed = False
     channel = "behavior_effect"
+    # authoritative 默认 False，按谓词在下方分支赋值（契约收敛，见 Plan §5.3.2/§5.4）：
+    # 仅确定性 before/after 反证才 True；当前态检查（element_present/element_absent/toggled）一律 False。
+    authoritative = False
     fact: dict[str, Any] = {"expected": expected}
+    logger.debug(
+        "[verify] assert_behavior_effect enter: expected=%r channel=%s",
+        expected,
+        channel,
+    )
     try:
         current_app = ctx.device.current_app() if ctx.device else {}
         if expected.startswith("still_on_activity(") and expected.endswith(")"):
@@ -265,6 +316,8 @@ def assert_behavior_effect(
                 activity, actual_activity
             )
             fact["activity"] = current_app.get("activity", "")
+            # still_on_activity = 确定性 before/after 比较 → 权威反证
+            authoritative = True
         elif expected.startswith("no_page_change(") and expected.endswith(")"):
             signature = expected[15:-1]
             actual_signature = (
@@ -272,6 +325,8 @@ def assert_behavior_effect(
             )
             passed = bool(actual_signature) and actual_signature == signature
             fact["signature"] = actual_signature
+            # no_page_change = 确定性 before/after 比较 → 权威反证
+            authoritative = True
         elif expected.startswith("list_count_unchanged(") and expected.endswith(")"):
             anchor, separator, expected_count = expected[21:-1].rpartition(",")
             if not separator:
@@ -285,6 +340,8 @@ def assert_behavior_effect(
                 )
                 passed = count == int(expected_count)
                 fact.update({"anchor": anchor, "count": count})
+                # list_count_unchanged = 确定性 before/after 比较 → 权威反证
+                authoritative = True
             except ValueError:
                 return f"ERROR: invalid list count: {expected}"
         elif expected.startswith("element_present(") and expected.endswith(")"):
@@ -297,6 +354,8 @@ def assert_behavior_effect(
                 )
             )
             fact["label"] = label
+            # element_present = 当前态检查（瞬态）→ 非权威，FAIL 默认 unknown 可重试
+            authoritative = False
         elif expected.startswith("element_absent(") and expected.endswith(")"):
             label = expected[15:-1]
             understanding = ctx.perceiver.perceive() if ctx.perceiver else None
@@ -307,12 +366,28 @@ def assert_behavior_effect(
                 )
             )
             fact["label"] = label
+            # element_absent = 当前态检查（瞬态）→ 非权威，FAIL 默认 unknown 可重试
+            authoritative = False
         elif expected.startswith("toggled(") and expected.endswith(")"):
+            # 格式校验（P0 第 2 点补强）：以 toggled( 开头但整体不匹配
+            # toggled(label,on|off)（裸 toggled / 缺 on|off / 多了参数）→ 直接返回
+            # 完整格式示例，不进入解析。既兜底 planner.txt 的 prompt 层禁止，也防
+            # 换模型后再次传错（契约收敛：显式示例，不自动补全）。
+            if not re.match(r"^toggled\([^,]+,(on|off)\)$", expected):
+                return (
+                    f"ERROR: toggled 格式不正确: {expected}. "
+                    "正确格式为 toggled(label,on|off)，例如 toggled(WLAN,on) "
+                    "或 toggled(蓝牙开关,off)。"
+                )
             # toggled(label, on|off): 点击某开关后它应变为 on/off。
             # 与 element_state 的区别是语义更明确，且为切换类操作提供直接断言。
             anchor, separator, state_spec = expected[8:-1].rpartition(",")
             if not separator:
-                return f"ERROR: toggled requires label,on|off: {expected}"
+                return (
+                    f"ERROR: toggled 格式不正确: {expected}. "
+                    "正确格式为 toggled(label,on|off)，例如 toggled(WLAN,on) "
+                    "或 toggled(蓝牙开关,off)。"
+                )
             anchor = anchor.strip().strip('"').strip("'")
             state_spec = state_spec.strip().lower()
             if "=" in state_spec:
@@ -352,9 +427,33 @@ def assert_behavior_effect(
                 fact["inferred_from_text"] = inferred
             passed = actual_checked == expected_checked
             # toggled 是「切换行为」断言，产出 behavior_effect 通道，与状态/开关类
-            # claim 的默认通道一致。
+            # claim 的默认通道一致。但读的是实时 checked（过渡态 3-4s 不可靠），
+            # 故当前态检查 → 非权威，FAIL 默认 unknown 可重试，不触发 fail-fast。
+            # 真·失败由 visual_check 高置信 FAIL 做权威确认（见 Plan P0 第 3 点）。
             channel = "behavior_effect"
+            authoritative = False
+            logger.debug(
+                "[verify] toggled realtime checked: anchor=%r expected_checked=%s "
+                "actual_checked=%s inferred=%s → passed=%s "
+                "(authoritative=False, 过渡态易误报)",
+                anchor,
+                expected_checked,
+                actual_checked,
+                inferred,
+                passed,
+            )
         else:
+            # 格式校验（P0 第 2 点补强）：以 toggled 开头但格式不对（裸 toggled /
+            # 缺 on|off / 多了括号）时，明确提示完整格式而非只走通用 unsupported。
+            # 即便 planner.txt 已从 prompt 层禁止裸 toggled，这里仍兜底，防止换了
+            # 模型又传错（契约收敛：显式示例，不自动补全）。
+            if expected.startswith("toggled"):
+                if not re.match(r"^toggled\([^,]+,(on|off)\)$", expected):
+                    return (
+                        f"ERROR: toggled 格式不正确: {expected}. "
+                        "正确格式为 toggled(label,on|off)，例如 toggled(WLAN,on) "
+                        "或 toggled(蓝牙开关,off)。"
+                    )
             return (
                 f"ERROR: unsupported behavior predicate: {expected}. "
                 "supported predicates: still_on_activity(activity), "
@@ -365,16 +464,26 @@ def assert_behavior_effect(
     except Exception as exc:
         return f"ERROR: behavior effect check failed: {exc}"
     if verification_key and clause_id:
+        _save_evidence_screenshot(ctx, verification_key, verification_seq())
         ctx._evidence_events.append(
             {
                 "verification_key": verification_key,
                 "clause_id": clause_id,
                 "channel": channel,
                 "status": "PASS" if passed else "FAIL",
-                "authoritative": True,
+                "authoritative": authoritative,
                 "fact": fact,
-            }
+                "artifact_ref": getattr(ctx, "_last_screenshot_path", "") or "",
+                }
         )
+    logger.debug(
+        "[verify] assert_behavior_effect result: expected=%r status=%s "
+        "authoritative=%s channel=%s",
+        expected,
+        "PASS" if passed else "FAIL",
+        authoritative,
+        channel,
+    )
     return "PASS" if passed else f"FAIL: behavior effect not observed: {expected}"
 
 
