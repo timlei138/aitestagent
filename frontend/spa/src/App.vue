@@ -337,11 +337,12 @@
       <div class="pr-section">
         <div class="pr-section-label"><span class="pr-label-ico">✅</span>验证条件与覆盖状态</div>
         <div v-for="(v, i) in planReviewVerifications" :key="i" class="pr-verify-edit-row">
-          <el-input v-model="planReviewVerifications[i]" size="small" @input="rebuildEditedContract" />
-          <el-button size="small" type="danger" text @click="planReviewVerifications.splice(i,1); rebuildEditedContract()">×</el-button>
+          <el-input v-model="planReviewVerifications[i]" size="small" @input="onEditDraft" />
+          <el-button size="small" type="danger" text @click="planReviewVerifications.splice(i,1); onEditDraft()">×</el-button>
         </div>
-        <el-button size="small" class="pr-add-btn" @click="planReviewVerifications.push(''); rebuildEditedContract()">+ 添加验证</el-button>
-        <div v-if="planReviewContract" class="pr-coverage-section">
+        <el-button size="small" class="pr-add-btn" @click="planReviewVerifications.push(''); onEditDraft()">+ 添加验证</el-button>
+        <div v-if="isEditingDraft" class="pr-draft-hint">⚠ 草稿态：覆盖图已隐藏，以服务端最终校验为准（确认后后端重建）</div>
+        <div v-else-if="planReviewContract" class="pr-coverage-section">
           <div v-for="verification in planReviewContract.verifications" :key="verification.key" class="pr-verification-card">
             <div class="pr-verification-head">
               <span class="pr-verification-key">{{ verification.key }}</span>
@@ -568,6 +569,7 @@ const planReviewSubmitting = ref(false);
 const planReviewUserRequest = ref("");
 const planReviewContract = ref(null);
 const planReviewSpanStatus = ref({ valid: true, gaps: [], overlaps: [] });
+const isEditingDraft = ref(false);
 const newPageName = ref("");
 
 function addReviewPage() {
@@ -578,149 +580,9 @@ function addReviewPage() {
   newPageName.value = "";
 }
 
-// 与后端 _CLAUSE_BOUNDARY 保持一致：按显式连接词/标点拆分验证条件
-function splitClaims(statement) {
-  const parts = String(statement || "").split(/[，,；;]+|(?:并且|同时|以及|且)/g);
-  return parts.map(p => p.trim()).filter(p => p);
-}
-
-// 根据当前编辑的 verifications 重新计算 contract（保持 span 与后端一致）
-function rebuildEditedContract() {
-  const request = planReviewUserRequest.value || "";
-  const verifications = (planReviewVerifications.value || [])
-    .map((item, index) => {
-      const statement = String(item || "").trim();
-      if (!statement) return null;
-      const key = `v${index}`;
-      const claims = splitClaims(statement);
-      const clauses = [];
-      let cursor = 0;
-      claims.forEach((claim, ci) => {
-        let offset = statement.indexOf(claim, cursor);
-        if (offset < 0) offset = cursor;
-        cursor = offset + claim.length;
-        // 与后端 _default_channels_for_claim 对应：简单按关键词推断
-        const normalized = claim.toLowerCase();
-        let channels = ["ui_text", "vision_verify", "click_and_check", "behavior_effect"];
-        if (/颜色|红色|黑色|布局|图标|样式|视觉/.test(normalized)) {
-          channels = ["vision_verify"];
-        } else if (/文字|文本|提示|toast|显示/.test(normalized)) {
-          channels = ["ui_text", "click_and_check"];
-        } else if (/页面|activity|状态|开启|关闭|勾选|选中|打开|开关/.test(normalized)) {
-          channels = ["behavior_effect", "vision_verify"];
-        }
-        clauses.push({
-          id: `${key}.${ci}`,
-          claim,
-          goal_source_span: [offset, cursor],
-          channels,
-        });
-      });
-      return {
-        key,
-        statement,
-        request_source_span: [0, request.length],
-        goal_source_span: [0, statement.length],
-        context_spans: [],
-        clauses,
-      };
-    })
-    .filter(Boolean);
-
-  const contract = {
-    status: "contract_pending_review",
-    user_request: request,
-    verifications,
-  };
-  contract.coverage_map = buildCoverageMap(contract);
-  planReviewContract.value = contract;
-  planReviewSpanStatus.value = validateContractSpans(contract);
-}
-
-function buildCoverageMap(contract) {
-  const request = String(contract.user_request || "");
-  const goalSpans = {};
-  const conditionSpans = [];
-  const goals = {};
-  (contract.verifications || []).forEach(v => {
-    const key = v.key;
-    const reqSpan = v.request_source_span || [0, request.length];
-    conditionSpans.push([...reqSpan]);
-    goalSpans[key] = [...reqSpan];
-    const statement = String(v.statement || "");
-    const goalSourceSpan = v.goal_source_span || [0, statement.length];
-    goals[key] = {
-      goal_source_span: [...goalSourceSpan],
-      clause_spans: (v.clauses || []).map(c => ({
-        id: c.id,
-        span: [...(c.goal_source_span || [0, 0])],
-      })),
-      context_spans: (v.context_spans || []).map(s => [...s]),
-    };
-  });
-  return {
-    request: {
-      condition_spans: mergeSpans(conditionSpans),
-      goal_spans: goalSpans,
-    },
-    goals,
-  };
-}
-
-function validateContractSpans(contract) {
-  const gaps = [];
-  const overlaps = [];
-  (contract.verifications || []).forEach(v => {
-    const key = v.key;
-    const statement = String(v.statement || "");
-    const goalSpan = v.goal_source_span || [0, statement.length];
-    const clauses = (v.clauses || []).filter(c =>
-      Array.isArray(c.goal_source_span) &&
-      c.goal_source_span.length === 2 &&
-      c.goal_source_span[0] >= 0 &&
-      c.goal_source_span[1] <= statement.length &&
-      c.goal_source_span[0] < c.goal_source_span[1]
-    );
-    for (let i = 0; i < clauses.length; i++) {
-      for (let j = i + 1; j < clauses.length; j++) {
-        const a = clauses[i].goal_source_span;
-        const b = clauses[j].goal_source_span;
-        if (a[0] < b[1] && b[0] < a[1]) {
-          overlaps.push({ layer: "goal", key, span_a: { id: clauses[i].id, span: a }, span_b: { id: clauses[j].id, span: b } });
-        }
-      }
-    }
-    let pos = goalSpan[0];
-    const sorted = [...clauses].sort((a, b) => a.goal_source_span[0] - b.goal_source_span[0]);
-    for (const c of sorted) {
-      const [s, e] = c.goal_source_span;
-      if (s > pos) {
-        gaps.push({ layer: "goal", key, start: pos, end: s, reason: "clause coverage gap" });
-      }
-      pos = Math.max(pos, e);
-    }
-    if (pos < goalSpan[1]) {
-      gaps.push({ layer: "goal", key, start: pos, end: goalSpan[1], reason: "clause coverage gap" });
-    }
-  });
-  return { valid: gaps.length === 0 && overlaps.length === 0, gaps, overlaps };
-}
-
-function mergeSpans(spans) {
-  if (!spans.length) return [];
-  const sorted = [...spans].sort((a, b) => a[0] - b[0]);
-  const merged = [[...sorted[0]]];
-  for (let i = 1; i < sorted.length; i++) {
-    const last = merged[merged.length - 1];
-    const cur = sorted[i];
-    if (cur[0] <= last[1]) {
-      last[1] = Math.max(last[1], cur[1]);
-    } else {
-      merged.push([...cur]);
-    }
-  }
-  return merged;
-}
+// 契约收敛：前端不再维护第二份 span/channel 算法。contract 与 span 校验结果
+// 一律来自后端（plan_review interrupt payload 的 verification_contract /
+// span_validation），编辑态只标草稿、隐藏覆盖图，不本地重算。
 
 function spanStyle(span, totalLen) {
   // 仅用于 tooltip/文本展示，不做复杂高亮
@@ -728,18 +590,26 @@ function spanStyle(span, totalLen) {
 }
 
 function spanStatusType(verification) {
+  const status = planReviewSpanStatus.value;
+  if (!status || !Array.isArray(status.gaps) || !Array.isArray(status.overlaps)) {
+    return "info";
+  }
   const key = verification.key;
-  const hasGap = planReviewSpanStatus.value.gaps.some(g => g.key === key);
-  const hasOverlap = planReviewSpanStatus.value.overlaps.some(o => o.key === key);
+  const hasGap = status.gaps.some(g => g.key === key);
+  const hasOverlap = status.overlaps.some(o => o.key === key);
   if (hasOverlap) return "danger";
   if (hasGap) return "warning";
   return "success";
 }
 
 function spanStatusText(verification) {
+  const status = planReviewSpanStatus.value;
+  if (!status || !Array.isArray(status.gaps) || !Array.isArray(status.overlaps)) {
+    return "未知";
+  }
   const key = verification.key;
-  const hasGap = planReviewSpanStatus.value.gaps.some(g => g.key === key);
-  const hasOverlap = planReviewSpanStatus.value.overlaps.some(o => o.key === key);
+  const hasGap = status.gaps.some(g => g.key === key);
+  const hasOverlap = status.overlaps.some(o => o.key === key);
   if (hasOverlap) return "重叠";
   if (hasGap) return "有缺口";
   return "覆盖完整";
@@ -905,7 +775,7 @@ function handleEvent(data) {
       }
       break;
     case "status": wp?.addEntry({ type: "log", text: typeof content === 'object' ? JSON.stringify(content) : String(content) }); refreshSnapshot(); break;
-    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewUserRequest.value = content.user_request || ""; planReviewContract.value = content.verification_contract || null; if (planReviewContract.value) { planReviewSpanStatus.value = validateContractSpans(planReviewContract.value); } else { rebuildEditedContract(); } planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
+    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewUserRequest.value = content.user_request || ""; planReviewContract.value = content.verification_contract || null; planReviewSpanStatus.value = content.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
     case "stream_token": wp?.onToken(); break;
@@ -930,7 +800,7 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewUserRequest.value = intr.user_request || ""; planReviewContract.value = intr.verification_contract || null; if (planReviewContract.value) { planReviewSpanStatus.value = validateContractSpans(planReviewContract.value); } else { rebuildEditedContract(); } planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewUserRequest.value = intr.user_request || ""; planReviewContract.value = intr.verification_contract || null; planReviewSpanStatus.value = intr.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
       wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports();
       break;
@@ -1154,22 +1024,28 @@ async function confirmIdentities() {
 
 // ═══════════ 计划审阅 ═══════════
 
+// 编辑态：仅标记草稿，隐藏覆盖图（契约收敛：前端不重算 clause 分解/span）
+function onEditDraft() {
+  isEditingDraft.value = true;
+}
+
 async function confirmPlan(action) {
   if (planReviewSubmitting.value) return;  // 防抖：已在提交中
   planReviewSubmitting.value = true;
   planReviewVisible.value = false;
   executing.value = true;
 
-  // 确保 contract 反映最终编辑状态
-  rebuildEditedContract();
-
+  // 契约收敛：前端不重建 contract（第二份算法已删），只回传 verification 文本数组，
+  // 后端 plan_review_node 一律基于 edited 重建 contract。
   const resumePayload = action === "cancel" ? "cancel" : {
     action: "confirm",
     goal: planReviewGoal.value,
     target_pages: planReviewPages.value.filter(p => p.trim()),
     verification: planReviewVerifications.value.filter(v => v.trim()),
     hints: planReviewHints.value.filter(h => h.trim()),
-    verification_contract: planReviewContract.value,
+    // 契约收敛：前端只回传 verification 文本数组，不回传 verification_contract。
+    // 后端 plan_review_node 一律基于 edited 重建 contract（含 context_spans + channels），
+    // 前端回传的 contract 会被忽略。
   };
 
   if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", text: action === "cancel" ? "目标已取消" : `目标已确认: ${planReviewGoal.value}` });

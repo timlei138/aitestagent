@@ -1393,6 +1393,14 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
     verification_contract = state.get("verification_contract", {})
     from langgraph.types import interrupt
 
+    # 后端下发 span 校验结果：前端零计算，直接展示（初始即绿，编辑降级草稿）
+    from agents.verification import validate_contract_spans
+
+    _initial_span_validation = (
+        validate_contract_spans(verification_contract)
+        if isinstance(verification_contract, dict)
+        else None
+    )
     result = interrupt(
         {
             "type": "plan_review",
@@ -1402,6 +1410,7 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
             "verification": goal.get("verification", []),
             "user_request": state.get("user_request", ""),
             "verification_contract": verification_contract,
+            "span_validation": _initial_span_validation,
         }
     )
     # If user edited the goal, use the edited version
@@ -1416,18 +1425,30 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
             "verification", goal.get("verification", [])
         )
         edited["hints"] = result.get("hints", goal.get("hints", []))
+
+        # 空 verification 守卫：验证项全删空则不允许 approve，避免 agent 空跑一轮
+        if not (edited.get("verification") or []):
+            logger.warning("Plan review: empty verification, keep pending")
+            pending_contract = {
+                "status": "contract_pending_review",
+                "reason": "empty_verification",
+            }
+            return Command(
+                update={
+                    "goal_description": edited,
+                    "verification_contract": pending_contract,
+                }
+            )
+
         logger.info("Plan review: user edited goal")
         from agents.verification import (
             build_verification_contract,
             validate_contract_spans,
         )
 
-        reviewed_contract = result.get("verification_contract")
-        contract = (
-            reviewed_contract
-            if isinstance(reviewed_contract, dict)
-            else build_verification_contract(edited, state.get("user_request", ""))
-        )
+        # 契约收敛：一律由后端基于 edited 重建 contract，忽略前端回传的
+        # verification_contract（前端只负责展示结构，不产判定、不回传）。
+        contract = build_verification_contract(edited, state.get("user_request", ""))
         contract = dict(contract)
         span_validation = validate_contract_spans(contract)
         if span_validation["valid"]:
@@ -1517,6 +1538,8 @@ def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
 
     contract = state.get("verification_contract", {})
     if not isinstance(contract, dict) or contract.get("status") != "approved":
+        # 路由交由 graph 的 conditional edge（未 approved -> reporter）决定，
+        # 此处不再设 goto（历史 goto 是死代码，已移除，避免误导维护者）
         return Command(
             update={
                 "status": "fail",
@@ -1525,14 +1548,17 @@ def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
                 "lifecycle_state": "Terminal",
                 "mode_selection_reason": "verification_contract_not_approved",
                 "selected_plan_actions": [],
-            },
-            goto="reporter",
+            }
         )
 
     span_validation = validate_contract_spans(contract)
     if not span_validation["valid"]:
         contract = dict(contract)
         contract["span_validation_error"] = span_validation
+        # 契约收敛：status 是 contract 唯一真相字段，校验失败则回退非 approved，
+        # 使 route_after_mode_selection 一致路由到 reporter（不再依赖 goto）。
+        contract["status"] = "contract_pending_review"
+        # 路由交给 conditional edge，不在此设 goto
         return Command(
             update={
                 "status": "fail",
@@ -1546,8 +1572,7 @@ def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
                 "mode_selection_reason": "verification_contract_span_invalid",
                 "verification_contract": contract,
                 "selected_plan_actions": [],
-            },
-            goto="reporter",
+            }
         )
 
     from agents.plan_extractor import (

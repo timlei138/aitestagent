@@ -464,3 +464,88 @@ def test_should_not_force_query_when_rag_already_available():
         graph._should_force_request_knowledge(state, include_rag=True, rag_summary="## 人工知识")  # type: ignore[attr-defined]
         is False
     )
+
+
+def test_plan_review_ignores_frontend_bad_contract(monkeypatch):
+    """锁 bug：plan_review_node 必须忽略前端回传的坏 verification_contract，
+    一律由后端 build_verification_contract 重建（修复 context_spans + channels 漂移）。
+
+    前端坏 contract 特征：status=contract_pending_review、context_spans=[]、channels 简化。
+    """
+    # 1) 跳过 stop 拦截 + 提供 fake ctx（plan_review_node 直接读 get_tool_context）
+    monkeypatch.setattr(nodes, "_stop_or_continue", lambda state, ctx: None)
+    monkeypatch.setattr(nodes, "get_tool_context", lambda: SimpleNamespace())
+    # 2) 替换 interrupt 为返回前端坏 contract 的 confirm 决策
+    bad_contract = {
+        "status": "contract_pending_review",
+        "context_spans": [],
+        "verifications": [
+            {
+                "key": "v0",
+                "statement": "页面切换到设置页并且开关被打开",
+                "channels": ["ui_text", "vision_verify", "click_and_check", "behavior_effect"],
+            }
+        ],
+    }
+    fake_decision = {
+        "action": "confirm",
+        "goal": "切到设置页并打开开关",
+        "target_pages": ["设置页"],
+        "verification": ["页面切换到设置页并且开关被打开"],
+        "hints": [],
+        "verification_contract": bad_contract,
+    }
+    monkeypatch.setattr(
+        "langgraph.types.interrupt", lambda payload: fake_decision
+    )
+
+    state = {
+        "goal_description": {
+            "goal": "切到设置页并打开开关",
+            "target_pages": ["设置页"],
+            "verification": ["页面切换到设置页并且开关被打开"],
+        },
+        "user_request": "请验证设置页切换和开关",
+        "verification_contract": bad_contract,
+    }
+    cmd = nodes.plan_review_node(
+        state, {"configurable": {"test_config": AppTestConfig(), "thread_id": "t"}}
+    )
+    contract = cmd.update["verification_contract"]
+    # 后端重建后 status 必须 approved（build->validate 恒 valid）
+    assert contract["status"] == "approved"
+    # context_spans 必须非空（前端坏 contract 的 [] 已被后端重建覆盖）
+    assert contract["verifications"][0]["context_spans"]
+    # channels 必须含 page_state / element_state（前端简化的漂移被修好）
+    assert "page_state" in contract["verifications"][0]["clauses"][0]["channels"]
+    assert "element_state" in contract["verifications"][0]["clauses"][0]["channels"]
+
+
+def test_route_after_mode_selection_unapproved_goes_reporter():
+    """锁 bug：verification_contract 未 approved 时，mode_selection 路由必须返回 reporter，
+    避免 agent 空跑一轮再被 evaluator 判 inconclusive（旧 conditional edge 只认
+    direct/agent，把 mode_selection_node 的 goto='reporter' 死代码覆盖掉）。"""
+    # 未 approved：contract 缺 status
+    state_pending = {
+        "verification_contract": {"status": "contract_pending_review"},
+        "execution_mode": "agent",
+    }
+    assert graph.route_after_mode_selection(state_pending) == "reporter"
+
+    # 非 dict contract
+    state_none = {"verification_contract": None, "execution_mode": "agent"}
+    assert graph.route_after_mode_selection(state_none) == "reporter"
+
+    # 已 approved -> agent
+    state_agent = {
+        "verification_contract": {"status": "approved"},
+        "execution_mode": "agent",
+    }
+    assert graph.route_after_mode_selection(state_agent) == "agent"
+
+    # 已 approved -> direct
+    state_direct = {
+        "verification_contract": {"status": "approved"},
+        "execution_mode": "direct",
+    }
+    assert graph.route_after_mode_selection(state_direct) == "direct"

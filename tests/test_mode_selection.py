@@ -210,10 +210,15 @@ def test_mode_selection_terminates_to_reporter_when_contract_not_approved():
 
     command = nodes.mode_selection_node(state, {})
 
-    assert command.goto == "reporter"
+    # mode_selection_node 不再设 goto（路由交由 graph conditional edge 接管），
+    # 节点只负责写好 fail 状态；真正跳 reporter 的是 route_after_mode_selection。
+    assert command.goto == ()
     assert command.update["status"] == "fail"
     assert "CONTRACT_REVIEW_REQUIRED" in command.update["conclusion"]
     assert command.update["mode_selection_reason"] == "verification_contract_not_approved"
+    # 真正生效的路由：未 approved -> reporter（合并节点 update 后）
+    routed_state = {**state, "verification_contract": command.update.get("verification_contract", state["verification_contract"])}
+    assert graph.route_after_mode_selection(routed_state) == "reporter"
 
 
 def test_mode_selection_terminates_to_reporter_when_span_validation_fails():
@@ -244,9 +249,13 @@ def test_mode_selection_terminates_to_reporter_when_span_validation_fails():
 
     command = nodes.mode_selection_node(state, {})
 
-    assert command.goto == "reporter"
+    assert command.goto == ()
     assert command.update["status"] == "fail"
     assert command.update["mode_selection_reason"] == "verification_contract_span_invalid"
+    # 真正生效的路由：节点把 contract status 回退为非 approved，
+    # graph conditional edge 据此路由到 reporter（模拟 state 合并 update 后）
+    routed_state = {**state, "verification_contract": command.update["verification_contract"]}
+    assert graph.route_after_mode_selection(routed_state) == "reporter"
 
 
 def test_direct_requires_full_environment_score(monkeypatch):

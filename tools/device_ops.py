@@ -45,12 +45,20 @@ def paste() -> str:
 
 @tool
 def type_input(text: str) -> str:
-    """向当前已聚焦的输入框输入文本。"""
+    """向当前已聚焦的输入框输入文本，走输入法通道（ADBKeyboard）。
+
+    - 传正常文本：清空当前输入框原有内容，再输入 text（整框覆盖）。
+    - 传空字符串 text=\"\"：仅清空当前输入框，不写入任何内容（即「删除/清空输入框」）。
+      清空/删除输入框内容时**优先用本工具传空串**，这是最轻量、最确定的输入法方案，
+      不要为了清空而去 long_press 输入框再走菜单。
+    - 本工具会整框覆盖，无法只删除光标前后「部分」字符。若需求是「保留前半、删掉后半」
+      （部分删除/选中替换），才用 long_press 选中目标片段后再操作。
+    """
     ctx = get_tool_context()
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
     ctx.device.type_text(text)
-    return f"已输入: {text}"
+    return f"已输入: {text}" if text else "已清空输入框"
 
 
 @tool

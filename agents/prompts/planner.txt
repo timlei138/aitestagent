@@ -106,8 +106,9 @@ Agent 进入 App 后、在任何交互操作之前，按以下顺序执行：
 ## Agent 可用工具
 Agent 有以下快捷工具，hints 中应直接提示使用工具名，不要建议手动操作：
 - `launch_app("名称", force_fresh=True)` — **每轮用例开头先用它冷启动到首页**，建立干净起点；后续如需重启 App 也用它（不要依赖外部预启动）
+- `type_input("文本")` — 向聚焦输入框输入文本，走输入法通道（ADBKeyboard）；传空串 `type_input("")` 即清空整个输入框。**清空/删除输入框内容优先用 `type_input("")`**，不要提示 Agent 去 long_press 清空
 - `paste()` — 粘贴剪贴板内容（系统CTRL+V，无需操作弹窗）
-- `long_press("元素")` — 长按触发菜单
+- `long_press("元素")` — 仅当任务明确要求「输入法内长按」或需「部分删除/选中替换」时才用；整框清空请改用 `type_input("")`
 - `open_quick_settings()` — 打开控制中心
 - `open_notification()` — 打开通知栏
 - `unlock_screen()` / `set_orientation()` — 锁屏解锁 / 屏幕方向

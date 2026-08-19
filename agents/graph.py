@@ -135,6 +135,19 @@ def route_after_plan_review(state: TestState) -> str:
     return "mode_selection"
 
 
+def route_after_mode_selection(state: TestState) -> str:
+    """Route after mode_selection_node.
+
+    契约收敛：verification_contract 未 approved 时直接进 reporter（避免 agent
+    空跑一轮再被 evaluator 判 inconclusive）。approved 后按 execution_mode 选
+    direct / agent。此函数替代原匿名 lambda，便于测试直接断言。
+    """
+    contract = state.get("verification_contract", {})
+    if not isinstance(contract, dict) or contract.get("status") != "approved":
+        return "reporter"
+    return "direct" if state.get("execution_mode") == "direct" else "agent"
+
+
 def route_start(state: TestState) -> str:
     """Every run creates and reviews a current contract before execution."""
     return "planner"
@@ -161,8 +174,8 @@ def build_graph(config: TestConfig) -> StateGraph:
     )
     g.add_conditional_edges(
         "mode_selection",
-        lambda state: "direct" if state.get("execution_mode") == "direct" else "agent",
-        {"direct": "direct", "agent": "agent"},
+        route_after_mode_selection,
+        {"direct": "direct", "agent": "agent", "reporter": "reporter"},
     )
     g.add_edge("direct", "evaluator")
     g.add_conditional_edges(

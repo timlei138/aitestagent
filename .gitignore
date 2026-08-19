@@ -231,4 +231,5 @@ storage/test_history.db-wal
 scripts/*
 !scripts/migrate_curated_rules_v2.py
 config.local.yaml
+output/
 
