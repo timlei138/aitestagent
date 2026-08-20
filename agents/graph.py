@@ -12,7 +12,7 @@ from typing import Any, Annotated
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
-from config import TestConfig
+from config import TestConfig, UNKNOWN_ROUTE_LIMIT, UNKNOWN_RESTRICT_AFTER
 from agents.state import TestState
 from agents.budget import _calc_budget, _calc_budget_from_state, _calc_mode_phase_budget
 from agents.rag_context import (
@@ -23,6 +23,9 @@ from agents.verification import (
     _determine_execution_status,
     evaluate_verification,
 )
+
+# M2（Plan §7）：unknown（inconclusive）路由上限。达到后 route_after_evaluator 强制
+# 收敛到 reporter，治「问题2-RootA 图不终止」。常量统一定义于 config.py。
 from tools import get_tool_context
 from agents.nodes import (
     agent_node,
@@ -71,6 +74,31 @@ def route_after_evaluator(state: TestState) -> str:
     if evaluation["verdict"] in {"passed", "failed"}:
         logger.info("Route: reporter (contract verdict=%s)", evaluation["verdict"])
         return "reporter"
+
+    # M2（Plan §7）：unknown（inconclusive）路由上限。达到上限后强制收敛到 reporter，
+    # 治「问题2-RootA 图不终止」——避免 inconclusive 一直吃满 agent 预算、期间做契约外探索。
+    # 计数与耗尽标志由 evaluator_node 经累加 reducer 维护，独立于 max_agent_iterations。
+    if state.get("_unknown_exhausted") or int(
+        state.get("_unknown_route_count", 0) or 0
+    ) >= UNKNOWN_ROUTE_LIMIT:
+        logger.warning(
+            "Route: reporter (unknown routes exhausted: %d)",
+            int(state.get("_unknown_route_count", 0) or 0),
+        )
+        return "reporter"
+
+    # 证据驱动终止机制 · 第 3 层：M2 兜底（死循环护栏）已在上方优先判定，此处是「正常范围内」
+    # 的强制回环。agent 已声明 DONE（status=="success"），但 verdict 仍为 inconclusive
+    # （有 unknown、无 failed；failed 已在最上方 verdict 分支被 reporter 截走）。
+    # 此时「结束只能靠证据判定」的契约必须由代码强制：不放过 DONE，把图回环到 agent 节点。
+    # 专门提示不依赖跨层 flag——agent 在历史中能看到自己上轮的 report_done 被驳回，且 agent_node
+    # 每轮都会重新注入「待验证清单」+「若你上轮已 DONE 但清单非空则不得重申 DONE」提示。
+    # 注意：每次回环都会经过 evaluator_node 累加 _unknown_route_count，故 M2 上限仍能兜底防死循环。
+    if state.get("status") == "success" and evaluation["verdict"] == "inconclusive":
+        logger.warning(
+            "Route: agent (DONE loopback: status=success but verdict=inconclusive)"
+        )
+        return "agent"
     if state.get("execution_mode") == "direct":
         # If direct already degraded once, do not route back to direct.
         if int(state.get("_direct_downgrade_count", 0) or 0) >= 1:

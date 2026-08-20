@@ -11,47 +11,23 @@ from typing import Any
 from agents.budget import _calc_budget_from_state
 from agents.loop_control import _detect_termination
 
-_VISUAL_CLAIM_MARKERS = ("颜色", "红色", "黑色", "布局", "图标", "样式", "视觉")
-_TEXT_CLAIM_MARKERS = ("文字", "文本", "提示", "toast", "显示")
-_STATE_CLAIM_MARKERS = (
-    "页面", "activity", "状态", "开启", "关闭", "勾选", "选中", "打开", "开关",
-)
 _CLAUSE_BOUNDARY = re.compile(r"[，,；;]+|(?:并且|同时|以及|且)")
 
-
-def _default_channels_for_claim(claim: str) -> list[str]:
-    """Choose the evidence channels for a generated claim.
-
-    - Visual claims rely on vision_verify (screenshot + VLM).
-    - Text claims rely on ui_text / click_and_check (OCR / UI-tree text).
-    - State/switch claims use behavior_effect (did the action produce the expected
-      result) and vision_verify (does the screenshot show the switch on/off), and
-      also accept page_state / element_state: a page_state PASS (e.g. landed on the
-      expected activity) or element_state PASS (target element exists) is genuine
-      positive evidence and must be recognized by the evaluator, otherwise the run
-      is wrongly marked inconclusive while the frontend (which shows any PASS) looks
-      green. The original concern about Accessibility ``checked`` unreliability only
-      applied to the producer side (agent loop of open/close to collect evidence),
-      not to the evaluator accepting an observed state.
-    - The fallback lists channels that have a real producer so a claim never lands
-      in a dead channel.
-    """
-    normalized = str(claim or "").lower()
-    if any(marker in normalized for marker in _VISUAL_CLAIM_MARKERS):
-        return ["vision_verify", "page_state", "element_state"]
-    if any(marker in normalized for marker in _TEXT_CLAIM_MARKERS):
-        return ["ui_text", "click_and_check", "page_state", "element_state"]
-    if any(marker in normalized for marker in _STATE_CLAIM_MARKERS):
-        # UI Tree 能判定的状态/页面类断言优先走 UI Tree；视觉仅作为兜底。
-        return ["page_state", "element_state", "behavior_effect", "vision_verify"]
-    return [
-        "ui_text",
-        "vision_verify",
-        "click_and_check",
-        "behavior_effect",
-        "page_state",
-        "element_state",
-    ]
+# M1-4: 删除关键词通道推断（discrepancy_detection_core_plan Phase 0）。
+# 原 _default_channels_for_claim 依据 claim 关键词（"状态"/"提示"/"显示"...）猜测
+# 证据通道，是 v4 通道漂移与 v5 漏判的根因之一。Plan §6 要点4：channel 由 spec 谓词
+# 决定（Phase 1）；M1 阶段 spec:null 的 claim 回退到全通道（含 behavior_effect），
+# 由 authoritative 标志承接确定性判定，不再靠关键词白名单过滤。
+# 全通道顺序：UI Tree 类（page_state/element_state/behavior_effect）优先，其余视觉/
+# 文本通道兜底——与 Plan §6 要点4 回退一致。
+_ALL_CHANNELS_FALLBACK = (
+    "page_state",
+    "element_state",
+    "behavior_effect",
+    "ui_text",
+    "vision_verify",
+    "click_and_check",
+)
 
 
 def _split_claims(statement: str) -> list[str]:
@@ -84,13 +60,21 @@ def evaluate_verification(
                 continue
             clause_id = str(clause.get("id", "") or "")
             channels = {str(channel) for channel in clause.get("channels", []) or []}
-            matching = [
+            in_scope = [
                 event
                 for event in events or []
                 if isinstance(event, dict)
                 and str(event.get("verification_key", "") or "") == key
                 and str(event.get("clause_id", "") or "") == clause_id
-                and str(event.get("channel", "") or "") in channels
+            ]
+            # M1-2: authoritative 证据无视 channels 过滤，直接进匹配集。
+            # 非 authoritative 证据仍按 channels 过滤（保留 test_contract_ignores_
+            # undeclared_or_free_text_evidence 的语义）。
+            matching = [
+                event
+                for event in in_scope
+                if bool(event.get("authoritative", False))
+                or str(event.get("channel", "") or "") in channels
             ]
             positive = any(
                 str(event.get("status", "") or "").upper() in {"PASS", "YES"}
@@ -101,17 +85,29 @@ def evaluate_verification(
                 and str(event.get("status", "") or "").upper() in {"FAIL", "NO"}
                 for event in matching
             )
+            # M1-1 + M1-2 优先级链（discrepancy_detection_core_plan §6 要点①）：
+            # authoritative FAIL > 任意 PASS(权威/非权威) > unknown。
+            # authoritative FAIL 压住一切 positive（根治 v5：positive 命中仍 failed）；
+            # 非 authoritative PASS 不得压过 authoritative FAIL。
+            # 注意：authoritative PASS 是 positive 的子集，无需单独变量；
+            # 优先级仅两层（FAIL 优先 / 否则 PASS / 否则 unknown）。
             status = (
-                "passed"
-                if positive
-                else "failed" if authoritative_failure else "unknown"
+                "failed"
+                if authoritative_failure
+                else "passed" if positive else "unknown"
             )
+            # M2（Plan §7 增强）：零证据 unknown 标记 unverified。区分「agent 从
+            # 未对此 clause 调用验证工具（漏验）」与「调用过但证据不足/通道不匹配」。
+            # 两者都判 unknown + review_required，但 unverified 用于前端/报告暴露
+            # agent 幻觉式跳过验证（如口头声称「v0-v4 已通过」却零工具证据）。
+            unverified = status == "unknown" and len(matching) == 0
             clauses.append(
                 {
                     "id": clause_id,
                     "claim": str(clause.get("claim", "") or ""),
                     "status": status,
                     "evidence_count": len(matching),
+                    "unverified": unverified,
                 }
             )
         result = (
@@ -184,7 +180,9 @@ def build_verification_contract(
                     "id": f"{key}.{clause_index}",
                     "claim": claim,
                     "goal_source_span": [claim_offset, cursor],
-                    "channels": _default_channels_for_claim(claim),
+                    # M1-4: 删关键词推断（Plan Phase 0）。M1 阶段 spec:null 回退全通道
+                    # （含 behavior_effect），与 §6 要点4 一致；M4 后由 spec 谓词决定。
+                    "channels": list(_ALL_CHANNELS_FALLBACK),
                 }
             )
         # Gaps between clauses (connectors/punctuation) are context, not condition.

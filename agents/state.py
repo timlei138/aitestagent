@@ -116,3 +116,11 @@ class TestState(TypedDict, total=False):
     # 用户手动停止标志（由 orchestrator.request_stop 置位，节点入口检查）。
     # 命中时让图收敛到 reporter 写 cancelled，不影响其他状态的正常流转。
     _stop_requested: bool
+    # M2（discrepancy_detection_core_plan §7）：inconclusive（unknown）路由累计次数。
+    # evaluator 每次判定 inconclusive 时 +1（累加 reducer），route_after_evaluator
+    # 超过上限后强制收敛到 reporter，治「问题2-RootA 图不终止」。
+    _unknown_route_count: Annotated[int, operator.add]
+    _unknown_exhausted: bool
+    # M3（Plan §8 代码护栏）：连续 inconclusive 达到阈值后置位，提示 agent_node
+    # 限制契约外探索（如 re-import / launch_app 重开），治 RootB agent 惯性。
+    _explore_restricted: bool

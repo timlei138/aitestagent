@@ -167,6 +167,7 @@ class SqliteBackend(RelationalBackend):
                 duration_seconds REAL NOT NULL DEFAULT 0.0,
                 llm_call_count INTEGER NOT NULL DEFAULT 0,
                 token_usage_json TEXT NOT NULL DEFAULT '{}',
+                verification_results_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (plan_id) REFERENCES execution_plans(plan_id)
@@ -250,7 +251,23 @@ class SqliteBackend(RelationalBackend):
             CREATE INDEX IF NOT EXISTS idx_evidence_events_run
                 ON evidence_events(run_id, verification_key, clause_id);
         """)
+        self._migrate_execution_runs()
         self._conn.commit()
+
+    def _migrate_execution_runs(self) -> None:
+        """兼容旧库：为 execution_runs 补 verification_results_json 列（Plan §7 差异报告）。"""
+        try:
+            cols = {
+                r["name"]
+                for r in self._conn.execute("PRAGMA table_info(execution_runs)").fetchall()
+            }
+            if "verification_results_json" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE execution_runs ADD COLUMN verification_results_json "
+                    "TEXT NOT NULL DEFAULT '{}'"
+                )
+        except Exception as _e:  # 迁移失败不应阻断建表
+            logger.warning("execution_runs 迁移失败: %s", _e)
 
     def execute(self, sql: str, params: tuple = ()) -> Any:
         return self._conn.execute(sql, params)
@@ -321,6 +338,7 @@ class SqliteBackend(RelationalBackend):
         duration_seconds: float = 0.0,
         llm_call_count: int = 0,
         token_usage: dict[str, Any] | None = None,
+        verification_results: list[dict[str, Any]] | None = None,
     ) -> None:
         """Persist the current run in the v2 execution schema."""
         now = datetime.now().isoformat()
@@ -347,6 +365,9 @@ class SqliteBackend(RelationalBackend):
                 "llm_call_count": int(llm_call_count or 0),
                 "token_usage_json": json.dumps(
                     token_usage or {}, ensure_ascii=False
+                ),
+                "verification_results_json": json.dumps(
+                    verification_results or [], ensure_ascii=False
                 ),
                 "created_at": now,
                 "updated_at": now,
@@ -827,6 +848,9 @@ class SqliteBackend(RelationalBackend):
         )
         report["token_usage"] = json.loads(
             report.pop("token_usage_json", "{}") or "{}"
+        )
+        report["verification_results"] = json.loads(
+            report.pop("verification_results_json", "[]") or "[]"
         )
         action_rows = self._conn.execute(
             """

@@ -54,11 +54,19 @@
 - `PASS` / `FAIL: ...` 断言结果（assert_page_contains / assert_element_exists）。
 
 ## 验证报告与人工复核边界
-- 每个 verification clause 必须由对应验证工具产生 current-run evidence。调用 `assert_page_contains` / `assert_element_exists` 时必须提供上下文给出的 `verification_key` 与 `clause_id`；不要报告自由文本的 passed/failed。
+- 每个 verification clause 必须由对应验证工具产生 current-run evidence。调用 `assert_page_contains` / `assert_element_exists` / `assert_behavior_effect` 时**都必须**提供上下文给出的 `verification_key` 与 `clause_id`——尤其是 `assert_behavior_effect`（toggled/disabled 等开关类断言），同样要带 clause 身份，否则该条开关类 clause 收不到证据会被判 unknown（前端「未验证」）；不要报告自由文本的 passed/failed。
+- ❗ **每条 assert 必须用系统注入的「待验证清单 / 已通过验证」里给出的精确 `verification_key::clause_id` 原样填进 verified_key / clause_id 参数**，且用标注的 channel 对应工具。不同 clause 用各自真实的 clause_id，**严禁把所有 assert 都打同一个 clause_id（如全打 v0.0）**——那样证据会全部错配到 v0，其余 clause 因收不到对应身份的证据被判 unknown（前端显示「未验证」），即便 assert 返回 PASS 也无效。
 - 证据工具只能证明其声明的 UI 事实。缺少对应通道的证据时，evaluator 保持 unknown；不要猜测通过。
+- ❗ **进入任一页面后，必须先用验证工具覆盖该页面所有「尚未拿到证据」的 clause，禁止以 `get_screen_info` 的肉眼观察替代验证工具产出 passed。** 看到页面「看起来正常」不等于验证通过——只有 `assert_*` 工具返回 `PASS` 才是证据。不得在任何消息里写「某 clause 已验证通过 / vX-vY 已通过」之类结论，除非该 clause 已有工具产出的 PASS 证据（evaluator 不读取你的文字结论，只认工具证据）。
 - 以下主张默认只能报 `unknown`，除非已有专门的客观测量/受控夹具工具提供证据：内部接口或调用链是否执行、真实相机/硬件采集、全量媒体过滤、动画/手势是否命中目标、流畅/无卡顿/无延迟/无掉帧等性能体验。
 - 页面跳转、当前 Activity、元素存在、按钮可点击等，只能证明对应的 UI 事实；**不能外推**为接口调用成功、功能全量正确或性能流畅。一个验证项含多个主张时，只要其中任一关键主张无法核实，整个验证项报 `unknown`，并在 detail 中保留已观察到的 UI 事实供人工复核。
 - 可**字面判定**的验证项（页面是否含某文字、某元素是否存在），先用 `assert_page_contains` / `assert_element_exists`：返回 `PASS` 才是可靠的确定性证据。
+- 同一增量控件（加号/减号/步进器/“+1”/“最多添加 N 节”）需连点多次时，**必须一次 `click(label=..., repeat=N)` 或 `vision_tap(..., repeat=N)` 完成，禁止连发 N 次相同 click**——后者会被循环断路器（LOOP_DETECTED）判为死循环并 abort 本轮。N = 目标值 − 当前值（如当前 5、目标 10 → repeat=5）；switch/checkbox 切换控件不要传 repeat。详见 agent_explore 的「同一增量控件需连点多次」节。
+
+## 状态类 claim 必须用专用谓词验证（不要猜）
+- **置灰/禁用/可点/开关态**这类「状态类」claim，**必须用 `assert_behavior_effect` 的 `disabled(label)` / `enabled(label)` / `toggled(...)` 谓词**做确定性验证（读控件 `isEnabled()` / checked 状态，证据权威、确定、可点开复核）。
+- **不要用** `click_and_check` 去"点一下看弹不弹 Toast"，也不要用 `visual_check` 去"看颜色/看灰不灰"猜状态——视觉/点击只能证伪、不能证明禁用，会引入 unknown 漂移且破坏"禁止破坏性操作"规则。
+- 判定口诀：**问"这个控件现在是什么状态" → `assert_behavior_effect` 状态谓词；问"页面有没有某文字/某元素" → `assert_page_contains` / `assert_element_exists`；问"颜色/布局/图标观感" → `visual_check`。三者各管一类，不要混用。
 - `FAIL` 不代表验证失败：图标、无文字元素或 canvas 绘制会导致文字断言失败。没有其他可靠反证时，报 `unknown` 并说明人工复核缺口；不要把模型观察或一次普通滑动当作性能结论。
 - 例如：`assert_page_contains(text="计算器", verification_key="v0", clause_id="v0.0")`
 

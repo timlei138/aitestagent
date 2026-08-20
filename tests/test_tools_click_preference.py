@@ -539,6 +539,92 @@ def test_click_rejects_empty_label_without_locator():
     assert "label 不能为空" not in out_idx
 
 
+def test_click_repeat_performs_n_taps_on_resolved_element():
+    # 回归：click(label=..., repeat=N) 必须对同一个已解析元素连点 N 次（增量控件场景，
+    # 如“最多添加10节”连点 + 号）。一次性完成，避免 agent 连发 N 次相同 click 触发
+    # LOOP_DETECTED 把本轮 abort。本测试锁定：repeat=4 → click_bounds 被调用 4 次，
+    # 且返回文案含「连点4次」。
+    class _Device:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.MainActivity",
+            }
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+        def click_resource_id(self, rid):
+            return False
+
+        def click_text(self, text):
+            return False
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.MainActivity",
+                page_title="",
+                primary_paths=[],
+                elements=[_el(label="加号", bounds=(20, 120, 220, 180))],
+            )
+
+    tools_module.set_tool_context(ToolContext(device=_Device(), perceiver=_Perceiver()))
+    out = tools_module.click.invoke({"label": "加号", "repeat": 4})
+    assert "已点击" in out
+    assert "连点4次" in out
+    assert len(_Device().clicked_bounds) == 0  # sanity: fresh instance unused
+    # 重新跑以统计真实调用次数
+    d = _Device()
+    tools_module.set_tool_context(ToolContext(device=d, perceiver=_Perceiver()))
+    tools_module.click.invoke({"label": "加号", "repeat": 4})
+    assert len(d.clicked_bounds) == 4  # 首次（_perform_click）+ 额外 3 次 repeat
+
+
+def test_click_repeat_ignored_for_switch_toggle():
+    # 回归：switch/checkbox 是“切换”控件，连点会来回切，repeat 必须被忽略（仍只点 1 次）。
+    class _Device:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.MainActivity",
+            }
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.MainActivity",
+                page_title="",
+                primary_paths=[],
+                elements=[
+                    _el(
+                        label="WLAN",
+                        bounds=(20, 120, 220, 180),
+                        role="switch",
+                        cls="android.widget.Switch",
+                    )
+                ],
+            )
+
+    d = _Device()
+    tools_module.set_tool_context(ToolContext(device=d, perceiver=_Perceiver()))
+    out = tools_module.click.invoke({"label": "WLAN", "repeat": 5})
+    # switch 走专用回检路径（sleep 4s），repeat 被忽略：bounds 只点 1 次
+    assert "连点" not in out
+    assert len(d.clicked_bounds) == 1
+
+
 def test_empty_requested_label_never_counts_as_fuzzy():
     # P0 第 4 点回归：空 requested_label 绝不能被记为 fuzzy_match=True。
     # click.py:827-832 的 fuzzy_match 公式依赖「双方非空」约束（_q 与 _el_label

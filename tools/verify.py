@@ -293,7 +293,17 @@ def _infer_state_from_text(text: str) -> str | None:
 def assert_behavior_effect(
     expected: str, verification_key: str = "", clause_id: str = ""
 ) -> str:
-    """Assert a deterministic page behavior using a restricted predicate DSL."""
+    """Assert a deterministic page behavior using a restricted predicate DSL.
+
+    Supported predicates:
+    - still_on_activity(activity)            -> before/after 比较, authoritative=True
+    - no_page_change(signature)              -> before/after 比较, authoritative=True
+    - list_count_unchanged(anchor,count)     -> before/after 比较, authoritative=True
+    - element_present(label)                 -> 当前态检查, authoritative=False
+    - element_absent(label)                  -> 当前态检查, authoritative=False
+    - toggled(label,on|off)                  -> 当前态(checked 过渡态), authoritative=False
+    - disabled(label)                        -> 读 View.isEnabled(), 置灰矛盾 authoritative=True
+    """
     ctx = get_tool_context()
     expected = str(expected or "").strip()
     passed = False
@@ -442,6 +452,49 @@ def assert_behavior_effect(
                 inferred,
                 passed,
             )
+        elif expected.startswith("disabled(") and expected.endswith(")"):
+            # disabled(label): 断言某元素处于置灰/不可交互状态（enabled=False）。
+            # 对应 Plan §5 D1：必填项为空时"完成"按钮置灰 → 期望 disabled=True。
+            # 读 View.isEnabled()（UI Tree 真实字段，可靠且稳定，不同于 Accessibilty
+            # checked 过渡态抖动），故 FAIL（期望置灰却 enabled=True）标 authoritative=True，
+            # 触发 fail-fast（根治 v5：置灰差异直接判 failed，不靠 LLM 通道补判 passed）。
+            # 这是既有"当前态→非权威"规则的刻意例外（toggled/element_present/absent
+            # 保持非权威），仅 disabled 单独标权威。
+            label = expected[9:-1].strip().strip('"').strip("'")
+            if not label:
+                return f"ERROR: disabled requires a label: {expected}"
+            understanding = ctx.perceiver.perceive() if ctx.perceiver else None
+            matched = None
+            for element in understanding.elements if understanding else []:
+                if label and (
+                    label in (element.label or "")
+                    or label in (element.resource_id or "")
+                ):
+                    matched = element
+                    break
+            if matched is None:
+                return f"ERROR: disabled anchor not found: {label}"
+            actual_enabled = bool(getattr(matched, "enabled", True))
+            fact.update(
+                {
+                    "anchor": label,
+                    "resource_id": getattr(matched, "resource_id", None),
+                    "bounds": getattr(matched, "bounds", None),
+                    "enabled": actual_enabled,
+                    "expected_disabled": True,
+                }
+            )
+            passed = not actual_enabled
+            channel = "behavior_effect"
+            # enabled=View.isEnabled() 可靠 → 置灰矛盾为权威反证。
+            authoritative = True
+            logger.debug(
+                "[verify] disabled state: anchor=%r enabled=%s expected_disabled=True "
+                "→ passed=%s (authoritative=True)",
+                label,
+                actual_enabled,
+                passed,
+            )
         else:
             # 格式校验（P0 第 2 点补强）：以 toggled 开头但格式不对（裸 toggled /
             # 缺 on|off / 多了括号）时，明确提示完整格式而非只走通用 unsupported。
@@ -459,7 +512,7 @@ def assert_behavior_effect(
                 "supported predicates: still_on_activity(activity), "
                 "no_page_change(signature), list_count_unchanged(anchor,count), "
                 "element_present(label), element_absent(label), "
-                "toggled(label,on|off)"
+                "toggled(label,on|off), disabled(label)"
             )
     except Exception as exc:
         return f"ERROR: behavior effect check failed: {exc}"

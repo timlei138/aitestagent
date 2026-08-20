@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from agents.verification import (
-    _default_channels_for_claim,
     build_coverage_map,
     build_verification_contract,
     evaluate_verification,
@@ -47,6 +46,51 @@ def test_contract_requires_evidence_for_every_clause():
     assert result["verifications"][0]["clauses"][1]["status"] == "unknown"
 
 
+def test_contract_marks_zero_evidence_unknown_as_unverified():
+    """Plan §7 增强：agent 仅验证部分 clause 时，零证据 unknown clause 应标记
+    unverified=True（暴露幻觉式漏验，如口头声称 v0-v4 已通过却零工具证据）。"""
+    result = evaluate_verification(
+        CONTRACT,
+        [
+            {
+                "verification_key": "v0",
+                "clause_id": "v0.red",
+                "channel": "vision_verify",
+                "status": "YES",
+            }
+        ],
+    )
+    clauses = {c["id"]: c for c in result["verifications"][0]["clauses"]}
+    # v0.red 有证据 → 非 unverified
+    assert clauses["v0.red"]["status"] == "passed"
+    assert clauses["v0.red"].get("unverified") is not True
+    # v0.saved 零证据 → unknown + unverified
+    assert clauses["v0.saved"]["status"] == "unknown"
+    assert clauses["v0.saved"]["unverified"] is True
+
+
+def test_contract_unverified_false_when_evidence_present_but_undecided():
+    """对照：clause 有匹配通道的证据事件，但状态为 NO（非 YES/PASS）→ 仍判
+    unknown，然而 evidence_count>0 → unverified=False。以此区分「验证过但证据
+    不足/未决」与「从未调用验证工具（零证据）」两类 unknown。"""
+    result = evaluate_verification(
+        CONTRACT,
+        [
+            {
+                # behavior_effect 通道匹配，但状态为 NO（未决）→ unknown 但非漏验
+                "verification_key": "v0",
+                "clause_id": "v0.saved",
+                "channel": "behavior_effect",
+                "status": "NO",
+            }
+        ],
+    )
+    clause = result["verifications"][0]["clauses"][1]
+    assert clause["status"] == "unknown"
+    assert clause["evidence_count"] > 0
+    assert clause["unverified"] is False
+
+
 def test_contract_ignores_undeclared_or_free_text_evidence():
     result = evaluate_verification(
         CONTRACT,
@@ -63,50 +107,19 @@ def test_contract_ignores_undeclared_or_free_text_evidence():
     assert result["verdict"] == "inconclusive"
 
 
-def test_default_channels_for_switch_state_claims():
-    """状态/开关类 claim 用行为 + 视觉 + 页面态 + 元素态验证。
-
-    说明（修订自原设计）：原设计刻意排除 page_state/element_state，理由是 Accessibility
-    ``checked`` 属性在不同 ROM 上不可靠、易诱导 agent 反复开关补证据。但 ``checked`` 不可靠
-    只是 element_state 的一种取值（开关勾选）；而 page_state（落到预期 Activity/包）与
-    element_exists（目标元素存在）是可靠的正向证据。评估器只负责「承认已观测到的证据」，
-    并不驱动 agent 去收集——因此把这两个通道纳入评估匹配，可避免「前端显示已通过、但
-    run 被判 inconclusive」的不一致（见 2026-08-18 日志复盘）。
+def test_contract_clauses_use_all_channel_fallback():
+    """M1-3/M1-4: 删除关键词通道推断后，clause 的 channels 恒为全通道回退
+    （含 behavior_effect），由 authoritative 标志承接确定性判定（Plan §6 要点4）。
     """
-    switch_claims = [
-        "Wi-Fi开关可正常打开",
-        "开关是开启的",
-        "勾选用户协议",
-        "选中第一个选项",
-        "按钮状态为关闭",
-        "WLAN 打开后状态变为开启",
-    ]
-    for claim in switch_claims:
-        channels = _default_channels_for_claim(claim)
-        assert "vision_verify" in channels, f"{claim!r} 缺少 vision_verify"
-        assert "behavior_effect" in channels, f"{claim!r} 缺少 behavior_effect"
-        # page_state / element_state 现作为可靠正向证据被纳入（非 checked 属性本身）
-        assert "page_state" in channels, f"{claim!r} 应纳入 page_state"
-        assert "element_state" in channels, f"{claim!r} 应纳入 element_state"
-
-
-def test_default_channels_for_text_claims():
-    channels = _default_channels_for_claim("页面提示文字为保存成功")
-    assert "ui_text" in channels
-    assert "click_and_check" in channels
-    assert "vision_verify" not in channels
-
-
-def test_default_fallback_channels_have_producers():
-    """完全无 marker 命中的 claim，fallback 包含全部有生产者的通道（含 page/element_state）。"""
-    channels = _default_channels_for_claim("something totally unknown xyz")
-    assert set(channels) == {
+    contract = build_verification_contract({"verification": ["页面显示保存成功提示"]})
+    clause = contract["verifications"][0]["clauses"][0]
+    assert set(clause["channels"]) == {
+        "page_state",
+        "element_state",
+        "behavior_effect",
         "ui_text",
         "vision_verify",
         "click_and_check",
-        "behavior_effect",
-        "page_state",
-        "element_state",
     }
 
 
@@ -134,6 +147,39 @@ def test_contract_authoritative_failure_is_failed():
     ]
 
 
+def test_authoritative_failure_beats_positive_v5_scenario():
+    """M1-1 盲区（根治 v5）：当某 clause 同时存在 authoritative FAIL 与非权威 PASS 证据时，
+    判定必须为 failed——不得让非权威 PASS 压过 authoritative FAIL。
+
+    对应真实场景：期望"完成"按钮置灰（disabled），实际 enabled=True 且点击弹 Toast
+    （click_and_check PASS 合理化通过），但元素 enabled=True 是确定性矛盾（authoritative FAIL）。
+    """
+    result = evaluate_verification(
+        CONTRACT,
+        [
+            # 非权威 PASS：click_and_check 认为点击有反应（Toast 拦截）
+            {
+                "verification_key": "v0",
+                "clause_id": "v0.red",
+                "channel": "click_and_check",
+                "status": "PASS",
+            },
+            # authoritative FAIL：元素 enabled=True 与期望 disabled=True 矛盾
+            {
+                "verification_key": "v0",
+                "clause_id": "v0.red",
+                "channel": "behavior_effect",
+                "status": "NO",
+                "authoritative": True,
+            },
+        ],
+    )
+
+    assert result["verdict"] == "failed"
+    assert result["terminated_on_authoritative_failure"] is True
+    assert {"verification_key": "v0", "clause_id": "v0.red"} in result["failed_clauses"]
+
+
 def test_deterministic_check_needs_explicit_clause_association(monkeypatch):
     class Context:
         _deterministic_checks: list[dict] = []
@@ -158,12 +204,19 @@ def test_generated_contract_requires_review_before_execution():
     assert contract["verifications"][0]["clauses"][0]["channels"]
 
 
-def test_visual_claim_requires_vision_evidence():
+def test_visual_claim_uses_all_channel_fallback():
+    """M1-3/M1-4: visual claim 不再特例化为 vision-only 通道，
+    统一走全通道回退（Plan §6 要点4）。"""
     contract = build_verification_contract({"verification": ["时间文本为红色"]})
     clause = contract["verifications"][0]["clauses"][0]
-    # 视觉 claim 仍以 vision_verify 为核心，同时接受 page_state/element_state 作为可靠正向证据
-    assert "vision_verify" in clause["channels"]
-    assert set(clause["channels"]) == {"vision_verify", "page_state", "element_state"}
+    assert set(clause["channels"]) == {
+        "page_state",
+        "element_state",
+        "behavior_effect",
+        "ui_text",
+        "vision_verify",
+        "click_and_check",
+    }
 
     result = evaluate_verification(
         {**contract, "status": "approved"},
@@ -176,13 +229,16 @@ def test_visual_claim_requires_vision_evidence():
             }
         ],
     )
-    assert result["verdict"] == "inconclusive"
+    # M1-4 全通道回退：ui_text 现在属于 clause 通道，PASS 即 passed
+    # （不再像原视觉特例那样排除 ui_text 导致 inconclusive）。
+    assert result["verdict"] == "passed"
 
 
-def test_text_claim_excludes_vision_only_evidence():
+def test_text_claim_uses_all_channel_fallback():
+    """M1-3/M1-4: text claim 同样走全通道回退，不再排除 vision_verify。"""
     contract = build_verification_contract({"verification": ["页面显示保存成功提示"]})
     clause = contract["verifications"][0]["clauses"][0]
-    assert "vision_verify" not in clause["channels"]
+    assert "vision_verify" in clause["channels"]
 
 
 def test_composite_claim_requires_each_subclaim_evidence():
@@ -191,9 +247,16 @@ def test_composite_claim_requires_each_subclaim_evidence():
     )
     clauses = contract["verifications"][0]["clauses"]
     assert len(clauses) == 2
-    # 第一个子句为视觉类，核心仍是 vision_verify（并接纳 page/element_state 作为正向证据）
-    assert "vision_verify" in clauses[0]["channels"]
-    assert "click_and_check" in clauses[1]["channels"]
+    # M1-3/M1-4: 各子句统一走全通道回退
+    assert set(clauses[0]["channels"]) == {
+        "page_state",
+        "element_state",
+        "behavior_effect",
+        "ui_text",
+        "vision_verify",
+        "click_and_check",
+    }
+    assert set(clauses[1]["channels"]) == set(clauses[0]["channels"])
 
     result = evaluate_verification(
         {**contract, "status": "approved"},
@@ -444,6 +507,107 @@ def test_assert_behavior_effect_toggled_emits_behavior_effect_channel(monkeypatc
     assert len(context._evidence_events) == 1
     assert context._evidence_events[0]["channel"] == "behavior_effect"
     assert context._evidence_events[0]["authoritative"] is False
+
+
+def test_assert_behavior_effect_without_clause_id_drops_evidence(monkeypatch):
+    """回归：assert_behavior_effect 与 assert_page_contains 一样，必须使用方传入
+    verification_key + clause_id 才会落证据（tools/verify.py:519 的 `if verification_key
+    and clause_id` 守卫）。若 agent 像真实跑批里那样只传 `toggled(周末有课,on)` 而不带
+    clause 身份，证据被静默丢弃 → 该条开关类 clause 收不到证据 → evaluator 判 unknown
+    → 前端「未验证」。这正是某次跑批『未验证项特别多』的根因（UI 文本类 clause 正常，
+    开关类 clause 全未验证）。修复在 prompt 侧（common/explore 已要求 behavior_effect
+    也必须带 clause 身份）；本测试锁定该不变量：缺身份则不落证据。
+    """
+    context = _make_context_with_elements(
+        [FakeElement("rid_wifi", "WLAN", checked=True)], monkeypatch
+    )
+    # 只传 expected，不传 verification_key / clause_id —— 复现真实跑批的缺身份调用
+    assert_behavior_effect.invoke({"expected": "toggled(WLAN,on)"})
+    assert len(context._evidence_events) == 0
+
+    # 带上身份后必须落证据
+    assert_behavior_effect.invoke(
+        {"expected": "toggled(WLAN,on)", "verification_key": "v0", "clause_id": "v0.0"}
+    )
+    assert len(context._evidence_events) == 1
+    assert context._evidence_events[0]["clause_id"] == "v0.0"
+
+
+def test_assert_behavior_effect_disabled_fails_when_enabled_is_true(monkeypatch):
+    """M1-5（根治 v5）：disabled(完成) 在元素 enabled=True（实际未置灰）时应 FAIL，
+    且证据 authoritative=True——置灰矛盾为确定性反证，触发 fail-fast，不被 LLM 通道补判 passed。
+    """
+    context = _make_context_with_elements(
+        [FakeElement("rid_done", "完成", enabled=True)], monkeypatch
+    )
+
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "disabled(完成)",
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+        }
+    )
+    assert result.startswith("FAIL"), result
+    assert len(context._evidence_events) == 1
+    event = context._evidence_events[0]
+    # _record_deterministic_check 将 FAIL 记为 "FAIL"（evaluate_verification 同时认 FAIL/NO）。
+    assert event["status"] == "FAIL"
+    assert event["authoritative"] is True
+    assert event["channel"] == "behavior_effect"
+    assert event["fact"]["enabled"] is True
+    assert event["fact"]["expected_disabled"] is True
+
+
+def test_assert_behavior_effect_disabled_passes_when_enabled_is_false(monkeypatch):
+    """disabled(完成) 在元素 enabled=False（真实置灰）时应 PASS，且 authoritative=True。"""
+    context = _make_context_with_elements(
+        [FakeElement("rid_done", "完成", enabled=False)], monkeypatch
+    )
+
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "disabled(完成)",
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+        }
+    )
+    assert result.startswith("PASS"), result
+    assert context._evidence_events[0]["authoritative"] is True
+    assert context._evidence_events[0]["fact"]["enabled"] is False
+
+
+def test_assert_behavior_effect_disabled_respects_only_enabled_not_checked(monkeypatch):
+    """M1-5 nuance：disabled 只按 View.isEnabled() 判定，不混入 checked（避免过渡态抖动）。
+    元素 enabled=False 但 checked=True 时仍判 PASS（置灰态下 checked 不可靠）。
+    """
+    context = _make_context_with_elements(
+        [FakeElement("rid_done", "完成", checked=True, enabled=False)], monkeypatch
+    )
+
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "disabled(完成)",
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+        }
+    )
+    assert result.startswith("PASS"), result
+    assert context._evidence_events[0]["authoritative"] is True
+
+
+def test_assert_behavior_effect_disabled_missing_anchor_errors(monkeypatch):
+    """disabled(label) 找不到锚点元素时应报错，而非误判。"""
+    context = _make_context_with_elements([], monkeypatch)
+
+    result = assert_behavior_effect.invoke(
+        {
+            "expected": "disabled(不存在的按钮)",
+            "verification_key": "v0",
+            "clause_id": "v0.0",
+        }
+    )
+    assert result.startswith("ERROR"), result
 
 
 def test_assert_page_state_matches_simple_activity_name(monkeypatch):

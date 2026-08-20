@@ -141,6 +141,22 @@ _FINALIZATION_REMAINING_TOOL_BUDGET = 5
 # launch_app 守卫：目标 App 已在前台（package 已匹配）却仍 launch 属冗余重开，
 # 累计同 package 超过该阈值则下次直接 COOLDOWN_SKIP，逼 LLM 转向验证或终止请求。
 _LAUNCH_REDUNDANT_LIMIT = 3
+# M3（Plan §8）工具层硬护栏：explore_restricted 时这些「契约外探索动作」被拒绝执行。
+# click / click_and_check = 点击切页探索（re-import 的真实路径就是 click 序列：
+# 点击转到上一层级 → 点击导入课程表 → 点击图库导入课程表）；launch_app 已另有顶层冗余守卫。
+# 故意不含 assert_behavior_effect / visual_check / vision_verify——它们是断言/读取型补验证，
+# 不切页，允许在 explore_restricted 后继续执行（即"验证可续、探索被堵"）。
+_EXPLORE_RESTRICTED_TOOLS = ("click", "click_and_check")
+
+
+def _is_explore_blocked(name: str, explore_restricted: bool) -> bool:
+    """M3（Plan §8，工具层硬护栏）：explore_restricted 时拒绝契约外探索动作。
+
+    click / click_and_check 属切页探索（re-import 走 click 序列，被硬拦）；
+    launch_app 已有独立顶层冗余守卫。允许 assert_behavior_effect / visual_check /
+    vision_verify（补验证类动作可继续执行）。
+    """
+    return bool(explore_restricted) and name in _EXPLORE_RESTRICTED_TOOLS
 _NO_PROGRESS_ACTIONS = {
     "click",
     "scroll_find_and_click",
@@ -204,6 +220,7 @@ def _run_agent(
     base_url,
     max_turns=20,
     run_id: str = "",
+    explore_restricted: bool = False,
 ) -> tuple[str, list, dict[str, Any], str]:
     # 延迟 import：读取 graph 的可变全局当前值（set_ws_emit_callback 会更新它）
     from agents.graph import _ws_emit_callback
@@ -346,6 +363,28 @@ def _run_agent(
                         )
                     )
                     continue
+
+            # M3（Plan §8，工具层硬护栏）：连续 inconclusive 达阈值后限制契约外探索。
+            # explore_restricted=True 时，click / click_and_check（切页探索，re-import 走 click 序列）
+            # 属「契约外探索动作」，工具层拒绝执行并强制收敛，根治「问题2-RootB agent 惯性重探」。
+            # 允许保留：assert_behavior_effect / visual_check / vision_verify（断言/读取型补验证）。
+            if _is_explore_blocked(name, explore_restricted):
+                outputs.append(
+                    ToolMessage(
+                        content=(
+                            f"[EXPLORE_BLOCKED] 已限制契约外探索：{name} 不被执行。"
+                            "请改用 assert_behavior_effect / visual_check / vision_verify 做补充验证，"
+                            "或直接 terminate_run 收敛。"
+                        ),
+                        tool_call_id=tc["id"],
+                    )
+                )
+                # 触发本轮强制收敛（force terminate 探索循环）。
+                return {
+                    "messages": outputs,
+                    "_loop_break_reason": "EXPLORE_RESTRICTED",
+                }
+
             if cooldown_group and int(cooldown_map.get(cooldown_group, 0) or 0) > 0:
                 cooldown_map[cooldown_group] = int(cooldown_map[cooldown_group]) - 1
                 if cooldown_map[cooldown_group] <= 0:

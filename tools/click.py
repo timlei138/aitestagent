@@ -509,6 +509,7 @@ def click(
     class_name: str = "",
     path_contains: str = "",
     index: int = -1,
+    repeat: int = 1,
     permission_hint: str = "",
 ) -> str:
     """点击页面上指定文本, 描述, 资源 id 或关联标签的元素。
@@ -519,6 +520,13 @@ def click(
        - switch / switch_row → 直接用 bounds 点击（避免 click_text 误点到同名导航项）
        - 其他→ 先 click_text → click_resource_id → bounds 兑底
     3. 记录时输出语义信息（label/rid/role/context_path）供知识库沉淀，不记录原始坐标。
+
+    repeat: 可选，>=1 的整数（上限 50）。对同一个已解析元素连点 N 次，等价于一次性完成
+    “重复点击同一增量控件”的操作（例如课程表“最多添加10节”= 连点 + 号 10 次；
+    当前为 5、目标 10 → repeat=5）。**重要**：测试步骤要求对同一个增量控件（加号/减号/
+    步进器/“+1”等）连点多次时，必须一次 `click(label=..., repeat=N)` 完成，不要发 N 次
+    相同 click —— 否则会触发循环断路器（LOOP_DETECTED）直接 abort 本轮。
+    repeat 对 switch / checkbox 类“切换”控件无意义（连点会来回切），此类忽略 repeat。
 
     permission_hint: 可选，"grant" 或 "deny"。点击后若系统权限弹窗出现，
     自动点击对应按钮（毫秒级响应，消除 LLM 时延竞态）。
@@ -855,6 +863,20 @@ def click(
         if not ok and "AMBIGUOUS:" in (result or ""):
             return result  # 歧义直接透传给 LLM，不走 fallback
         if ok:
+            # repeat：对同一个已解析元素连点 N 次（增量控件场景，如“最多添加10节”连点 + 号）。
+            # switch/checkbox 是“切换”控件，连点会来回切，repeat 无意义 → 忽略。
+            _role = getattr(best_el, "role", "")
+            _is_toggle = _role in ("switch", "switch_row") or _is_checkbox_like(best_el)
+            _n = max(1, min(int(repeat) if repeat else 1, 50))
+            if _n > 1 and not _is_toggle:
+                for _ in range(_n - 1):
+                    time.sleep(0.3)
+                    try:
+                        if getattr(best_el, "bounds", (0, 0, 0, 0)) != (0, 0, 0, 0):
+                            ctx.device.click_bounds(best_el.bounds)
+                    except Exception:
+                        pass
+                result = (result or "") + f" | 连点{_n}次"
             strategy_match = re.search(r"strategy=([A-Za-z0-9_-]+)", result or "")
             match_mode = strategy_match.group(1) if strategy_match else "element"
             return _make_click_success(

@@ -82,6 +82,44 @@
       </div>
     </div>
 
+    <!-- 未验证 clause（Plan §7 增强）：零证据 unknown，暴露 agent 幻觉式漏验 -->
+    <div v-if="unverifiedList.length" class="rd-unverified">
+      <div class="rd-section-title">未验证项（agent 未产出证据）</div>
+      <p class="rd-unv-hint">
+        以下 clause 结果为 unknown 且 agent 未调用任何验证工具产出证据，疑似直接跳过验证。已自动标记人工复核。
+      </p>
+      <div v-for="(u, i) in unverifiedList" :key="i" class="rd-unv-card">
+        <span class="rd-badge-unv">未验证</span>
+        <span class="rd-unv-claim">{{ u.statement || u.clause_id }}</span>
+      </div>
+    </div>
+
+    <!-- 差异报告（Plan §7 / §10.7）：失败 clause 的 authoritative FAIL 直接呈现「期望 vs 实际」 -->
+    <div v-if="discrepancyList.length" class="rd-discrepancy">
+      <div class="rd-section-title">差异报告</div>
+      <p class="rd-disc-hint">
+        仅展示被权威证据（如 disabled 谓词）判定的确定性矛盾，不做自动 bug 定性（留待人工复核）。
+      </p>
+      <div v-for="(d, i) in discrepancyList" :key="i" class="rd-disc-card">
+        <div class="rd-disc-head">
+          <span class="rd-badge-auth">权威反证</span>
+          <span class="rd-disc-claim">{{ d.statement || d.clause_id }}</span>
+          <span class="rd-disc-channel">通道：{{ channelLabel(d.channel) }}</span>
+        </div>
+        <div class="rd-disc-body">
+          <div class="rd-disc-col">
+            <div class="rd-disc-label">期望</div>
+            <pre class="rd-disc-json">{{ pretty(d.expected) }}</pre>
+          </div>
+          <div class="rd-disc-arrow">→</div>
+          <div class="rd-disc-col">
+            <div class="rd-disc-label">实际</div>
+            <pre class="rd-disc-json">{{ pretty(d.actual) }}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div v-if="report.terminal_reason" class="rd-conclusion">
       <div class="rd-section-title">终止理由</div>
       <pre>{{ report.terminal_reason }}</pre>
@@ -190,6 +228,51 @@ const channelLabels = {
 }
 function channelLabel(channel) { return channelLabels[channel] || channel || '未知通道' }
 
+// 差异报告（Plan §7/§10.7）：从 verification_results 收集带 authoritative discrepancy 的 clause。
+const discrepancyList = computed(() => {
+  const results = props.report?.verification_results || []
+  const out = []
+  for (const item of results) {
+    if (!item || !Array.isArray(item.clauses)) continue
+    for (const clause of item.clauses) {
+      if (clause && clause.discrepancy) {
+        out.push({
+          clause_id: clause.id,
+          statement: clause.statement || clause.claim || item.key,
+          channel: clause.discrepancy.channel,
+          expected: clause.discrepancy.expected,
+          actual: clause.discrepancy.actual,
+        })
+      }
+    }
+  }
+  return out
+})
+
+// 未验证 clause（Plan §7 增强）：零证据 unknown，暴露 agent 幻觉式漏验。
+const unverifiedList = computed(() => {
+  const results = props.report?.verification_results || []
+  const out = []
+  for (const item of results) {
+    if (!item || !Array.isArray(item.clauses)) continue
+    for (const clause of item.clauses) {
+      if (clause && clause.unverified) {
+        out.push({
+          clause_id: clause.id,
+          statement: clause.statement || clause.claim || item.key,
+        })
+      }
+    }
+  }
+  return out
+})
+
+function pretty(obj) {
+  if (obj === null || obj === undefined) return '—'
+  if (typeof obj === 'object') return JSON.stringify(obj, null, 2)
+  return String(obj)
+}
+
 // 用 verification_key + clause_id 反查 contract，显示可读的 statement/claim，而非内部 key。
 function clauseText(v) {
   const verifications = props.report?.verification_contract?.verifications || []
@@ -276,4 +359,24 @@ function screenshotUrl(path) {
 /* ── 截图 lightbox ── */
 .rd-lightbox { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: flex; align-items: center; justify-content: center; z-index: 1000; padding: 24px; }
 .rd-lightbox img { max-width: 90vw; max-height: 90vh; border-radius: var(--radius-sm); box-shadow: 0 20px 60px rgba(0,0,0,0.4); }
+
+/* ── 未验证项（Plan §7 增强）── */
+.rd-unverified { margin-bottom: 12px; }
+.rd-unv-hint { font-size: 12px; color: var(--text-muted); margin: 0 0 8px; }
+.rd-unv-card { border: 1px solid #fcd34d; background: #fffbeb; border-radius: var(--radius-sm); padding: 8px 12px; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+.rd-badge-unv { background: #fef3c7; color: #92400e; font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: var(--radius-xs); border: 1px solid #fcd34d; }
+
+/* ── 差异报告（Plan §7/§10.7）── */
+.rd-discrepancy { margin-bottom: 12px; }
+.rd-disc-hint { font-size: 12px; color: var(--text-muted); margin: 0 0 8px; }
+.rd-disc-card { border: 1px solid #fca5a5; background: #fff5f5; border-radius: var(--radius-sm); padding: 10px 12px; margin-bottom: 8px; }
+.rd-disc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.rd-badge-auth { background: #fee2e2; color: #b91c1c; font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: var(--radius-xs); border: 1px solid #fca5a5; }
+.rd-disc-claim { font-size: 13px; font-weight: 600; color: var(--text-primary); flex: 1; min-width: 120px; }
+.rd-disc-channel { font-size: 12px; color: var(--text-muted); }
+.rd-disc-body { display: flex; align-items: stretch; gap: 10px; }
+.rd-disc-col { flex: 1; min-width: 0; background: #fff; border: 1px solid var(--line-light); border-radius: var(--radius-xs); padding: 6px 8px; }
+.rd-disc-label { font-size: 11px; font-weight: 600; color: var(--text-secondary); margin-bottom: 4px; }
+.rd-disc-json { font-size: 12px; margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--text-secondary); font-family: 'JetBrains Mono', monospace; max-height: 220px; overflow-y: auto; }
+.rd-disc-arrow { display: flex; align-items: center; font-size: 18px; color: var(--danger); font-weight: 700; }
 </style>

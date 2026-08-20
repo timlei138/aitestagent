@@ -375,3 +375,11 @@ def append_run_log(file_path: str) -> dict:
         lc_file.close()
 
     return {"cleanup": cleanup}
+
+
+# ── 验证图收敛 / 探索护栏常量（Plan §7/§8，单一定义避免双份漂移）──
+# M2（§7）：unknown（inconclusive）路由上限，达到后 route_after_evaluator 强制收敛
+# 到 reporter，治「问题2-RootA 图不终止」。
+UNKNOWN_ROUTE_LIMIT = 3
+# M3（§8）：连续 inconclusive 达到该次数后，限制 agent 的契约外探索动作（治 RootB）。
+UNKNOWN_RESTRICT_AFTER = 2

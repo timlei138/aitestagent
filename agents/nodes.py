@@ -20,7 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
 
-from config import TestConfig
+from config import TestConfig, UNKNOWN_ROUTE_LIMIT, UNKNOWN_RESTRICT_AFTER
 from llm.clients import create_llm_client
 from agents.state import TestState
 from agents.budget import (
@@ -528,13 +528,58 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         merged_verifications = (getattr(ctx, "_clause_state", {}) or {}).get(
             "verifications", []
         )
-        passed_items = [
-            f"[{entry.get('key', '')}] {key_to_item.get(entry.get('key', ''), '')}"
-            for entry in merged_verifications
-            if str(entry.get("result", "") or "") == "passed"
-        ]
+
+        def _clause_tag(vkey: str, clause: dict) -> str:
+            """生成「clause 身份」标签，供 agent 原样填进 assert 的 verification_key/clause_id。
+
+            关键：agent 之前把所有 assert 都打上 v0.0，导致证据错配、其余 clause 全部
+            unknown（即前端「未验证」）。这里把 evaluator 契约里**精确的 clause_id + 所需
+            channel** 直接给出来，让 agent 知道每次 assert 该 stamped 什么身份、用哪个通道工具。
+            """
+            cid = str(clause.get("id", "") or "")
+            chs = clause.get("channels") or []
+            ch_str = ",".join(str(c) for c in chs) if chs else "any"
+            claim = str(clause.get("claim", "") or key_to_item.get(vkey, "") or "")
+            return f"[{vkey}::{cid} | channels:{ch_str}] {claim}"
+
+        # 已通过验证：逐 clause 列出已拿到证据的 clause 身份（含 clause_id/channel），
+        # 让 agent 知道哪些已满足、不必重复验证。failed 走 authoritative FAIL 终止，不列。
+        passed_items = []
+        for entry in merged_verifications:
+            if str(entry.get("result", "") or "") != "passed":
+                continue
+            for clause in entry.get("clauses", []) or []:
+                if str(clause.get("status", "") or "") == "passed":
+                    passed_items.append(_clause_tag(str(entry.get("key", "")), clause))
         if passed_items:
-            hist_str += "\n\n已通过验证: " + "; ".join(passed_items)
+            hist_str += "\n\n已通过验证（clause 身份，勿重复验证）: " + "; ".join(passed_items)
+        # 证据驱动终止机制 · 第 2 层：待验证清单。
+        # 逐 clause 列出 result=="unknown"（缺证据）的 clause 身份；failed 不在此列
+        # （确定性矛盾，走 authoritative FAIL 终止，不该让 agent 去「补」）。
+        pending_items = []
+        for entry in merged_verifications:
+            if str(entry.get("result", "") or "") == "failed":
+                continue
+            for clause in entry.get("clauses", []) or []:
+                if str(clause.get("status", "") or "") == "unknown":
+                    pending_items.append(_clause_tag(str(entry.get("key", "")), clause))
+        if pending_items:
+            hist_str += (
+                "\n\n待验证清单（以下 clause 尚未拿到任何证据，结束前必须用对应 assert 工具"
+                "补齐，并把上面给出的「verification_key::clause_id」原样填进 assert 的"
+                " verification_key / clause_id 参数，且使用标注的 channel 工具；"
+                "不得仅用肉眼观察替代，也不得把所有 assert 都打同一个 clause_id）: "
+                + "; ".join(pending_items)
+            )
+        # 第 3 层回环提示（无需跨层 flag：pending list 每轮都注入，且 agent 在历史中能看到
+        # 自己上轮的 report_done 被驳回）。只要待验证清单非空，就明确约束 agent 不得原样
+        # 重申 DONE，必须先补齐证据或 terminate_run。
+        if pending_items:
+            hist_str += (
+                "\n\n⚠️ 若你上轮已 report_done 但本清单仍非空，说明 DONE 被驳回："
+                "必须先针对上面每条补齐 assert 证据（PASS/FAIL），或确认无法验证则 terminate_run，"
+                "不得原样再重申 DONE。"
+            )
 
     # Messages — always include goal + page for context
     msgs = list(state.get("messages", []))
@@ -634,6 +679,21 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         hint_candidates.append(
             (1, "knowledge", "KNOWLEDGE_QUERY_REQUIRED: " + _kq, _kq)
         )
+    # M3（Plan §8 代码护栏）：契约尚无定论且已连续 inconclusive，限制 agent 的
+    # 契约外探索（如 re-import 截图重开、launch_app 重开），只补验证证据或 terminate_run。
+    # 每轮注入（不依赖 injected 标志），直到 clause 被 resolve 或 run 收敛。
+    if state.get("_explore_restricted"):
+        hint_candidates.append(
+            (
+                1,
+                "explore_restricted",
+                "EXPLORE_RESTRICTED: 验证契约尚未定论且已多次无结论。禁止重新"
+                " import/截图重开或 launch_app 重开等契约外操作；仅允许与未定论"
+                " clause 直接相关的补验证证据（如 assert_behavior_effect / "
+                "vision_verify），或调用 terminate_run(reason=...) 结束本轮。",
+                "",
+            )
+        )
     if self_doubt_reasons:
         hint_candidates.append(
             (
@@ -707,6 +767,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         llm["base_url"],
         max_turns=budget["max_turns_per_iteration"],
         run_id=config.get("configurable", {}).get("thread_id", "unknown"),
+        explore_restricted=bool(state.get("_explore_restricted", False)),
     )
     # reducer 通道：只上报本次迭代增量（delta），累计由通道 reducer 完成。
     iter_llm_call_count = int(loop_meta.get("llm_call_count", 0) or 0)
@@ -743,6 +804,18 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     _signal_source = "text" if (done or abort) else "none"
     if loop_meta.get("loop_break_action") == "terminate_run":
         _signal_source = "tool_call"
+    if loop_meta.get("loop_pattern") == "EXPLORE_RESTRICTED":
+        # M3（Plan §8 工具层硬护栏）：explore_restricted 后 agent 仍发起契约外探索动作，
+        # 工具层已拒绝执行并强制收敛。此处将本轮标记为 abort，导向 reporter 收敛，不再回 agent
+        # 死循环（治「问题2-RootB agent 惯性重探」），同时保留补验证窗口由 prompt 软约束给出。
+        abort = True
+        done = False
+        terminal_verdict = ""
+        result = (
+            result.rstrip()
+            + "\nABORT: EXPLORE_RESTRICTED — 已限制契约外探索，请改用补验证证据或终止请求收敛。"
+        )
+        _signal_source = "tool_guard"
     si = len(history) + 1
     st = "success" if done else ("fail" if abort else "continue")
     logger.info(
@@ -999,6 +1072,22 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     ctx = get_tool_context()
     evidence_events = list(getattr(ctx, "_evidence_events", []) or [])
 
+    def _extract_expected_actual(fact: dict[str, Any]) -> tuple[Any, Any]:
+        """从结构化 fact 提取「期望 vs 实际」（Plan §7 差异报告）。
+
+        纯结构化提取，无关键词补丁——确定性矛盾优先、证据自描述。
+        被 failure_summary 与 _build_discrepancy 共用，避免两份分叉逻辑。
+        """
+        if "expected_disabled" in fact:
+            return {"disabled": fact.get("expected_disabled")}, {"enabled": fact.get("enabled")}
+        if "expected_checked" in fact:
+            return {"checked": fact.get("expected_checked")}, {"checked": fact.get("checked")}
+        if "expected_activity" in fact:
+            return {"activity": fact.get("expected_activity")}, {"activity": fact.get("actual_activity")}
+        if "expected_count" in fact:
+            return {"count": fact.get("expected_count")}, {"count": fact.get("actual_count")}
+        return fact.get("expected"), fact.get("actual", fact)
+
     # ── Contract-only verdict ──
     execution_status = _determine_execution_status(state)
     verification_contract = state.get("verification_contract", {})
@@ -1016,11 +1105,34 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     ):
         execution_status = "completed"
     if evaluation.get("terminated_on_authoritative_failure"):
+        # M2（Plan §7）：差异报告只呈现「期望 vs 实际」，不做 bug 自动定性
+        # （定性留给人工 / 后续 report_bug 阶段）。结构化 discrepancy 同步透出到
+        # verification_results[].clauses[].discrepancy，供 ReportDetail.vue 点开复核。
+        # 直接遍历 evidence 找 authoritative FAIL（不依赖 _deciding_evidence 的"首个
+        # 事件"语义），与下方 _build_discrepancy 共用 _extract_expected_actual 避免分叉。
+        _discrepancies = []
+        for ev in evidence_events:
+            if not isinstance(ev, dict):
+                continue
+            if not bool(ev.get("authoritative", False)):
+                continue
+            if str(ev.get("status", "") or "").upper() not in {"FAIL", "NO"}:
+                continue
+            expected, actual = _extract_expected_actual(ev.get("fact", {}) or {})
+            _discrepancies.append(
+                {
+                    "clause_id": ev.get("clause_id"),
+                    "expected": expected,
+                    "actual": actual,
+                    "channel": ev.get("channel"),
+                }
+            )
         failure_summary = json.dumps(
             {
                 "terminated_on_authoritative_failure": True,
                 "failed_clauses": evaluation.get("failed_clauses", []),
                 "pending_clauses": evaluation.get("pending_clauses", []),
+                "discrepancies": _discrepancies,
             },
             ensure_ascii=False,
         )
@@ -1085,10 +1197,45 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 "fact": event.get("fact", {}),
             }
 
+    def _build_discrepancy(key: str, clause: dict[str, Any]) -> dict[str, Any] | None:
+        """Plan §7（Phase 4 差异报告）：仅当 clause 已 failed 且存在权威反证时，
+        推导「期望 vs 实际」差异条目，供前端 ReportDetail.vue 点开复核。
+
+        **直接遍历 evidence_events 找该 clause 的 authoritative FAIL**（不依赖
+        _deciding_evidence 的"首个事件"语义）——否则在 v5 场景（先非权威 PASS、
+        后权威 FAIL）下会误取先来的非权威 PASS 而漏报差异。与 failure_summary
+        共用 _extract_expected_actual，单一事实来源。
+        """
+        if str(clause.get("status", "") or "") != "failed":
+            return None
+        cid = str(clause.get("id", "") or "")
+        for ev in evidence_events:
+            if not isinstance(ev, dict):
+                continue
+            if str(ev.get("verification_key", "") or "") != key:
+                continue
+            if str(ev.get("clause_id", "") or "") != cid:
+                continue
+            if not bool(ev.get("authoritative", False)):
+                continue
+            if str(ev.get("status", "") or "").upper() not in {"FAIL", "NO"}:
+                continue
+            expected, actual = _extract_expected_actual(ev.get("fact", {}) or {})
+            return {
+                "expected": expected,
+                "actual": actual,
+                "channel": ev.get("channel"),
+                "authoritative": True,
+            }
+        return None
+
     def _enrich_clause(key: str, clause: dict[str, Any]) -> dict[str, Any]:
         cid = str(clause.get("id", "") or "")
         enriched = dict(clause)
-        enriched["deciding_evidence"] = _deciding_evidence.get((key, cid))
+        ev = _deciding_evidence.get((key, cid))
+        enriched["deciding_evidence"] = ev
+        # M2（Plan §7）：仅 failed + 权威反证的 clause 附带差异条目。
+        enriched["discrepancy"] = _build_discrepancy(key, clause)
         return enriched
 
     verification_results = [
@@ -1246,6 +1393,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 duration_seconds=float(duration or 0.0),
                 llm_call_count=int(llm_call_count or 0),
                 token_usage=token_usage,
+                verification_results=verification_results,
             )
             _relational_db.record_evidence_events(
                 config.get("configurable", {}).get("thread_id", ""), evidence_events
@@ -1957,6 +2105,10 @@ def mode_transition_node(state: TestState, config: RunnableConfig) -> Command:
     )
 
 
+# M2（Plan §7）/ M3（Plan §8）常量统一定义于 config.py：
+# UNKNOWN_ROUTE_LIMIT（unknown 路由上限）、UNKNOWN_RESTRICT_AFTER（探索限制阈值）。
+
+
 def evaluator_node(state: TestState, config: RunnableConfig) -> Command:
     """Materialize the current-run typed-evidence verdict without invoking an LLM."""
     contract = state.get("verification_contract", {})
@@ -1970,7 +2122,19 @@ def evaluator_node(state: TestState, config: RunnableConfig) -> Command:
     )
     if ctx:
         ctx._clause_state = evaluation
-    return Command(update={"clause_state": evaluation})
+    # M2：inconclusive 时累计 unknown 路由次数（累加 reducer，每次 evaluator 调用 +1）。
+    update: dict[str, Any] = {"clause_state": evaluation}
+    if evaluation.get("verdict") == "inconclusive":
+        prior = int(state.get("_unknown_route_count", 0) or 0)
+        new_count = prior + 1
+        update["_unknown_route_count"] = 1  # 累加 reducer → prior + 1
+        if new_count >= UNKNOWN_ROUTE_LIMIT:
+            update["_unknown_exhausted"] = True
+        # M3（Plan §8 代码护栏）：连续 inconclusive 达阈值 → 限制 agent 契约外探索，
+        # 治 RootB agent 惯性（禁止 re-import / launch_app 重开，只补证据或 terminate_run）。
+        if new_count >= UNKNOWN_RESTRICT_AFTER:
+            update["_explore_restricted"] = True
+    return Command(update=update)
 
 
 # ═══ ROUTING ═══
