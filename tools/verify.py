@@ -72,6 +72,77 @@ def verification_seq() -> int:
     return _evidence_seq
 
 
+def _legal_clause_refs(ctx) -> tuple[set[str], set[str], dict[str, set[str]]]:
+    """从当前验证契约收集合法的 verification_key 集合、clause_id 集合，以及 key→clause 映射。
+
+    clause_id 仅接受契约中真实存在的 `v{index}.{clause_index}`（如 v0.0 / v1.0 / v2.1
+    需契约确有该子句）。key_to_clauses 用于跨 key 配对校验（防 v1::v2.0 这类错配）。
+    """
+    valid_keys: set[str] = set()
+    valid_clauses: set[str] = set()
+    key_to_clauses: dict[str, set[str]] = {}
+    contract = getattr(ctx, "_verification_contract", None) or {}
+    for v in contract.get("verifications", []) or []:
+        if not isinstance(v, dict):
+            continue
+        key = str(v.get("key", "") or "")
+        if key:
+            valid_keys.add(key)
+            key_to_clauses.setdefault(key, set())
+        for c in v.get("clauses", []) or []:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id", "") or "")
+            if cid:
+                valid_clauses.add(cid)
+                if key:
+                    key_to_clauses[key].add(cid)
+    return valid_keys, valid_clauses, key_to_clauses
+
+
+def _check_clause_ref(ctx, verification_key: str, clause_id: str) -> tuple[bool, str]:
+    """校验 agent 传入的 (verification_key, clause_id) 是否来自当前契约。
+
+    两层校验：
+    1. 孤儿 clause_id（契约中不存在）直接判非法，不写入证据（避免污染 evaluate_verification
+       的精确匹配），提示合法候选，让 LLM 自纠。
+    2. 跨 key 错配（clause_id 不属于该 verification_key，如 v1::v2.0）判非法——
+       孤儿是"id 不存在"，错配是"id 存在但挂错 key"，护栏能抓。
+    设计边界：仅传 clause_id 不传 key、或语义错配（v1.0 是 max=10 却拿"默认第4节"当证据）
+    这类非确定性问题抓不到，只能靠模型质量（#6）解决，记录在案。
+    """
+    if not verification_key and not clause_id:
+        return True, ""  # 未携带归因信息，放行（由调用方决定是否记录）
+    valid_keys, valid_clauses, key_to_clauses = _legal_clause_refs(ctx)
+    # 无任何契约上下文（如单元测试未注入 contract）时宽松放行，不阻断。
+    if not valid_keys and not valid_clauses:
+        return True, ""
+    if clause_id and clause_id not in valid_clauses:
+        hint = (
+            f"clause_id={clause_id!r} 不在当前验证契约，证据未计入。"
+            f" 合法 clause_id: {sorted(valid_clauses) or '无'}；"
+            f" 合法 verification_key: {sorted(valid_keys) or '无'}。"
+            " 请使用契约中的 clause_id（或仅传合法的 verification_key）。"
+        )
+        return False, hint
+    if verification_key and verification_key not in valid_keys:
+        hint = (
+            f"verification_key={verification_key!r} 不在当前验证契约，证据未计入。"
+            f" 合法 verification_key: {sorted(valid_keys) or '无'}。"
+        )
+        return False, hint
+    # 跨 key 配对校验：clause_id 必须归属于该 verification_key（如 v2.0 属于 v2）
+    if verification_key and clause_id and key_to_clauses.get(verification_key) is not None:
+        if clause_id not in key_to_clauses[verification_key]:
+            hint = (
+                f"clause_id={clause_id!r} 不属于 verification_key={verification_key!r}"
+                f"（跨 key 错配），证据未计入。该 key 合法的 clause_id: "
+                f"{sorted(key_to_clauses[verification_key]) or '无'}。"
+            )
+            return False, hint
+    return True, ""
+
+
 def _record_deterministic_check(
     text: str,
     kind: str,
@@ -79,18 +150,26 @@ def _record_deterministic_check(
     verification_key: str = "",
     clause_id: str = "",
     channel: str = "",
-) -> None:
-    """Record deterministic current-run evidence for a declared clause."""
+) -> str:
+    """Record deterministic current-run evidence for a declared clause.
+
+    返回 "" 表示证据已记录；返回非空字符串表示校验未通过（孤儿 clause_id），
+    该字符串为给 LLM 的提示，调用方可拼接到工具返回值。
+    """
     try:
         ctx = get_tool_context()
     except Exception:
-        return
+        return ""
     if ctx is None:
-        return
+        return ""
     if not verification_key or not clause_id or not channel:
-        return
+        return ""
     if not hasattr(ctx, "_evidence_events"):
         ctx._evidence_events = []
+    valid, hint = _check_clause_ref(ctx, verification_key, clause_id)
+    if not valid:
+        logger.warning("verify skip orphan clause ref: %s", hint)
+        return hint  # 孤儿 clause_id：不写入证据，返回提示让 LLM 自纠
     ctx._evidence_events.append(
         {
             "verification_key": verification_key,
@@ -103,6 +182,7 @@ def _record_deterministic_check(
             "artifact_ref": getattr(ctx, "_last_screenshot_path", "") or "",
         }
     )
+    return ""
 
 
 @tool
@@ -120,19 +200,20 @@ def assert_page_contains(
     返回: PASS 或 FAIL: <原因>
     """
     _result = _assert_page_contains_impl(text, pattern)
+    _hint = ""
     if verification_key and clause_id:
         _save_evidence_screenshot(
             get_tool_context(), verification_key, verification_seq()
         )
-    _record_deterministic_check(
-        text,
-        "page_contains",
-        _result.startswith("PASS"),
-        verification_key,
-        clause_id,
-        "ui_text",
-    )
-    return _result
+        _hint = _record_deterministic_check(
+            text,
+            "page_contains",
+            _result.startswith("PASS"),
+            verification_key,
+            clause_id,
+            "ui_text",
+        )
+    return _result + ((" | 归因被拒：" + _hint) if _hint else "")
 
 
 def _assert_page_contains_impl(text: str, pattern: bool = False) -> str:
@@ -212,9 +293,16 @@ def assert_element_exists(
     ctx = get_tool_context()
     if ctx.perceiver is None:
         return "FAIL: Perceiver not available - no device"
+    # 先校验归因：孤儿 clause_id 直接提示并拒绝，避免静默丢证据
+    _hint = ""
+    if verification_key and clause_id:
+        valid, _hint = _check_clause_ref(ctx, verification_key, clause_id)
+        if not valid:
+            logger.warning("assert_element_exists skip orphan clause ref: %s", _hint)
+            return f"FAIL: 元素 {label} 查询未完成归因 | 归因被拒：" + _hint
     understanding = ctx.perceiver.perceive()
     matched = any(label in (element.label or "") for element in understanding.elements)
-    if verification_key and clause_id:
+    if verification_key and clause_id and valid:
         _save_evidence_screenshot(ctx, verification_key, verification_seq())
     for element in understanding.elements:
         if label in (element.label or ""):
@@ -226,7 +314,7 @@ def assert_element_exists(
                 clause_id,
                 "element_state",
             )
-            return "PASS"
+            return "PASS" + ((" | 归因被拒：" + _hint) if _hint else "")
     _record_deterministic_check(
         label,
         "element_exists",
@@ -235,7 +323,7 @@ def assert_element_exists(
         clause_id,
         "element_state",
     )
-    return f"FAIL: 元素不存在 {label}"
+    return (f"FAIL: 元素不存在 {label}") + ((" | 归因被拒：" + _hint) if _hint else "")
 
 
 @tool
@@ -262,6 +350,10 @@ def assert_page_state(
     )
     fact = {"package": actual_package, "activity": actual_activity}
     if verification_key and clause_id:
+        valid, hint = _check_clause_ref(ctx, verification_key, clause_id)
+        if not valid:
+            logger.warning("assert_page_state skip orphan clause ref: %s", hint)
+            return ("PASS" if passed else f"FAIL: page state {fact}") + " | 归因被拒：" + hint
         _save_evidence_screenshot(ctx, verification_key, verification_seq())
         ctx._evidence_events.append(
             {
@@ -517,6 +609,10 @@ def assert_behavior_effect(
     except Exception as exc:
         return f"ERROR: behavior effect check failed: {exc}"
     if verification_key and clause_id:
+        valid, hint = _check_clause_ref(ctx, verification_key, clause_id)
+        if not valid:
+            logger.warning("assert_behavior_effect skip orphan clause ref: %s", hint)
+            return ("PASS" if passed else f"FAIL: behavior effect not observed: {expected}") + " | 归因被拒：" + hint
         _save_evidence_screenshot(ctx, verification_key, verification_seq())
         ctx._evidence_events.append(
             {

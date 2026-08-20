@@ -225,6 +225,11 @@ storage/screenshots/
 storage/test_history.db
 storage/test_history.db-shm
 storage/test_history.db-wal
+# 运行时产物（RAG 向量库 / 知识库二进制），不应进版本库
+storage/knowledge_v2/*.bin
+storage/knowledge_v2/chroma.sqlite3
+storage/knowledge_v2/chroma.sqlite3-shm
+storage/knowledge_v2/chroma.sqlite3-wal
 .codebuddy/
 
 # Local sensitive config (API keys)

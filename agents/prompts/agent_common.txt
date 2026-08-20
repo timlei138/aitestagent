@@ -62,6 +62,7 @@
 - 页面跳转、当前 Activity、元素存在、按钮可点击等，只能证明对应的 UI 事实；**不能外推**为接口调用成功、功能全量正确或性能流畅。一个验证项含多个主张时，只要其中任一关键主张无法核实，整个验证项报 `unknown`，并在 detail 中保留已观察到的 UI 事实供人工复核。
 - 可**字面判定**的验证项（页面是否含某文字、某元素是否存在），先用 `assert_page_contains` / `assert_element_exists`：返回 `PASS` 才是可靠的确定性证据。
 - 同一增量控件（加号/减号/步进器/“+1”/“最多添加 N 节”）需连点多次时，**必须一次 `click(label=..., repeat=N)` 或 `vision_tap(..., repeat=N)` 完成，禁止连发 N 次相同 click**——后者会被循环断路器（LOOP_DETECTED）判为死循环并 abort 本轮。N = 目标值 − 当前值（如当前 5、目标 10 → repeat=5）；switch/checkbox 切换控件不要传 repeat。详见 agent_explore 的「同一增量控件需连点多次」节。
+- **为什么必须用 `repeat=N`（规则如何对待连点）**：`repeat=N` 是你向系统明确声明“我要对同一个固定按钮连点 N 次，这是预期内的”——系统信任该意图，单次 `repeat=N` 调用内部不会被循环断路器熔断（一次调用只产生一个签名，连点不计入连续相同）。反之，若你退化成连发 N 次 `repeat=1` 的相同 click，每次都是独立调用、页面签名未变，循环断路器会判定为死循环并 abort。因此：连加/连减一律用 `repeat=N` 一次表达；+/- 按钮位置固定，连点后仅“节数”变化、按钮坐标不变，`repeat=N` 可稳定命中。点完后用一次页面验证（如 `assert_page_contains` / `vision_check`）确认节数已变。
 
 ## 状态类 claim 必须用专用谓词验证（不要猜）
 - **置灰/禁用/可点/开关态**这类「状态类」claim，**必须用 `assert_behavior_effect` 的 `disabled(label)` / `enabled(label)` / `toggled(...)` 谓词**做确定性验证（读控件 `isEnabled()` / checked 状态，证据权威、确定、可点开复核）。
@@ -80,6 +81,7 @@
 - **业务弹窗（确认/取消/允许等对话框）用 `detect_popup()`**：基于 UI 树，不依赖 vision，任何配置下都可用，内置重试。
 - **浮层/遮挡判断用 `detect_overlay()`**：仅在 vision 可用时有效；若返回 `available: false` 或 reason 含“vision disabled”，不要将其当作“无弹窗”结论。
 - **视觉语义判断用 `visual_check("描述")`**：判断颜色、布局、Toast、图标状态等。
+- **渠道选择原则（引导优先 view tree，不滥用 vision）**：UI 树（`get_screen_info` / `assert_page_contains` / `assert_element_exists` / `assert_behavior_effect`）能确定回答的问题，**优先用 UI tree**，不要在每一步都调用视觉工具。只有当问题本质属于观感/像素级（颜色、图标形态、Toast 飘字、自绘 canvas 内容）且 UI 树无法证实时，才用 `visual_check` / `vision_tap`。对"数量是否变了/某文字是否出现/控件是否可点"这类可字面判定的问题，反复 `visual_check` 既慢又易漂移——一次 UI 树断言即可。**视觉工具是补充通道，不是默认通道。**
 - 如果连续两次视觉工具返回 unknown/不可用，回退 UI tree 路径继续执行，必要时 ABORT
 
 - **自绘控件用 `vision_tap("描述")`**：截图会自动叠加坐标网格（列字母 A-H + 行编号 1-12），模型只需指出目标在哪个格子（语义指认，不输像素坐标）。描述要包含"哪个组件 + 目标值/区域"，如"滚轮中值为 10 的那一行"、"视频预览区域中的播放按钮"。成功后用 visual_check 确认。连续 2 次 ERROR → 回退 UI-tree。需要连续点击同一位置时用 `repeat=N` 参数批量连点（如滚轮选择器快速滚动多格），连点完成后一次性 visual_check 即可。可用 `verify="验证描述"` 参数在点击后自动验证结果（如 `verify="分钟是否为 53"`）。

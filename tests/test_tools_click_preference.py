@@ -16,6 +16,7 @@ def _el(
     bounds: tuple[int, int, int, int] = (0, 0, 100, 100),
     clickable: bool = True,
     text: str = "",
+    checked=None,
 ):
     return SimpleNamespace(
         label=label,
@@ -28,7 +29,7 @@ def _el(
         bounds=bounds,
         clickable=clickable,
         text=text,
-        checked=None,
+        checked=checked,
     )
 
 
@@ -623,6 +624,163 @@ def test_click_repeat_ignored_for_switch_toggle():
     # switch 走专用回检路径（sleep 4s），repeat 被忽略：bounds 只点 1 次
     assert "连点" not in out
     assert len(d.clicked_bounds) == 1
+
+
+def test_click_repeat_works_for_stepper_imageview_not_checkbox():
+    # 回归 #1+#回归：无文本 ImageView +/- 节数按钮（btn_add_morning_slot）携带 XML 噪音
+    # checked="false" + role=list_entry。修复前 _is_checkbox_like 误判为 True → 走 switch
+    # 回检分支、repeat 被忽略。修复后判定为 False → 走普通 bounds 路径，repeat=N 连点生效。
+    class _Device:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.TimetableActivity",
+            }
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+        def click_text(self, text):
+            return False
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.TimetableActivity",
+                page_title="",
+                primary_paths=[],
+                elements=[
+                    _el(
+                        label="",
+                        rid="com.zui.calendar:id/btn_add_morning_slot",
+                        cls="android.widget.ImageView",
+                        checked=False,  # XML 噪音：并非真可勾选（真实 perceiver 返回布尔）
+                        bounds=(20, 120, 220, 180),
+                    )
+                ],
+            )
+
+    d = _Device()
+    tools_module.set_tool_context(ToolContext(device=d, perceiver=_Perceiver()))
+    # 用 index 精确定位无文本 +/- 按钮，并声明 repeat=6
+    out = tools_module.click.invoke(
+        {"index": 0, "label": "添加上午课程节数", "repeat": 6}
+    )
+    # 关键：不再被误判为 checkbox/switch 回检分支，repeat 连点生效
+    assert "连点6次" in out
+    assert len(d.clicked_bounds) == 6
+    # 不应出现勾选/开关状态误导文案（那是 checkbox-like 分支才加的）
+    assert "勾选状态" not in out
+    assert "开关状态" not in out
+
+
+def test_click_index_bypasses_rid_semantic_match_for_textless_imageview():
+    # 回归 #回归：无文本 ImageView + 唯一 rid + 按 index 点击，应绕过 rid 语义匹配分支
+    # （该分支要求 label 命中才放行，无文本元素必然 label_assoc_hit=False → AMBIGUOUS），
+    # 直接走 click_bounds 成功。index 已精确定位，无需 rid 语义匹配。
+    class _Device:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.TimetableActivity",
+            }
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+        def click_resource_id(self, rid):
+            self.clicked_bounds.append(rid)
+            return True
+
+        def click_text(self, text):
+            return False
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.TimetableActivity",
+                page_title="",
+                primary_paths=[],
+                elements=[
+                    _el(
+                        label="",
+                        rid="com.zui.calendar:id/btn_add_morning_slot",
+                        cls="android.widget.ImageView",
+                        checked=False,
+                        bounds=(20, 120, 220, 180),
+                    )
+                ],
+            )
+
+    d = _Device()
+    tools_module.set_tool_context(ToolContext(device=d, perceiver=_Perceiver()))
+    # 按 index=0 精确点击，无文本按钮不应返回 AMBIGUOUS
+    out = tools_module.click.invoke({"index": 0, "label": "添加上午课程节数"})
+    assert "AMBIGUOUS" not in out
+    assert "已点击" in out
+    assert d.clicked_bounds == [(20, 120, 220, 180)]  # 走 bounds，非 rid
+
+
+def test_edittext_with_checked_noise_not_checkbox_like():
+    # 回归（最新日志实证）：EditText（如 et_schedule_name）常携带 checked 噪音属性，
+    # 且 role 默认 list_entry，修复前 _is_checkbox_like 借此兜底判 True → 走 switch 回检
+    # 分支、打“勾选状态: 未勾选”误导文案。EditText 非 toggle，必须排除。
+    class _Device:
+        def __init__(self):
+            self.clicked_bounds = []
+
+        def current_app(self):
+            return {
+                "package": "com.zui.calendar",
+                "activity": "com.zui.calendar.TimetableActivity",
+            }
+
+        def click_bounds(self, bounds):
+            self.clicked_bounds.append(bounds)
+            return True
+
+        def click_resource_id(self, rid):
+            self.clicked_bounds.append(rid)
+            return True
+
+        def click_text(self, text):
+            return False
+
+    class _Perceiver:
+        def perceive(self):
+            return SimpleNamespace(
+                activity="com.zui.calendar.TimetableActivity",
+                page_title="",
+                primary_paths=[],
+                elements=[
+                    _el(
+                        label="课程表名称（必填）",
+                        rid="com.zui.calendar:id/et_schedule_name",
+                        cls="android.widget.EditText",
+                        checked=False,  # XML 噪音：输入框并非可勾选
+                        bounds=(88, 200, 2952, 280),
+                    )
+                ],
+            )
+
+    d = _Device()
+    tools_module.set_tool_context(ToolContext(device=d, perceiver=_Perceiver()))
+    out = tools_module.click.invoke(
+        {"index": 0, "label": "课程表名称（必填）", "repeat": 2}
+    )
+    # 关键：EditText 不再被误判为 checkbox-like → 走 bounds、repeat 生效、无勾选状态误导
+    assert "连点2次" in out
+    assert "勾选状态" not in out
+    assert "开关状态" not in out
+    assert len(d.clicked_bounds) == 2
 
 
 def test_empty_requested_label_never_counts_as_fuzzy():

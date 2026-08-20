@@ -726,9 +726,9 @@ def click(
             rid_is_unique = rid_count <= 1
         if role in ("switch", "switch_row") or _is_checkbox_like(el):
             ctx.device.click_bounds(el.bounds)
-            # 部分开关（如 Wi-Fi）关→开需要 3-4 秒才能真正生效，1 秒后读到的是
-            # 过渡态（会短暂 on 再回 off），导致「开关状态」误报。等 4 秒再回检。
-            time.sleep(4.0)
+            # 部分开关（如 Wi-Fi）关→开需要 2 秒才能真正生效，1 秒后读到的是
+            # 过渡态（会短暂 on 再回 off），导致「开关状态」误报。等 2 秒再回检。
+            time.sleep(2.0)
             new_checked = _check_switch_state(ctx, el)
             if new_checked is not None:
                 if role in ("switch", "switch_row"):
@@ -754,11 +754,14 @@ def click(
             if label_assoc_hit:
                 if ctx.device.click_resource_id(rid):
                     return True, _format_click_log(desc, el, strategy="resource_id")
-            return (
-                False,
-                f"AMBIGUOUS: rid={rid} label={getattr(el, 'label', '')} "
-                f"与目标 '{desc}' 不匹配，请用 index/class 精确定位",
-            )
+            # 未用 index 等精确定位手段、且 label 未命中 → 确实不确定元素，提示用 index/class
+            elif index < 0:
+                return (
+                    False,
+                    f"AMBIGUOUS: rid={rid} label={getattr(el, 'label', '')} "
+                    f"与目标 '{desc}' 不匹配，请用 index/class 精确定位",
+                )
+            # 否则（已用 index 精确定位）fall through 到下方 bounds 路径，不误判 AMBIGUOUS
         if getattr(el, "text", "") and ctx.device.click_text(el.text):
             return True, _format_click_log(desc, el, strategy="text")
         if getattr(el, "bounds", (0, 0, 0, 0)) != (0, 0, 0, 0):
@@ -802,9 +805,7 @@ def click(
         # Phase 4 locator 解析类型：semantic=语义搜索 ranker 命中（match_mode=element 且
         # 非兜底）；exact=确定性定位（resource_id/bounds/text/known-rid/pct-bounds 兜底）。
         resolution_type = (
-            "semantic"
-            if (match_mode == "element" and not fallback_used)
-            else "exact"
+            "semantic" if (match_mode == "element" and not fallback_used) else "exact"
         )
         evidence: dict[str, Any] = {
             "match_mode": match_mode,
@@ -869,6 +870,9 @@ def click(
             _is_toggle = _role in ("switch", "switch_row") or _is_checkbox_like(best_el)
             _n = max(1, min(int(repeat) if repeat else 1, 50))
             if _n > 1 and not _is_toggle:
+                # 连点：沿用首次解析的固定 bounds 连点 N 次（增量控件 +/- 等按钮位置固定，
+                # 点击后节数变化但按钮坐标不变，固定 bounds 即可命中）。超出 N 次连点由
+                # 调用方用 repeat=N 一次性表达意图，loop 保护器对 repeat=N 内部连点豁免熔断。
                 for _ in range(_n - 1):
                     time.sleep(0.3)
                     try:
@@ -1019,8 +1023,14 @@ def _is_checkbox_like(el: Any) -> bool:
     cls = _normalize_text(getattr(el, "class_name", "")).split(".")[-1]
     if "checkbox" in cls:
         return True
-    # 复合控件（list_entry/容器等）若自身携带 checked 属性，视为可勾选
+    # 复合控件（list_entry/容器等）若自身携带 checked 属性，视为可勾选。
+    # 但叶子按钮（ImageView/ImageButton/Button/TextView/Image）常因 XML 噪音携带
+    # checked="false"（如联想日历的 +/- 节数按钮 btn_add_morning_slot），并非真可勾选，
+    # 若误判会导致：repeat 循环被跳过、点一次当点 N 次、走开关回检分支多 4s sleep、
+    # 返回误导性的“勾选状态”。此处排除叶子按钮类，保留对真 checkbox/switch 容器的判定。
     if getattr(el, "checked", None) is not None:
+        if cls in ("imageview", "imagebutton", "button", "textview", "edittext", "image"):
+            return False
         if any(k in cls for k in ("check", "radio", "switch", "compound", "toggle")):
             return True
         if role in ("list_entry", "container", "compound_button", "checkable"):

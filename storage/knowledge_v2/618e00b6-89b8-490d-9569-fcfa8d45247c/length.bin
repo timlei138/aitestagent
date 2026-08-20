@@ -1,1 +1,1 @@
-invalid type: string "app=com.zui.calendar | 测试用例 联想日历_175\n前提：\n已通过图库导入图片并完成解析，进入课程表基本信息确认页\n操作步骤 \n1. 点击“课程时间设置”\n2. 查看课程时间设置页字段\n2.1. 打开每节课上课时长弹框\n2.2. 打开课间休息时长弹框\n2,3. 查看上午/下午/晚上课程节数入口\n", expected a 
+invalid type: string "app=com.zui.calendar | 验证联想日历课程表页面能成功打开并正常显示课程表内容 | 动作:set_permission_intent;click;点击课程表;assert_page_contains | 验证:课程表页面成功打开;课程表页面成功打开;课程表内容正常显示（课程网格/课程块可见）;课程表内容正常显示（课程网格/课程块可见）", expected f6
