@@ -164,8 +164,23 @@ def build_verification_contract(
     and overlap detection can be performed deterministically.
     """
     request = str(user_request or "")
+    # M4a (M1): verification 项支持对象形式 {"claim":..., "spec":{...}} 或
+    # 旧字符串形式。spec 描述 clause 的结构化期望，由自动匹配器(auto_record_evidence)
+    # 在 perceive 后落成证据；spec:null 的 clause 回退 M1 手动 verify。
+    raw_items = goal.get("verification", []) if isinstance(goal, dict) else []
+    parsed_items: list[tuple[str, dict | None]] = []
+    for raw in raw_items:
+        if isinstance(raw, dict):
+            parsed_items.append(
+                (str(raw.get("claim", "") or "").strip(), raw.get("spec"))
+            )
+        else:
+            parsed_items.append((str(raw or "").strip(), None))
+
     verifications = []
-    for index, item in enumerate(_goal_verification_items(goal)):
+    for index, (item, item_spec) in enumerate(parsed_items):
+        if not item:
+            continue
         key = f"v{index}"
         claims = _split_claims(item)
         cursor = 0
@@ -175,10 +190,14 @@ def build_verification_contract(
             if claim_offset < 0:
                 claim_offset = cursor
             cursor = claim_offset + len(claim)
+            # spec 只挂首条 clause（代表整条 verification 的终态期望），
+            # 其余子 clause 保持 spec=None 走手动。
+            spec = item_spec if clause_index == 0 else None
             clauses.append(
                 {
                     "id": f"{key}.{clause_index}",
                     "claim": claim,
+                    "spec": spec,
                     "goal_source_span": [claim_offset, cursor],
                     # M1-4: 删关键词推断（Plan Phase 0）。M1 阶段 spec:null 回退全通道
                     # （含 behavior_effect），与 §6 要点4 一致；M4 后由 spec 谓词决定。
@@ -535,6 +554,380 @@ def _determine_execution_status(state: dict) -> str:
     if len(history) >= 3:
         return "completed"
     return "error"
+
+
+def _render_checklist_view(
+    clause_state: dict[str, Any] | None,
+    contract: dict[str, Any] | None,
+    evidence_events: list[dict[str, Any]] | None = None,
+) -> str:
+    """Render the real-time verification checklist (✓/✗/○) for the agent.
+
+    Called from the inner `_llm` node every LLM turn, using the freshly
+    recomputed `_ctx._clause_state` (from evaluate_verification) so the agent
+    sees up-to-date progress and stops re-touching passed clauses. This is a
+    soft constraint (tell the agent), not a code-enforced interception.
+
+    Returns "" when there is nothing to render (no clause_state / no clauses).
+    """
+    if not isinstance(clause_state, dict):
+        return ""
+    verifications = clause_state.get("verifications", []) or []
+    if not isinstance(verifications, list) or not verifications:
+        return ""
+
+    # key -> clause_id -> [ (status, artifact_ref) ]  from evidence events,
+    # so we can attach the latest screenshot path to each clause line.
+    evidence_index: dict[tuple[str, str], tuple[str, str]] = {}
+    for ev in evidence_events or []:
+        if not isinstance(ev, dict):
+            continue
+        key = str(ev.get("verification_key", "") or "")
+        cid = str(ev.get("clause_id", "") or "")
+        if not key or not cid:
+            continue
+        status = str(ev.get("status", "") or "").upper()
+        artifact = str(ev.get("artifact_ref", "") or "")
+        prev = evidence_index.get((key, cid))
+        # PASS/YES wins for display; otherwise keep first seen.
+        if prev is None or (status in {"PASS", "YES"} and prev[0] not in {"PASS", "YES"}):
+            evidence_index[(key, cid)] = (status, artifact)
+
+    # contract clauses carry `channels` (declared evidence channels).
+    contract_clause_channels: dict[tuple[str, str], list[str]] = {}
+    for v in (contract or {}).get("verifications", []) or []:
+        if not isinstance(v, dict):
+            continue
+        vkey = str(v.get("key", "") or "")
+        for c in v.get("clauses", []) or []:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id", "") or "")
+            chs = c.get("channels", []) or []
+            contract_clause_channels[(vkey, cid)] = [
+                str(ch) for ch in chs
+            ] or ["any"]
+
+    lines: list[str] = ["检查项清单（✓=已通过 ✗=已失败 ○=待验证）:"]
+    for v in verifications:
+        if not isinstance(v, dict):
+            continue
+        key = str(v.get("key", "") or "")
+        clauses = v.get("clauses", []) or []
+        for c in clauses:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("id", "") or "")
+            claim = str(c.get("claim", "") or "")
+            status = str(c.get("status", "") or "")
+            if status == "passed":
+                mark = "✓"
+            elif status == "failed":
+                mark = "✗"
+            else:
+                mark = "○"
+            chs = contract_clause_channels.get((key, cid), ["any"])
+            ch_str = ",".join(chs) if chs != ["any"] else "any"
+            ev = evidence_index.get((key, cid))
+            if ev and ev[1]:
+                ev_part = f" | 证据: {ev[0]} 截图 {ev[1]}"
+            elif ev and ev[0]:
+                ev_part = f" | 证据: {ev[0]}"
+            else:
+                ev_part = f" | 通道: {ch_str}"
+            lines.append(f" [{mark}] {key}::{cid} {claim}{ev_part}")
+    lines.append(
+        "规则：○ 项结束前必须补齐证据；✓/✗ 项禁止再 open 编辑器微调或重复 assert。"
+    )
+    return "\n".join(lines)
+
+
+# ── M4a: 自动证据匹配器 ────────────────────────────────────────────────
+
+# M4a (M2): 谓词词汇表。每个谓词声明「找不到元素时是 unknown 还是 PASS/FAIL」。
+# 不对称设计（见 m4_auto_evidence_plan §3）：element_exists 找不到=unknown，
+# element_absent 找不到=PASS，避免把「元素不在当前可见区」误判成矛盾。
+_PREDICATES: dict[str, dict[str, str]] = {
+    "page_is": {"source": "activity", "not_found": "unknown"},
+    "page_contains": {"source": "text", "not_found": "unknown"},
+    "element_exists": {"source": "element", "not_found": "unknown"},
+    "element_absent": {"source": "element", "not_found": "pass"},
+    "element_enabled": {"source": "element", "not_found": "unknown"},
+    "element_disabled": {"source": "element", "not_found": "unknown"},
+    "element_checked": {"source": "element", "not_found": "unknown"},
+    "list_count": {"source": "element", "not_found": "unknown"},
+}
+
+
+def _activity_short(activity: str) -> str:
+    return (activity or "").split(".")[-1]
+
+
+def _element_matches(el: Any, target: str) -> bool:
+    """Match a UIElement against a spec target by resource-id leaf or label/text."""
+    if not isinstance(el, object) or not hasattr(el, "resource_id"):
+        return False
+    t = str(target or "").strip().lower()
+    if not t:
+        return False
+    rid = str(getattr(el, "resource_id", "") or "")
+    rid_leaf = rid.split("/")[-1].split(".")[-1].lower()
+    label = str(getattr(el, "label", "") or "").lower()
+    text = str(getattr(el, "text", "") or "").lower()
+    desc = str(getattr(el, "content_desc", "") or "").lower()
+    return t == rid_leaf or t in label or t in text or t in desc
+
+
+def _find_elements(u: Any, target: str) -> list[Any]:
+    elements = getattr(u, "elements", []) or []
+    return [e for e in elements if _element_matches(e, target)]
+
+
+def _match_spec(
+    spec: dict[str, Any], u: Any, current_app: dict[str, Any]
+) -> dict[str, Any] | None:
+    """M4a (M2): 纯代码 spec 匹配。
+
+    Returns None (无法判定/未知) | {"status":"PASS"/"FAIL","authoritative":bool,"fact":dict}.
+    保守原则：拿不准（元素不唯一/找不到且谓词非 absent）就不写。
+    """
+    if not isinstance(spec, dict):
+        return None
+    predicate = str(spec.get("predicate", "") or "").strip().lower()
+    if predicate not in _PREDICATES:
+        return None
+    target = str(spec.get("target", "") or "")
+    expected = spec.get("expected")
+    activity = _activity_short(str((current_app or {}).get("activity", "") or ""))
+    page_text = " ".join(
+        [
+            str(getattr(u, "page_title", "") or ""),
+            *[
+                str(getattr(e, "text", "") or "")
+                + " "
+                + str(getattr(e, "content_desc", "") or "")
+                + " "
+                + str(getattr(e, "resource_id", "") or "")
+                for e in getattr(u, "elements", []) or []
+            ],
+        ]
+    ).lower()
+
+    if predicate == "page_is":
+        if not target or not activity:
+            return None
+        if target.lower() in activity.lower() or activity.lower() in target.lower():
+            return {
+                "status": "PASS",
+                "authoritative": False,
+                "fact": {"predicate": predicate, "activity": activity, "target": target},
+            }
+        return None  # 页面对不上不算矛盾，只是还没到
+
+    if predicate == "page_contains":
+        if not target:
+            return None
+        if target.lower() in page_text:
+            return {
+                "status": "PASS",
+                "authoritative": False,
+                "fact": {"predicate": predicate, "target": target},
+            }
+        return None
+
+    # 以下谓词都依赖元素匹配
+    matched = _find_elements(u, target) if target else []
+    n = len(matched)
+
+    if predicate == "element_exists":
+        if n >= 1:
+            return {
+                "status": "PASS",
+                "authoritative": False,
+                "fact": {
+                    "predicate": predicate,
+                    "target": target,
+                    "matched_count": n,
+                },
+            }
+        return None
+
+    if predicate == "element_absent":
+        if n == 0:
+            return {
+                "status": "PASS",
+                "authoritative": False,
+                "fact": {"predicate": predicate, "target": target},
+            }
+        # 找到元素 = 矛盾（确定性 FAIL）
+        el = matched[0]
+        return {
+            "status": "FAIL",
+            "authoritative": True,
+            "fact": {
+                "predicate": predicate,
+                "target": target,
+                "matched_count": n,
+                "rid": str(getattr(el, "resource_id", "") or ""),
+            },
+        }
+
+    # enabled/disabled/checked/list_count 需要唯一元素，避免误判
+    if predicate in ("element_enabled", "element_disabled", "element_checked"):
+        if n != 1:
+            return None  # 多匹配/无匹配 → 不写（避免歧义误判）
+        el = matched[0]
+        if predicate == "element_enabled":
+            ok = bool(getattr(el, "enabled", False))
+            return {
+                "status": "PASS" if ok else "FAIL",
+                "authoritative": not ok,
+                "fact": {
+                    "predicate": predicate,
+                    "target": target,
+                    "enabled": ok,
+                    "rid": str(getattr(el, "resource_id", "") or ""),
+                },
+            }
+        if predicate == "element_disabled":
+            ok = not bool(getattr(el, "enabled", False))
+            return {
+                "status": "PASS" if ok else "FAIL",
+                "authoritative": bool(getattr(el, "enabled", False)),
+                "fact": {
+                    "predicate": predicate,
+                    "target": target,
+                    "enabled": bool(getattr(el, "enabled", False)),
+                    "rid": str(getattr(el, "resource_id", "") or ""),
+                },
+            }
+        if predicate == "element_checked":
+            actual = getattr(el, "checked", None)
+            if actual is None:
+                return None
+            ok = bool(actual) == bool(expected)
+            # element_checked 读的是 AccessibilityNodeInfo.isChecked()（实时 checked
+            # 过渡态），与 assert_behavior_effect 的 toggled 谓词同源 —— 历史已知在部分
+            # ROM 上「抖动/误读」，属当前态检查而非确定性 before/after 反证。故 FAIL
+            # 一律 authoritative=False（与 toggled 口径一致，见 verify.py toggled 分支），
+            # 不触发 fail-fast；真·失败交由 visual_check 高置信 FAIL 做权威确认。
+            # 注意：element_enabled/element_disabled 读 View.isEnabled()（可靠稳定），
+            # 仍保留 authoritative=True，不在本规则覆盖范围内。
+            return {
+                "status": "PASS" if ok else "FAIL",
+                "authoritative": False,
+                "fact": {
+                    "predicate": predicate,
+                    "target": target,
+                    "checked": bool(actual),
+                    "expected": bool(expected),
+                    "rid": str(getattr(el, "resource_id", "") or ""),
+                },
+            }
+
+    if predicate == "list_count":
+        if expected is None:
+            return None
+        try:
+            want = int(expected)
+        except (TypeError, ValueError):
+            return None
+        if n == 0:
+            return None  # anchor 无匹配 → 无法判定
+        ok = n == want
+        return {
+            "status": "PASS" if ok else "FAIL",
+            "authoritative": not ok,
+            "fact": {
+                "predicate": predicate,
+                "anchor": target,
+                "count": n,
+                "expected": want,
+            },
+        }
+
+    return None
+
+
+def _spec_channel(predicate: str) -> str:
+    """M4a: 写侧 channel 由 spec 谓词决定（m4_auto_evidence_plan §5 要点）。"""
+    if predicate in ("page_is", "page_contains"):
+        return "page_state"
+    return "element_state"
+
+
+def _has_same_evidence(
+    events: list[dict[str, Any]], key: str, clause_id: str, channel: str, status: str
+) -> bool:
+    """M4a (M3 去重): 已存在相同 (key,clause_id,channel,status) 的非权威证据则跳过。"""
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        if (
+            str(ev.get("verification_key", "") or "") == key
+            and str(ev.get("clause_id", "") or "") == clause_id
+            and str(ev.get("channel", "") or "") == channel
+            and str(ev.get("status", "") or "").upper() == status.upper()
+            and not bool(ev.get("authoritative", False))
+        ):
+            return True
+    return False
+
+
+def auto_record_evidence(
+    ctx: Any,
+    contract: dict[str, Any],
+    u: Any,
+    current_app: dict[str, Any],
+) -> int:
+    """M4a (M3): perceive() 之后调用，把当前页面确定性事实自动落成证据。
+
+    Returns the number of evidence events written. spec:null 的 clause 跳過
+    （留给 LLM 手动 verify）。保守原则：_match_spec 返回 None 不写；已存在相同
+    非权威证据去重；authoritative FAIL 例外（总写入，触发 fail-fast）。
+    """
+    if not isinstance(contract, dict) or not hasattr(ctx, "_evidence_events"):
+        return 0
+    written = 0
+    # 注意：不能用 `getattr(ctx, "_evidence_events", []) or []` —— 当属性本身是
+    # 空列表 [] 时，`[] or []` 会返回一个新的空列表，append 不会反映到 ctx 上。
+    events = getattr(ctx, "_evidence_events", None)
+    if events is None:
+        events = []
+        ctx._evidence_events = events
+    for v in contract.get("verifications", []) or []:
+        if not isinstance(v, dict):
+            continue
+        key = str(v.get("key", "") or "")
+        for clause in v.get("clauses", []) or []:
+            if not isinstance(clause, dict):
+                continue
+            spec = clause.get("spec")
+            if not isinstance(spec, dict):
+                continue  # spec:null → 手动 verify
+            r = _match_spec(spec, u, current_app)
+            if r is None:
+                continue  # 无法判定 → 不写
+            channel = _spec_channel(str(spec.get("predicate", "") or ""))
+            status = str(r.get("status", "") or "").upper()
+            # M3 去重：非权威证据若已存在相同记录则跳过（避免每次 perceive 重复写）
+            if not bool(r.get("authoritative", False)) and _has_same_evidence(
+                events, key, str(clause.get("id", "")), channel, status
+            ):
+                continue
+            events.append(
+                {
+                    "verification_key": key,
+                    "clause_id": str(clause.get("id", "")),
+                    "channel": channel,
+                    "status": status,
+                    "authoritative": bool(r.get("authoritative", False)),
+                    "fact": r.get("fact", {}),
+                    "auto": True,  # 标记自动证据，区别于 LLM 手动 assert
+                }
+            )
+            written += 1
+    return written
 
 
 # End of verification helpers.

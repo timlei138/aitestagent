@@ -10,6 +10,22 @@
 - goal: 测试目标（如 "验证设置中切换时区后日期格式正确变化"）
 - target_pages: 关键页面（如 ["通用设置页","日期和时间设置页","时区选择页"]）
 - verification: 验证条件（如 ["美国时区下日期为月/日/年格式","英国时区下日期为日/月/年格式"]）
+- verification 项的 spec（可选，结构化期望）：若某验证项描述「终态/可见状态」且能用下方谓词判定，把它写成对象并加 `spec`：
+  `{"claim":"课程表页面成功打开","spec":{"predicate":"page_is","target":"TimetableActivity","expected":null}}`
+  映射不了（依赖自绘/渲染内容）则保持纯字符串（spec:null，走手动 verify）。
+  **谓词词汇表（写结构化 spec 时用）**：
+  - `page_is(target)`：当前 activity 匹配 target（target 用 activity 短名，如 TimetableActivity）
+  - `page_contains(text)`：页面文本/元素文本含 text
+  - `element_exists(target)`：View Tree 找到 resource-id 或文本为 target 的元素
+  - `element_absent(target)`：View Tree 找不到 target（找到反而矛盾→FAIL）
+  - `element_enabled(target)`：找到的元素 enabled==True（enabled==False→FAIL）
+  - `element_disabled(target)`：找到的元素 enabled==False（enabled==True→FAIL）
+  - `element_checked(target,bool)`：找到的开关 checked==expected（不等→FAIL）
+  - `list_count(anchor,n)`：以 anchor 文本/rid 为锚的元素计数 == n（不等→FAIL）
+  **expected 字段如何填**：只有 `element_checked` 和 `list_count` 需要非 null 的 expected，其余谓词 expected 一律填 null。
+  - `element_checked`：expected 填 true/false。例：`{"predicate":"element_checked","target":"免打扰开关","expected":true}`
+  - `list_count`：expected 填数字。例：`{"predicate":"list_count","target":"课程节","expected":4}`
+  **规则**：target 尽量用稳定的 resource-id 叶子名或元素文本；activity 用短名。`element_*` 的 target 拿不准就别写 spec（避免误判），保持字符串走手动。
 - hints: 给 Agent 的导航提示，写清楚页面层级关系和常见坑：
   * "左侧导航可能需要向下滚动才能找到通用设置"
   * "日期和时间在通用设置的右侧列表里"
@@ -68,7 +84,6 @@ verification 只验证「用户预期结果中声明的目标状态是否达成�
 Agent 进入 App 后、在任何交互操作之前，按以下顺序执行：
 1. ❗ **`launch_app("包名", force_fresh=True)` 必须作为整轮测试的绝对第一步（无例外）**，先冷启动到 App 首页，确保从干净起点出发（消除上一轮/异常残留页面栈与脏状态）。**不得假设当前已在 App 内或页面正确而跳过冷启动**——"页面看起来对"不等于"已冷启动"，残留下次运行的页面栈会让后续验证失效。这一步由 Agent 自行调度，不要依赖外部预启动。
 2. 再调 `set_permission_intent(action="deny")` 建立「全部未授予」的干净基线。
-- **禁止在初始化阶段使用 `set_runtime_permission(grant)` 预授权**——它会一刀切 grant 所有权限（含 camera/storage），污染后续拒绝路径的前提，导致"测拒绝但权限已被授"的雪崩。
 - **禁止在初始化阶段使用 `set_runtime_permission(grant)` 预授权**——它会一刀切 grant 所有权限（含 camera/storage），污染后续拒绝路径的前提，导致"测拒绝但权限已被授"的雪崩。
 - 初始化阶段如遇 App 基础权限弹窗（如"日历需要使用以下权限"），deny intent 会让 auto-handler 自动拒绝；如遇系统 GrantPermissionsActivity 弹窗，同样被 auto-deny 接住。
 - 允许分支在该分支测试点才授予（intent=grant 或 set_runtime_permission(grant) 兑底），不在初始化阶段提前授。

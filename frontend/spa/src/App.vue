@@ -564,6 +564,9 @@ const planReviewVisible = ref(false);
 const planReviewGoal = ref("");
 const planReviewPages = ref([]);
 const planReviewVerifications = ref([]);
+// 与 planReviewVerifications 平行：verification 项若为对象 {claim, spec}，
+// 这里存对应 index 的 spec（plan_review_node 重建 contract 时需回传以保留 M4a 自动证据）。
+const planReviewSpecs = ref([]);
 const planReviewHints = ref([]);
 const planReviewSubmitting = ref(false);
 const planReviewUserRequest = ref("");
@@ -775,7 +778,7 @@ function handleEvent(data) {
       }
       break;
     case "status": wp?.addEntry({ type: "log", text: typeof content === 'object' ? JSON.stringify(content) : String(content) }); refreshSnapshot(); break;
-    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; planReviewVerifications.value = pd.verification || content.verification || []; planReviewHints.value = pd.hints || []; planReviewUserRequest.value = content.user_request || ""; planReviewContract.value = content.verification_contract || null; planReviewSpanStatus.value = content.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
+    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; const _rawV = pd.verification || content.verification || []; planReviewVerifications.value = _rawV.map(v => typeof v === "string" ? v : (v.claim || "")); planReviewSpecs.value = _rawV.map(v => (v && typeof v === "object" ? (v.spec || null) : null)); planReviewHints.value = pd.hints || []; planReviewUserRequest.value = content.user_request || ""; planReviewContract.value = content.verification_contract || null; planReviewSpanStatus.value = content.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
     case "stream_token": wp?.onToken(); break;
@@ -800,7 +803,7 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; planReviewVerifications.value = planData.verification || intr.verification || []; planReviewHints.value = planData.hints || []; planReviewUserRequest.value = intr.user_request || ""; planReviewContract.value = intr.verification_contract || null; planReviewSpanStatus.value = intr.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; const _rawV2 = planData.verification || intr.verification || []; planReviewVerifications.value = _rawV2.map(v => typeof v === "string" ? v : (v.claim || "")); planReviewSpecs.value = _rawV2.map(v => (v && typeof v === "object" ? (v.spec || null) : null)); planReviewHints.value = planData.hints || []; planReviewUserRequest.value = intr.user_request || ""; planReviewContract.value = intr.verification_contract || null; planReviewSpanStatus.value = intr.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
       wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports();
       break;
@@ -1035,17 +1038,24 @@ async function confirmPlan(action) {
   planReviewVisible.value = false;
   executing.value = true;
 
-  // 契约收敛：前端不重建 contract（第二份算法已删），只回传 verification 文本数组，
-  // 后端 plan_review_node 一律基于 edited 重建 contract。
+  // 契约收敛：前端不重建 contract（第二份算法已删），只回传编辑后的 verification。
+  // verification 项兼容两种形态：对象 {claim, spec}（保留 M4a 自动证据的 spec）或纯字符串。
+  const editedVerifications = planReviewVerifications.value
+    .map((claim, i) => {
+      const c = typeof claim === "string" ? claim.trim() : String(claim ?? "").trim();
+      if (!c) return null;
+      const spec = planReviewSpecs.value[i] || null;
+      return spec ? { claim: c, spec } : c;
+    })
+    .filter(Boolean);
   const resumePayload = action === "cancel" ? "cancel" : {
     action: "confirm",
     goal: planReviewGoal.value,
     target_pages: planReviewPages.value.filter(p => p.trim()),
-    verification: planReviewVerifications.value.filter(v => v.trim()),
+    verification: editedVerifications,
     hints: planReviewHints.value.filter(h => h.trim()),
-    // 契约收敛：前端只回传 verification 文本数组，不回传 verification_contract。
-    // 后端 plan_review_node 一律基于 edited 重建 contract（含 context_spans + channels），
-    // 前端回传的 contract 会被忽略。
+    // 契约收敛：前端回传 verification（含 spec 对象），后端 plan_review_node 一律基于
+    // edited 重建 contract（含 context_spans + channels），前端回传的 contract 会被忽略。
   };
 
   if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", text: action === "cancel" ? "目标已取消" : `目标已确认: ${planReviewGoal.value}` });

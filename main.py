@@ -26,6 +26,11 @@ def main():
     run_parser = sub.add_parser("run", help="自然语言执行测试")
     run_parser.add_argument("message", nargs="+", help="测试需求描述")
     run_parser.add_argument("--config", default="config.yaml")
+    run_parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="跳过计划人工确认，自动批准 verification contract（无人值守真机验证用）",
+    )
 
     server_parser = sub.add_parser("server", help="启动 Web 服务")
     server_parser.add_argument("--config", default="config.yaml")
@@ -67,8 +72,14 @@ def main():
             user_request=user_request,
             app_package=app_package,
             app_name=app_name,
+            auto_approve=getattr(args, "auto_approve", False),
         )
-        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        # GBK 终端下 ensure_ascii=False 会因中文/特殊字符抛 UnicodeEncodeError；
+        # 用 UTF-8 安全写出，异常时退化为 ensure_ascii=True，保证结果总能打印。
+        try:
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        except UnicodeEncodeError:
+            print(json.dumps(result, ensure_ascii=True, indent=2, default=str))
         return
 
     parser.print_help()

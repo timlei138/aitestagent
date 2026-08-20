@@ -67,6 +67,9 @@ class TestState(TypedDict, total=False):
     app_package: str
     app_name: str
     goal_description: dict[str, Any]
+    # 自动批准计划：CLI run --auto-approve 时置 True，plan_review_node 跳过
+    # interrupt() 直接 approve，用于无人值守的一次性真机验证。
+    auto_approve: bool
     verification_contract: dict[str, Any]
     clause_state: dict[str, Any]
     step_history: Annotated[list[dict[str, Any]], operator.add]

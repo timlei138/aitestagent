@@ -1,0 +1,197 @@
+"""M4a 自动证据：_match_spec + auto_record_evidence + build_verification_contract(spec)。
+
+覆盖 m4_auto_evidence_plan §10 验收：自动成证据、自动报差异、降级 spec:null、去重。
+"""
+
+from types import SimpleNamespace
+
+from agents.verification import (
+    _match_spec,
+    auto_record_evidence,
+    build_verification_contract,
+)
+
+
+def _make_element(label="", rid="", enabled=True, checked=None, text="", desc=""):
+    return SimpleNamespace(
+        label=label,
+        resource_id=rid,
+        text=text,
+        content_desc=desc,
+        enabled=enabled,
+        checked=checked,
+        clickable=True,
+    )
+
+
+def _make_u(activity="", title="", elements=None):
+    return SimpleNamespace(activity=activity, page_title=title, elements=elements or [])
+
+
+def _make_ctx(events=None):
+    return SimpleNamespace(_evidence_events=events if events is not None else [])
+
+
+# ── M2: _match_spec ─────────────────────────────────────────────────────
+
+def test_match_page_is_pass():
+    spec = {"predicate": "page_is", "target": "TimetableActivity"}
+    r = _match_spec(spec, _make_u(), {"activity": "com.xxx.TimetableActivity"})
+    assert r and r["status"] == "PASS" and r["authoritative"] is False
+
+
+def test_match_page_is_unknown_when_not_arrived():
+    spec = {"predicate": "page_is", "target": "TimetableActivity"}
+    r = _match_spec(spec, _make_u(), {"activity": "com.xxx.LauncherActivity"})
+    assert r is None  # 页面对不上不算矛盾
+
+
+def test_match_page_is_unknown_when_no_app():
+    spec = {"predicate": "page_is", "target": "TimetableActivity"}
+    r = _match_spec(spec, _make_u(activity="com.xxx.TimetableActivity"), {})
+    assert r is None  # current_app 缺 activity → 不误判
+
+
+def test_match_element_exists_pass_and_absent_fail():
+    u = _make_u(elements=[_make_element(rid="com.xxx:id/btn_add", label="加号")])
+    r1 = _match_spec({"predicate": "element_exists", "target": "btn_add"}, u, {})
+    assert r1 and r1["status"] == "PASS"
+    # element_absent 找到 = 确定性矛盾
+    r2 = _match_spec({"predicate": "element_absent", "target": "btn_add"}, u, {})
+    assert r2 and r2["status"] == "FAIL" and r2["authoritative"] is True
+
+
+def test_match_element_exists_unknown_when_missing():
+    u = _make_u(elements=[])
+    r = _match_spec({"predicate": "element_exists", "target": "btn_add"}, u, {})
+    assert r is None  # 找不到 = unknown（非矛盾）
+
+
+def test_match_element_disabled_contradiction():
+    u = _make_u(elements=[_make_element(rid="btn_done", enabled=True)])
+    r = _match_spec({"predicate": "element_disabled", "target": "btn_done"}, u, {})
+    assert r and r["status"] == "FAIL" and r["authoritative"] is True
+
+
+def test_match_element_enabled_pass():
+    u = _make_u(elements=[_make_element(rid="btn_done", enabled=True)])
+    r = _match_spec({"predicate": "element_enabled", "target": "btn_done"}, u, {})
+    assert r and r["status"] == "PASS"
+
+
+def test_match_element_checked_pass_and_fail():
+    u = _make_u(elements=[_make_element(rid="sw", checked=True)])
+    r_pass = _match_spec(
+        {"predicate": "element_checked", "target": "sw", "expected": True}, u, {}
+    )
+    assert r_pass and r_pass["status"] == "PASS"
+    r_fail = _match_spec(
+        {"predicate": "element_checked", "target": "sw", "expected": False}, u, {}
+    )
+    # element_checked 读 isChecked()（实时 checked 过渡态），与 toggled 同源，
+    # 历史已知部分 ROM 上抖动/误读 → FAIL 非权威，不触发 fail-fast。
+    assert r_fail and r_fail["status"] == "FAIL" and r_fail["authoritative"] is False
+
+
+def test_match_ambiguous_element_skipped():
+    # 两个匹配元素 → 不唯一 → 不写（避免误判）
+    u = _make_u(elements=[_make_element(rid="x"), _make_element(rid="x")])
+    r = _match_spec({"predicate": "element_enabled", "target": "x"}, u, {})
+    assert r is None
+
+
+def test_match_list_count():
+    u = _make_u(elements=[_make_element(rid="row") for _ in range(3)])
+    r = _match_spec({"predicate": "list_count", "target": "row", "expected": 3}, u, {})
+    assert r and r["status"] == "PASS"
+    r2 = _match_spec({"predicate": "list_count", "target": "row", "expected": 5}, u, {})
+    assert r2 and r2["status"] == "FAIL" and r2["authoritative"] is True
+
+
+def test_match_unknown_predicate_returns_none():
+    assert _match_spec({"predicate": "click_then_change", "target": "x"}, _make_u(), {}) is None
+
+
+# ── M3: auto_record_evidence ────────────────────────────────────────────
+
+def _contract_with_spec(predicate, target=None, expected=None):
+    return {
+        "verifications": [
+            {
+                "key": "v0",
+                "clauses": [
+                    {
+                        "id": "v0.0",
+                        "claim": "课程表页面成功打开",
+                        "spec": (
+                            {"predicate": predicate, "target": target, "expected": expected}
+                            if predicate
+                            else None
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+
+def test_auto_record_writes_pass_evidence():
+    ctx = _make_ctx()
+    u = _make_u(activity="com.xxx.TimetableActivity")
+    n = auto_record_evidence(
+        ctx, _contract_with_spec("page_is", "TimetableActivity"), u,
+        {"activity": "com.xxx.TimetableActivity"},
+    )
+    assert n == 1
+    ev = ctx._evidence_events[0]
+    assert ev["verification_key"] == "v0" and ev["clause_id"] == "v0.0"
+    assert ev["status"] == "PASS" and ev["channel"] == "page_state" and ev["auto"] is True
+
+
+def test_auto_record_skips_spec_null():
+    ctx = _make_ctx()
+    n = auto_record_evidence(ctx, _contract_with_spec(None), _make_u(), {})
+    assert n == 0 and ctx._evidence_events == []
+
+
+def test_auto_record_dedup_non_authoritative():
+    ctx = _make_ctx()
+    u = _make_u(activity="com.xxx.TimetableActivity")
+    c = _contract_with_spec("page_is", "TimetableActivity")
+    app = {"activity": "com.xxx.TimetableActivity"}
+    n1 = auto_record_evidence(ctx, c, u, app)  # 第一次 perceive
+    n2 = auto_record_evidence(ctx, c, u, app)  # 第二次 perceive 同页
+    assert n1 == 1 and n2 == 0  # 去重：非权威证据不重复写
+
+
+def test_auto_record_authoritative_fail_not_deduped():
+    ctx = _make_ctx()
+    u = _make_u(elements=[_make_element(rid="btn_done", enabled=True)])
+    c = _contract_with_spec("element_disabled", "btn_done")
+    n1 = auto_record_evidence(ctx, c, u, {})
+    n2 = auto_record_evidence(ctx, c, u, {})  # 第二次仍应写入（触发 fail-fast）
+    assert n1 == 1 and n2 == 1
+    assert all(e["authoritative"] for e in ctx._evidence_events)
+
+
+# ── M1: build_verification_contract 保留 spec ───────────────────────────
+
+def test_build_contract_keeps_spec_from_object():
+    goal = {
+        "verification": [
+            {
+                "claim": "课程表页面成功打开",
+                "spec": {"predicate": "page_is", "target": "TimetableActivity"},
+            }
+        ]
+    }
+    contract = build_verification_contract(goal)
+    clause = contract["verifications"][0]["clauses"][0]
+    assert clause["spec"] == {"predicate": "page_is", "target": "TimetableActivity"}
+
+
+def test_build_contract_string_falls_back_spec_null():
+    goal = {"verification": ["课程表页面成功打开"]}
+    contract = build_verification_contract(goal)
+    clause = contract["verifications"][0]["clauses"][0]
+    assert clause["spec"] is None  # 向后兼容：字符串 → spec:null → 手动 verify

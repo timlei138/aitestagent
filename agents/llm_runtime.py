@@ -34,6 +34,26 @@ import app_paths
 logger = logging.getLogger(__name__)
 
 
+def _build_checklist_message(_ctx: Any) -> str:
+    """Build the real-time verification checklist SystemMessage content for the
+    inner `_llm` node. Returns "" when there is no clause_state or nothing to render.
+
+    Isolated as a module-level function so it can be unit-tested without spinning
+    up the full `_run_agent` subgraph.
+    """
+    try:
+        from agents.verification import _render_checklist_view
+
+        return _render_checklist_view(
+            getattr(_ctx, "_clause_state", None) or {},
+            getattr(_ctx, "_verification_contract", {}) or {},
+            getattr(_ctx, "_evidence_events", None),
+        )
+    except Exception:
+        # 渲染失败不应阻断主流程
+        return ""
+
+
 _SKIP_EMIT = {"get_screen_info", "check_page_health", "request_knowledge"}
 
 _SCREENSHOT_ACTIONS = {
@@ -298,7 +318,16 @@ def _run_agent(
                 tool_call_400_count += 1
                 current_call_has_tool_400 = True
 
-        r = _call_retry(lc.invoke, s["messages"], on_error=_on_llm_error)
+        # Checklist（C2）：每次 LLM 调用前把实时验证进度以 SystemMessage 回灌 agent。
+        # 用本地 messages 副本注入，避免污染子图 state（SystemMessage 仅参与本次
+        # invoke，_llm 只 return {"messages": [r]}，不写回 state，故不跨 turn 残留）。
+        messages = list(s["messages"])
+        if _ctx is not None:
+            _checklist_msg = _build_checklist_message(_ctx)
+            if _checklist_msg:
+                messages.append(SystemMessage(content=_checklist_msg))
+
+        r = _call_retry(lc.invoke, messages, on_error=_on_llm_error)
         # O1：累计本次 LLM 调用的 token 消耗（run 级，存 ToolContext）
         _accumulate_token_usage(_ctx, r)
         return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
@@ -689,6 +718,12 @@ def _run_agent(
                     )
                     _ctx._clause_state = clause_state
                     if clause_state.get("verdict") in {"passed", "failed"}:
+                        # 全✓/全✗ 内层强制收口（原则1：结束只能靠证据）。
+                        # passed = 所有 clause 已通过，无需 agent 主动 DONE。
+                        logger.info(
+                            "EVALUATOR_TERMINAL: clause_state verdict=%s, break inner loop",
+                            clause_state.get("verdict", ""),
+                        )
                         loop_break_reason = "EVALUATOR_TERMINAL: " + str(
                             clause_state.get("verdict", "")
                         )

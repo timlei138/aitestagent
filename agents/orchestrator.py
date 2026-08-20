@@ -216,6 +216,7 @@ class TestOrchestrator:
         app_name: str = "",
         thread_id: str = "",
         goal_description: dict | None = None,
+        auto_approve: bool = False,
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
         logger.info(
@@ -277,6 +278,7 @@ class TestOrchestrator:
             "user_request": user_request,
             "app_package": app_package,
             "app_name": app_name,
+            "auto_approve": bool(auto_approve),
             "goal_description": goal_description or {},
             "step_history": [],
             "messages": [],
@@ -403,6 +405,7 @@ class TestOrchestrator:
         app_name: str = "",
         thread_id: str = "",
         goal_description: dict | None = None,
+        auto_approve: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """流式执行测试 — 通过 astream_events 实时推送每个事件。"""
         if not thread_id:
@@ -439,6 +442,7 @@ class TestOrchestrator:
             "user_request": user_request,
             "app_package": app_package,
             "app_name": app_name,
+            "auto_approve": bool(auto_approve),
             "goal_description": goal_description or {},
             "step_history": [],
             "messages": [],

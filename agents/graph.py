@@ -72,6 +72,8 @@ def route_after_evaluator(state: TestState) -> str:
             contract, getattr(ctx, "_evidence_events", []) if ctx else []
         )
     if evaluation["verdict"] in {"passed", "failed"}:
+        # 全✓（passed）/全✗（failed）强制收口 —— 原则1兜底：结束只能靠证据，
+        # 不依赖 agent 主动 DONE。优先于下方 M2（unknown 耗尽）与 Layer 3（DONE 回环）。
         logger.info("Route: reporter (contract verdict=%s)", evaluation["verdict"])
         return "reporter"
 

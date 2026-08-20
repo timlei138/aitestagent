@@ -1,0 +1,91 @@
+﻿======================================================================
+run_id= pkg= mode=explore verdict=inconclusive term=ABORT: USER_STOPPED llm=0
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_201539 pkg=com.zui.calendar mode=explore verdict=inconclusive term=DONE: EVALUATOR_TERMINAL: passed llm=119
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_191157 pkg=com.zui.calendar mode=explore verdict=passed term=DONE: EVALUATOR_TERMINAL: passed llm=53
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_190253 pkg=com.zui.calendar mode=explore verdict=failed term=ABORT: EVALUATOR_TERMINAL: failed
+
+---
+����ɲ���:
+[fail] ABORT: EVALUATOR_TERMINAL: failed
+{"terminated_on_authoritative_failure": true, "failed_clauses": [{"verification_key": "v6", "clause_id": "v6.0"}], "pending_clauses": [{"verification_key": "v0", "clause_id": "v0.1"}, {"verification_key": "v0", "clause_id": "v0.2"}, {"verification_key": "v1", "clause_id": "v1.0"}, {"verification_key": "v2", "clause_id": "v2.1"}, {"verification_key": "v3", "clause_id": "v3.1"}, {"verification_key": "v4", "clause_id": "v4.0"}, {"verification_key": "v4", "clause_id": "v4.1"}, {"verification_key": "v5", "clause_id": "v5.0"}, {"verification_key": "v5", "clause_id": "v5.1"}], "discrepancies": [{"clause_id": "v6.0", "expected": {"disabled": true}, "actual": {"enabled": true}, "channel": "behavior_effect"}]} llm=17
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_185604 pkg=com.zui.calendar mode=explore verdict=failed term=ABORT: EVALUATOR_TERMINAL: failed
+
+---
+����ɲ���:
+[fail] ABORT: EVALUATOR_TERMINAL: failed
+{"terminated_on_authoritative_failure": true, "failed_clauses": [{"verification_key": "v2", "clause_id": "v2.1"}], "pending_clauses": [{"verification_key": "v3", "clause_id": "v3.0"}, {"verification_key": "v3", "clause_id": "v3.1"}, {"verification_key": "v3", "clause_id": "v3.2"}, {"verification_key": "v4", "clause_id": "v4.0"}, {"verification_key": "v4", "clause_id": "v4.1"}, {"verification_key": "v5", "clause_id": "v5.0"}, {"verification_key": "v5", "clause_id": "v5.1"}], "discrepancies": [{"clause_id": "v2.1", "expected": null, "actual": {"decision": "no", "reason": "�γ̱�ҳ�����Ͻǵ�һ��С�ڣ���һ��һ�ڣ��������ǿհ׵ģ�û����ʾ�Ӻţ�+��ͼ�ꡣ�Ӻ�ͼ��λ��ҳ�����Ͻǡ�", "evidence": "��һ��һ�ڵĸ��ӣ�08:00-08:50����û���κ����ݣ��Ӻţ�+��ͼ������Ļ���Ͻǡ�", "confidence": "high"}, "channel": "vision_verify"}]} llm=26
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_182452 pkg=com.zui.calendar mode=explore verdict=failed term=ABORT: EVALUATOR_TERMINAL: failed
+
+---
+����ɲ���:
+[fail] ABORT: EVALUATOR_TERMINAL: failed
+{"terminated_on_authoritative_failure": true, "failed_clauses": [{"verification_key": "v6", "clause_id": "v6.0"}], "pending_clauses": [{"verification_key": "v0", "clause_id": "v0.0"}, {"verification_key": "v0", "clause_id": "v0.1"}, {"verification_key": "v0", "clause_id": "v0.2"}, {"verification_key": "v1", "clause_id": "v1.0"}, {"verification_key": "v2", "clause_id": "v2.1"}, {"verification_key": "v3", "clause_id": "v3.1"}, {"verification_key": "v4", "clause_id": "v4.0"}, {"verification_key": "v4", "clause_id": "v4.1"}, {"verification_key": "v5", "clause_id": "v5.0"}, {"verification_key": "v5", "clause_id": "v5.1"}, {"verification_key": "v6", "clause_id": "v6.1"}], "discrepancies": [{"clause_id": "v6.0", "expected": {"disabled": true}, "actual": {"enabled": true}, "channel": "behavior_effect"}]} llm=13
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_181207 pkg=com.zui.calendar mode=explore verdict=failed term=ABORT: EVALUATOR_TERMINAL: failed
+
+---
+����ɲ���:
+[fail] ABORT: EVALUATOR_TERMINAL: failed
+{"terminated_on_authoritative_failure": true, "failed_clauses": [{"verification_key": "v2", "clause_id": "v2.1"}], "pending_clauses": [{"verification_key": "v3", "clause_id": "v3.0"}, {"verification_key": "v3", "clause_id": "v3.1"}, {"verification_key": "v3", "clause_id": "v3.2"}, {"verification_key": "v4", "clause_id": "v4.0"}, {"verification_key": "v4", "clause_id": "v4.1"}, {"verification_key": "v5", "clause_id": "v5.0"}, {"verification_key": "v5", "clause_id": "v5.1"}], "discrepancies": [{"clause_id": "v2.1", "expected": null, "actual": {"decision": "no", "reason": "�Ӻţ�+��ͼ��λ����Ļ���Ͻǵĵ������У��������ڿγ̱�����������ڡ����������ǿհ׵ģ�û����ʾ�Ӻ�ͼ�ꡣ", "evidence": "��ͼ���Ͻ���һ�����ԵļӺţ�+��ͼ�꣬���·��Ŀγ̱�������һ�����壬��1-4�ڿΣ���û���κμӺ�ͼ�ꡣ", "confidence": "high"}, "channel": "vision_verify"}]} llm=24
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_170616 pkg=com.zui.calendar mode=explore verdict=inconclusive term=DONE: ������֤��֤�����뱸������������ɡ�
+
+## ִ��ժҪ
+
+**��ʼ״̬**��`TempConfirmTimetableActivity` ���С��γ�����ʱ�䡹�ӵ�����������/������ʱ/5����ǰ/15����ǰ/30����ǰ����v0�Cv4 ��ͨ������ʣ v5���༭�����رգ�����֤��
+
+**״̬����**�������豸�������γ̱��ѧ���γ̱��4���ҵĿγ̱��ѧ���γ̱�ddff����Υ�� hints ǰ�ᡸȷ���豸û�пγ̱������ hints ��ȷ��Ȩִ�� `clear_app_data(com.zui.calendar)` �󣬴���������������������̡�
+
+**�ɾ����̸���**��
+1. ����� �� App ����Ȩ��˵�������㡸ͬ�⡹�� ϵͳȨ�޵����� auto-deny ��ס �� ���γ̱������ˣ��������㡸��֪���ˡ�
+2. ������ҳ �� ���� �� �γ̱� �����ֶ������γ̱���� �½��γ̱�ҳ�������ơ��ҵĿγ̱���� ��� �� �տγ̱�ҳ�����⡸�ҵĿγ̱���Ҳࡸ��1�ܡ�����һ����ʾ�Ӻ� iv_add_hint��
+3. vision_tap �����һ��Ӻ� �� �������½��γ̡��༭������EditCourseActivity���γ�������/����/��ע/�γ�ʱ��/�Ͽ�����/�γ̱���ɫ��
+
+**v5 ��֤**����֤�ݣ���
+- ����������رա��� ҳ��� `EditCourseActivity` ���� `TimetableActivity`
+- `assert_page_state(TimetableActivity)` �� **PASS**
+- `assert_behavior_effect element_absent(�γ���)` �� **PASS**����������ʧ��
+
+**˳��ǿ��**��v2.0 �ڿտγ̱�ҳ�ض��ԡ���1�ܡ��� **PASS**��v2.1 �Ӻ�Ԫ���� UI ���пɼ���iv_add_hint���ұ� vision_tap �ɹ���������½��γ̵�����
+
+v0�Cv5 ������֤����Ѿ߱����߲����� PASS ֤�ݣ��ȴ� evaluator �������С� llm=34
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_165414 pkg=com.zui.calendar mode=explore verdict=passed term=DONE: EVALUATOR_TERMINAL: passed llm=62
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_154251 pkg=com.zui.calendar mode=explore verdict=failed term=ABORT: EVALUATOR_TERMINAL: failed
+
+---
+����ɲ���:
+[fail] ABORT: EVALUATOR_TERMINAL: failed
+{"terminated_on_authoritative_failure": true, "failed_clauses": [{"verification_key": "v5", "clause_id": "v5.0"}], "pending_clauses": [{"verification_key": "v6", "clause_id": "v6.0"}], "discrepancies": [{"clause_id": "v5.0", "expected": {"disabled": true}, "actual": {"enabled": true}, "channel": "behavior_effect"}]} llm=64
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260819_101045 pkg=com.zui.calendar mode=explore verdict=passed term=DONE: EVALUATOR_TERMINAL: passed llm=36
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260818_195319 pkg=com.zui.calendar mode=explore verdict=passed term=CONTRACT_REVIEW_REQUIRED: verification contract is not approved
+
+---
+����ɲ���:
+[success] DONE: ������֤�������ͨ����ǰ���еĹ���֤�ݸ��ǡ����������ܽ����£� llm=51
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260818_181747 pkg=com.zui.calendar mode=explore verdict=passed term=DONE: EVALUATOR_TERMINAL: passed llm=35
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count', 'rag_query_count', 'rag_same_app_ratio', 'rag_empty_hit_rate']
+======================================================================
+run_id=test-20260818_160040 pkg=com.zui.calendar mode=explore verdict=passed term=DONE: EVALUATOR_TERMINAL: passed llm=15
+  metrics keys: ['exact_resolution_count', 'semantic_resolution_count', 'label_mismatch_count']

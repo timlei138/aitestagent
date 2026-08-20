@@ -371,6 +371,22 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 else ""
             )
             current_app_key = f"{pkg}:{act}"
+            # M4a (M4): perceive 后自动匹配确定性事实成证据（spec 覆盖的 clause
+            # 自动落盘，agent 无需手动 assert）。失败不应阻断主流程。
+            try:
+                from agents.verification import auto_record_evidence
+
+                _current_app = (
+                    ctx.device.current_app() if ctx and ctx.device else {}
+                ) or {}
+                auto_record_evidence(
+                    ctx,
+                    state.get("verification_contract", {}) or {},
+                    u,
+                    _current_app,
+                )
+            except Exception as _auto_exc:
+                logger.warning("auto_record_evidence failed: %s", _auto_exc)
             # 契约：全局 [n] 与 click(index=n) 覆盖所有真实可点击元素，
             # 无文本课程格等元素不能因 label 为空而从候选池消失。
             clickable_elements = [e for e in u.elements if e.clickable]
@@ -1539,6 +1555,28 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
         return _stop_cmd
     goal = state.get("goal_description", {})
     verification_contract = state.get("verification_contract", {})
+
+    # CLI run --auto-approve：无人值守模式，跳过人工 interrupt 直接 approve。
+    # 复用与「simple confirm」完全相同的 span 校验 + 置 approved 逻辑，保持契约一致。
+    if state.get("auto_approve"):
+        if verification_contract:
+            from agents.verification import validate_contract_spans
+
+            approved = dict(verification_contract)
+            span_validation = validate_contract_spans(approved)
+            if span_validation["valid"]:
+                approved["status"] = "approved"
+                approved["span_validation_error"] = None
+            else:
+                approved["status"] = "contract_pending_review"
+                approved["span_validation_error"] = span_validation
+                logger.warning(
+                    "Plan review(auto): span validation failed, keeping pending: %s",
+                    span_validation,
+                )
+            return Command(update={"verification_contract": approved})
+        return Command(update={})
+
     from langgraph.types import interrupt
 
     # 后端下发 span 校验结果：前端零计算，直接展示（初始即绿，编辑降级草稿）
