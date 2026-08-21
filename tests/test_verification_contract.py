@@ -534,8 +534,14 @@ def test_assert_behavior_effect_without_clause_id_drops_evidence(monkeypatch):
 
 
 def test_assert_behavior_effect_disabled_fails_when_enabled_is_true(monkeypatch):
-    """M1-5（根治 v5）：disabled(完成) 在元素 enabled=True（实际未置灰）时应 FAIL，
-    且证据 authoritative=True——置灰矛盾为确定性反证，触发 fail-fast，不被 LLM 通道补判 passed。
+    """F2（决策反转，非纯 bug fix）：disabled(完成) 在元素 enabled=True（实际未置灰）
+    时应 FAIL，但证据 authoritative=False——enabled=True 只证明「App 没调 setEnabled(
+    false)」，推不出「用户可选中它」（不可选还能用 selected/自绘/OnClickListener 直接
+    return/父容器拦截表达）。代码不替 LLM 下它证不了的结论，非权威 FAIL 让 clause 保持
+    unknown 可重试，不再触发 llm_runtime 的 mid-batch break。
+
+    代价（必须记账）：「真该置灰却没置灰」从 fail-fast 降级为 unknown + 靠 LLM 取证，
+    这是有意反转。正向能力不丢：enabled=False 仍是权威 PASS（见下个测试）。
     """
     context = _make_context_with_elements(
         [FakeElement("rid_done", "完成", enabled=True)], monkeypatch
@@ -553,7 +559,7 @@ def test_assert_behavior_effect_disabled_fails_when_enabled_is_true(monkeypatch)
     event = context._evidence_events[0]
     # _record_deterministic_check 将 FAIL 记为 "FAIL"（evaluate_verification 同时认 FAIL/NO）。
     assert event["status"] == "FAIL"
-    assert event["authoritative"] is True
+    assert event["authoritative"] is False
     assert event["channel"] == "behavior_effect"
     assert event["fact"]["enabled"] is True
     assert event["fact"]["expected_disabled"] is True

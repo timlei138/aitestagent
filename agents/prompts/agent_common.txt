@@ -65,7 +65,9 @@
 - **为什么必须用 `repeat=N`（规则如何对待连点）**：`repeat=N` 是你向系统明确声明“我要对同一个固定按钮连点 N 次，这是预期内的”——系统信任该意图，单次 `repeat=N` 调用内部不会被循环断路器熔断（一次调用只产生一个签名，连点不计入连续相同）。反之，若你退化成连发 N 次 `repeat=1` 的相同 click，每次都是独立调用、页面签名未变，循环断路器会判定为死循环并 abort。因此：连加/连减一律用 `repeat=N` 一次表达；+/- 按钮位置固定，连点后仅“节数”变化、按钮坐标不变，`repeat=N` 可稳定命中。点完后用一次页面验证（如 `assert_page_contains` / `vision_check`）确认节数已变。
 
 ## 状态类 claim 必须用专用谓词验证（不要猜）
-- **置灰/禁用/可点/开关态**这类「状态类」claim，**必须用 `assert_behavior_effect` 的 `disabled(label)` / `enabled(label)` / `toggled(...)` 谓词**做确定性验证（读控件 `isEnabled()` / checked 状态，证据权威、确定、可点开复核）。
+- **置灰/禁用/开关态**这类「状态类」claim，**必须用 `assert_behavior_effect` 的 `disabled(label)` / `toggled(...)` 谓词**做确定性验证（读控件 `isEnabled()` / checked 状态）。
+- **口径边界（代码不主张、LLM 自己判断）**：`disabled()` 能证明「确实置灰」（enabled=False 是权威 PASS），但证明不了「没置灰就等于可选」——enabled=True 只能说明 App 没调 `setEnabled(false)`，不可选还能用 `selected`、自绘、`OnClickListener` 直接 return 等方式表达。`disabled(label)` 返回 FAIL 但**非权威**，clause 保持 unknown 可重试，需你结合 `[SELECTED]` 标记与交互取证自行判断（如 1/3/5 周无 `[SELECTED]` → 点一次 → 确认未翻转）。
+- （注意：不要调用 `enabled(...)` 这类谓词——它并未实现；想确认「未置灰」走上述 `disabled()` + selected 自行判断。）
 - **不要用** `click_and_check` 去"点一下看弹不弹 Toast"，也不要用 `visual_check` 去"看颜色/看灰不灰"猜状态——视觉/点击只能证伪、不能证明禁用，会引入 unknown 漂移且破坏"禁止破坏性操作"规则。
 - 判定口诀：**问"这个控件现在是什么状态" → `assert_behavior_effect` 状态谓词；问"页面有没有某文字/某元素" → `assert_page_contains` / `assert_element_exists`；问"颜色/布局/图标观感" → `visual_check`。三者各管一类，不要混用。
 - `FAIL` 不代表验证失败：图标、无文字元素或 canvas 绘制会导致文字断言失败。没有其他可靠反证时，报 `unknown` 并说明人工复核缺口；不要把模型观察或一次普通滑动当作性能结论。

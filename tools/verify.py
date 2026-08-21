@@ -381,6 +381,99 @@ def _infer_state_from_text(text: str) -> str | None:
     return None
 
 
+def _resolve_anchor(
+    understanding: Any, label: str, predicate: str = "disabled"
+) -> tuple[Any | None, str]:
+    """断言类谓词的统一锚点解析。返回 (element, err)；err 非空时 element 为 None。
+
+    predicate 是调用方谓词名（如 "disabled"），只用于错误串文案，绝不硬编码——
+    将来 toggled 走此函数也要传入它的 predicate，否则 LLM 会收到谓词名错的提示
+    （这正是本次修掉的 enabled(label) 文案漂移同类问题）。
+
+    分层精确优先 + 排除结构容器 + 层内唯一性检查（F1）：
+
+    第 0 步：排除 is_container 控件（layout/recyclerview/scroll/viewgroup 等，
+    见 perceiver.py:375）。这些容器可能通过 associated_label 携带数字/文本，
+    子串命中会把周 chip 之类的叶子控件误判到 ScrollView 上。
+
+    承重依赖：perceiver.py:404 把容器排除在「同页重复 label 抑制」判定之外——
+    否则 ScrollView/GridLayout/chip 三个 "10" 会互相抑制使 chip 的 label 变空，
+    层 1/层 3 都拿不到它。本函数依赖这个排除，才有意义。
+
+    层 1：label == el.label 或 el.text（label = text or content_desc or
+          associated_label；同页重复 label 被 suppress 时 el.label 返回 ""，
+          此时回退到 el.text 仍能命中或落到 ambiguous，不静默 not found）
+    层 2：label == rid 叶子名（rid.split("/")[-1].split(".")[-1].lower()）
+    层 3：子串命中 el.label 或 el.resource_id（保留既有行为，不回退能力）
+
+    某层非空即停；层内 >1 候选判歧义（ambiguous）。
+    所有字段访问必须 getattr 带默认（FakeElement 等测试替身字段不全）。
+    """
+    if not label:
+        return None, f"ERROR: {predicate} anchor not found: {label}"
+
+    elements = getattr(understanding, "elements", []) or []
+
+    def _rid_leaf(el: Any) -> str:
+        rid = getattr(el, "resource_id", "") or ""
+        return rid.split("/")[-1].split(".")[-1].lower()
+
+    # 第 0 步：排除容器
+    leaves = [el for el in elements if not getattr(el, "is_container", False)]
+
+    # 层 1：label 或 text 精确（覆盖同页重复 label 被 suppress 为 "" 的情况）
+    layer1 = [
+        el for el in leaves
+        if label == (getattr(el, "label", "") or "").strip()
+        or label == (getattr(el, "text", "") or "").strip()
+    ]
+    if len(layer1) == 1:
+        return layer1[0], ""
+    if len(layer1) > 1:
+        return None, _ambiguous_err(label, layer1, predicate)
+
+    # 层 2：rid 叶子精确
+    layer2 = [el for el in leaves if label == _rid_leaf(el)]
+    if len(layer2) == 1:
+        return layer2[0], ""
+    if len(layer2) > 1:
+        return None, _ambiguous_err(label, layer2, predicate)
+
+    # 层 3：子串（保留既有行为）
+    layer3 = [
+        el for el in leaves
+        if label in (getattr(el, "label", "") or "")
+        or label in (getattr(el, "resource_id", "") or "")
+    ]
+    if len(layer3) == 1:
+        return layer3[0], ""
+    if len(layer3) > 1:
+        return None, _ambiguous_err(label, layer3, predicate)
+
+    return None, f"ERROR: {predicate} anchor not found: {label}"
+
+
+def _ambiguous_err(label: str, cands: list[Any], predicate: str = "disabled") -> str:
+    """层内多候选 → 歧义，附带候选清单让 LLM 换更精确锚点（不写证据、不标权威）。
+
+    头部报总数（不静默截断），正文最多列前 5 个，符合项目「不做静默截断」原则。
+    predicate 同 _resolve_anchor，不硬编码谓词名。
+    """
+    lines = [
+        f"ERROR: {predicate} anchor ambiguous: {label} "
+        f"（共 {len(cands)} 个候选，显示前 5 个）"
+    ]
+    for el in cands[:5]:
+        rid = getattr(el, "resource_id", "") or ""
+        cls = (getattr(el, "class_name", "") or "").split(".")[-1]
+        bounds = getattr(el, "bounds", None)
+        lines.append(
+            f"  - label={getattr(el, 'label', '')!r} rid={rid!r} "
+            f"class={cls} bounds={bounds}"
+        )
+    return "\n".join(lines)
+
+
 @tool
 def assert_behavior_effect(
     expected: str, verification_key: str = "", clause_id: str = ""
@@ -546,46 +639,66 @@ def assert_behavior_effect(
             )
         elif expected.startswith("disabled(") and expected.endswith(")"):
             # disabled(label): 断言某元素处于置灰/不可交互状态（enabled=False）。
-            # 对应 Plan §5 D1：必填项为空时"完成"按钮置灰 → 期望 disabled=True。
-            # 读 View.isEnabled()（UI Tree 真实字段，可靠且稳定，不同于 Accessibilty
-            # checked 过渡态抖动），故 FAIL（期望置灰却 enabled=True）标 authoritative=True，
-            # 触发 fail-fast（根治 v5：置灰差异直接判 failed，不靠 LLM 通道补判 passed）。
-            # 这是既有"当前态→非权威"规则的刻意例外（toggled/element_present/absent
-            # 保持非权威），仅 disabled 单独标权威。
+            #
+            # 权威性契约（F2，决策反转，非纯 bug fix）：
+            #   enabled == False → PASS 且 authoritative=True。
+            #     「确实调用了 setEnabled(false)」是可核实事实，代码可主张权威。
+            #   enabled == True  → FAIL 但 authoritative=False（收紧）。
+            #     enabled=True 只能证明「App 没调 setEnabled(false)」，推不出
+            #     「用户可选中它」——不可选还能用 selected、自绘、OnClickListener
+            #     直接 return、父容器拦截等方式表达。代码在此不替 LLM 下它证不了
+            #     的结论。非权威 FAIL 落在 verification.py 优先级链第三档 → clause
+            #     保持 unknown 可重试，不再触发 llm_runtime 的 mid-batch break。
+            #
+            # 代价（必须记账）：「真该置灰却没置灰」会从 fail-fast 降级为 unknown
+            # + 靠 LLM 取证。这是有意反转，不是 bug。正向能力不丢：enabled=False
+            # 仍是权威 PASS。缓解靠 F3（[SELECTED] 渲染 + 全字段 fact 上报），那是
+            # 「更全的信息 + LLM 判断」，不是「代码硬保证」。
+            #
+            # 锚点解析（F1）：用 _resolve_anchor 统一分层精确优先 + 排除容器 +
+            # 唯一性检查，替代原来「子串 + 首个命中即停 + 不过滤容器」的坏匹配器
+            # （192037 误把 ScrollView「10」当周「1」）。
             label = expected[9:-1].strip().strip('"').strip("'")
             if not label:
                 return f"ERROR: disabled requires a label: {expected}"
             understanding = ctx.perceiver.perceive() if ctx.perceiver else None
-            matched = None
-            for element in understanding.elements if understanding else []:
-                if label and (
-                    label in (element.label or "")
-                    or label in (element.resource_id or "")
-                ):
-                    matched = element
-                    break
-            if matched is None:
-                return f"ERROR: disabled anchor not found: {label}"
+            # 层内候选在此收敛，toggled 统一时可在此返回 candidates 供 tie-break。
+            matched, anchor_err = _resolve_anchor(understanding, label, predicate="disabled")
+            if anchor_err:
+                # not-found / ambiguous：不写证据、不标权威（err 串保持 ERROR 前缀，
+                # 既有测试锁定该词表）。
+                return anchor_err
             actual_enabled = bool(getattr(matched, "enabled", True))
             fact.update(
                 {
                     "anchor": label,
                     "resource_id": getattr(matched, "resource_id", None),
+                    "class_name": getattr(matched, "class_name", None),
                     "bounds": getattr(matched, "bounds", None),
                     "enabled": actual_enabled,
+                    "clickable": getattr(matched, "clickable", False),
+                    "selected": bool(getattr(matched, "selected", False)),
+                    # checked 是 bool|None：None=非可勾选类型，False=可勾选但未勾。
+                    # 原样带出，bool() 会抹平这个区分（F2 细节 1）。
+                    "checked": getattr(matched, "checked", None),
                     "expected_disabled": True,
                 }
             )
             passed = not actual_enabled
             channel = "behavior_effect"
-            # enabled=View.isEnabled() 可靠 → 置灰矛盾为权威反证。
-            authoritative = True
+            if actual_enabled:
+                # enabled=True 只证明「没调 setEnabled」，非权威反证。
+                authoritative = False
+            else:
+                # enabled=False 是「确实置灰」的可核实事实，权威 PASS。
+                authoritative = True
             logger.debug(
                 "[verify] disabled state: anchor=%r enabled=%s expected_disabled=True "
-                "→ passed=%s (authoritative=True)",
+                "→ passed=%s (authoritative=%s)",
                 label,
                 actual_enabled,
                 passed,
+                authoritative,
             )
         else:
             # 格式校验（P0 第 2 点补强）：以 toggled 开头但格式不对（裸 toggled /

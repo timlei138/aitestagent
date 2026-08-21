@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr, model_validator
 
 import app_paths
 
@@ -61,7 +61,18 @@ def _get_onnx_model_status() -> dict[str, object]:
 @router.get("")
 async def get_config():
     cfg = _get_config()
-    payload = {field: getattr(cfg, field, None) or "" for field in _EDITABLE_FIELDS}
+    # 注意：bool/int/float 字段不能用 `or ""` 兜底——False/0/0.0 会被 coerce 成 ""，
+    # 前端保存时整包 PUT 回后端，Pydantic bool/int 字段收到 "" → 422 Unprocessable Entity。
+    # 仅字符串字段用 "" 兜底（避免 null 在表单里不好显示），标量字段保持原值/None。
+    _STRING_FIELDS = {"model", "api_key", "base_url", "perception_mode", "safety_level",
+                      "vision_model", "vision_api_key", "vision_base_url"}
+    payload = {}
+    for field in _EDITABLE_FIELDS:
+        val = getattr(cfg, field, None)
+        if field in _STRING_FIELDS:
+            payload[field] = val or ""
+        else:
+            payload[field] = val
     payload["onnx_model_status"] = _get_onnx_model_status()
     return payload
 
@@ -70,17 +81,30 @@ async def get_config():
 
 
 class ConfigUpdateRequest(BaseModel):
-    model: str | None = None
-    api_key: str | None = None
-    base_url: str | None = None
-    perception_mode: str | None = None
-    safety_level: str | None = None
-    vision_model: str | None = None
-    vision_api_key: str | None = None
-    vision_base_url: str | None = None
-    vision_timeout: int | None = None
-    llm_vision_capable: bool | None = None
-    context_history_steps: int | None = None
+    model_config = ConfigDict(extra="ignore")  # 前端整包 PUT，忽略非配置字段，避免 422
+
+    model: str | None =  None
+    api_key: str | None =  None
+    base_url: str | None =  None
+    perception_mode: str | None =  None
+    safety_level: str | None =  None
+    vision_model: str | None =  None
+    vision_api_key: str | None =  None
+    vision_base_url: str | None =  None
+    vision_timeout: int | None =  None
+    llm_vision_capable: bool | None =  None
+    context_history_steps: int | None =  None
+
+    # 容错：前端偶发把标量字段传空串（如 checkbox 未勾选 / 数字重置），
+    # 接收侧归一为 None，避免 Pydantic 类型校验 422。
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_blank(cls, data: object) -> object:
+        if isinstance(data, dict):
+            for f in ("vision_timeout", "context_history_steps", "llm_vision_capable"):
+                if data.get(f) == "":
+                    data[f] = None
+        return data
 
 
 class ModelTestRequest(BaseModel):

@@ -38,8 +38,9 @@ def test_agent_common_guides_state_claims_to_behavior_effect_predicates():
     assert "状态类 claim 必须用专用谓词验证" in system
     # 明确列出专用谓词
     assert "disabled(label)" in system
-    assert "enabled(label)" in system
     assert "toggled(" in system
+    # 不存在 enabled(label) 谓词（F3：删掉 prompt 里广告但未实现的谓词）
+    assert "enabled(label)" not in system
     # 明确禁止用 click_and_check / visual_check 猜状态（这是 M1+根因治理核心）
     assert "click_and_check" in system
     assert "不要用" in system

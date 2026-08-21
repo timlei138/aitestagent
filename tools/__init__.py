@@ -303,6 +303,11 @@ def _format_element_line(item: Any, clickable_index: int | None = None) -> str:
         clickable_mark = " [DISABLED]" if not _enabled else " [CLICKABLE]"
     else:
         clickable_mark = ""
+    # F3: selected 是 UI 树里真实携带「选中态」的字段（192037 里 1/3/5 周无 selected，
+    # 其余有），原从不渲染 → LLM 只能从 role=tab 间接猜。显式喂给 LLM 让它自己判断
+    # 「不可选」，代码只给事实地基、不替它判断。
+    if getattr(item, "selected", False):
+        clickable_mark += " [SELECTED]"
     extra = f" rid={rid}" if rid else ""
     extra += f" class={cls.split('.')[-1]}" if cls else ""
     if assoc and assoc != item.label:
