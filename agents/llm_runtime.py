@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from typing import Any, Annotated
 
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
@@ -275,6 +276,10 @@ def _run_agent(
         }
     llm_call_count = 0
     tool_call_400_count = 0
+    # 方案 5 回合级耗时（Plan §6.0，上轮升必选）：累计每次 LLM 调用的 wall-clock。
+    # D 类（LLM 推理）是最大隐藏成本（平均 83K input tokens/调用，延迟随 token 数增长），
+    # 只测工具级 elapsed_ms 会漏掉它，故在此按 turn 累计。
+    llm_elapsed_ms = 0.0
 
     def _is_tool_call_400_error(exc: Exception) -> bool:
         text = str(exc or "")
@@ -327,7 +332,11 @@ def _run_agent(
             if _checklist_msg:
                 messages.append(SystemMessage(content=_checklist_msg))
 
+        # 方案 5 回合级耗时：包裹本次 LLM 调用，记录 wall-clock（含 retry 总时间）。
+        _t_start = time.perf_counter()
         r = _call_retry(lc.invoke, messages, on_error=_on_llm_error)
+        nonlocal llm_elapsed_ms
+        llm_elapsed_ms += (time.perf_counter() - _t_start) * 1000.0
         # O1：累计本次 LLM 调用的 token 消耗（run 级，存 ToolContext）
         _accumulate_token_usage(_ctx, r)
         return {"messages": [r] if r else [AIMessage(content="LLM failed")]}
@@ -472,10 +481,12 @@ def _run_agent(
                     screen_profile = "x".join(str(value) for value in _ctx.screen_size)
             except Exception:
                 pass
+            _t0 = time.perf_counter()
             try:
                 output = str(t.invoke(args)) if t else f"UNKNOWN_TOOL: {name}"
             except Exception as e:
                 output = f"ERROR: {e}"
+            _elapsed_ms = round((time.perf_counter() - _t0) * 1000, 1)
             page_sig_after = _build_page_signature(_ctx)
             try:
                 after_app = (
@@ -624,6 +635,11 @@ def _run_agent(
                 "page_after_activity": str(after_app.get("activity", "") or ""),
                 "page_before_package": str(before_app.get("package", "") or ""),
                 "page_after_package": str(after_app.get("package", "") or ""),
+                # 方案 5 步级耗时埋点（Plan §6.0）：单次工具调用 wall-clock，
+                # 含工具内部感知/点击/断言耗时，不含 LLM 推理（推理属回合级）。
+                "elapsed_ms": _elapsed_ms,
+                "mode": str(getattr(_ctx, "_execution_mode", "explore") or "explore"),
+                "plan_id": str(getattr(_ctx, "_plan_id", "") or ""),
             }
             if name == "click":
                 entry["match_mode"] = _resolve_click_match_mode(name, args, output)
@@ -793,6 +809,7 @@ def _run_agent(
                     "loop_break_action": "user_stopped",
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
+                        "llm_elapsed_ms": round(llm_elapsed_ms, 1),
                 },
                 "",
             )
@@ -807,6 +824,7 @@ def _run_agent(
                     "loop_break_action": "terminate_run",
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
+                        "llm_elapsed_ms": round(llm_elapsed_ms, 1),
                 },
                 "",
             )
@@ -824,6 +842,7 @@ def _run_agent(
                         "loop_break_action": "evaluator_terminal",
                         "llm_call_count": llm_call_count,
                         "tool_call_400_count": tool_call_400_count,
+                        "llm_elapsed_ms": round(llm_elapsed_ms, 1),
                     },
                     "passed",
                 )
@@ -836,6 +855,7 @@ def _run_agent(
                     "loop_break_action": "evaluator_terminal",
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
+                        "llm_elapsed_ms": round(llm_elapsed_ms, 1),
                 },
                 "failed",
             )
@@ -866,6 +886,7 @@ def _run_agent(
                         "loop_break_action": "",
                         "llm_call_count": llm_call_count,
                         "tool_call_400_count": tool_call_400_count,
+                        "llm_elapsed_ms": round(llm_elapsed_ms, 1),
                     },
                     "",
                 )
@@ -896,6 +917,7 @@ def _run_agent(
                     "loop_break_action": "",
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
+                        "llm_elapsed_ms": round(llm_elapsed_ms, 1),
                 },
                 _terminal_verdict_from_conclusion(conclusion),
             )

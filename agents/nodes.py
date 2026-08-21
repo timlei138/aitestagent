@@ -310,6 +310,8 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     llm = _llm_cfg(cfg)
     ctx = get_tool_context()
     ctx._execution_mode = str(state.get("execution_mode", "explore") or "explore")
+    # 方案 5 埋点：把 plan_id 透到 ToolContext，供 llm_runtime 工具执行处记入 trace step。
+    ctx._plan_id = str(state.get("plan_id", "") or "")
 
     # 入口 stop 检查：优先于设备检查、感知、LLM 调用——命中直接收敛
     _stop_cmd = _stop_or_continue(state, ctx)
@@ -581,11 +583,16 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                     pending_items.append(_clause_tag(str(entry.get("key", "")), clause))
         if pending_items:
             hist_str += (
-                "\n\n待验证清单（以下 clause 尚未拿到任何证据，结束前必须用对应 assert 工具"
-                "补齐，并把上面给出的「verification_key::clause_id」原样填进 assert 的"
-                " verification_key / clause_id 参数，且使用标注的 channel 工具；"
-                "不得仅用肉眼观察替代，也不得把所有 assert 都打同一个 clause_id）: "
+                "\n\n待验证清单（以下 clause 尚未拿到任何证据；把上面给出的"
+                "「verification_key::clause_id」原样填进 assert 的 verification_key / clause_id"
+                " 参数，且使用标注的 channel 工具；不得仅用肉眼观察替代，也不得把所有 assert"
+                " 都打同一个 clause_id）: "
                 + "; ".join(pending_items)
+                + "\n\n【顺手验证提醒】若你本回合的某次操作结果已使某待验证 clause 进入可验状态"
+                "（如点击后出现/消失目标元素、状态翻转、出现 [SELECTED]），请在当回合内直接"
+                " fire 对应 assert，不要等到结尾统一补；若当前确实还不可验，继续探索即可，"
+                "无需特地回头。系统已在每轮感知后把确定性事实（如 disabled/[SELECTED] 命中）"
+                "自动落盘，你可直接引用，无需重复发 assert。"
             )
         # 第 3 层回环提示（无需跨层 flag：pending list 每轮都注入，且 agent 在历史中能看到
         # 自己上轮的 report_done 被驳回）。只要待验证清单非空，就明确约束 agent 不得原样
@@ -788,6 +795,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     # reducer 通道：只上报本次迭代增量（delta），累计由通道 reducer 完成。
     iter_llm_call_count = int(loop_meta.get("llm_call_count", 0) or 0)
     iter_tool_call_400_count = int(loop_meta.get("tool_call_400_count", 0) or 0)
+    iter_llm_elapsed_ms = float(loop_meta.get("llm_elapsed_ms", 0.0) or 0.0)
     llm_call_count = iter_llm_call_count
     tool_call_400_count = iter_tool_call_400_count
     # 派生比率：基于（累计值 + 本次增量）估算，仅用于实时展示，reporter 会重算。
@@ -1014,6 +1022,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
                 "llm_call_count": llm_call_count,
                 "tool_call_400_count": tool_call_400_count,
                 "tool_call_400_rate": tool_call_400_rate,
+                "llm_elapsed_ms": iter_llm_elapsed_ms,
                 "_tool_calls_log": list(state.get("_tool_calls_log", []))
                 + tool_calls_log_tagged,
             }
@@ -1037,6 +1046,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             "llm_call_count": llm_call_count,
             "tool_call_400_count": tool_call_400_count,
             "tool_call_400_rate": tool_call_400_rate,
+            "llm_elapsed_ms": iter_llm_elapsed_ms,
             "_tool_calls_log": list(state.get("_tool_calls_log", []))
             + tool_calls_log_tagged,
         }
@@ -1271,6 +1281,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
     llm_call_count = int(state.get("llm_call_count", 0) or 0)
     tool_call_400_count = int(state.get("tool_call_400_count", 0) or 0)
     tool_call_400_rate = float(state.get("tool_call_400_rate", 0.0) or 0.0)
+    llm_elapsed_ms = float(state.get("llm_elapsed_ms", 0.0) or 0.0)
     # 用户手动停止：优先级最高，**不**被 V1 全过归正覆盖。
     # 即便所有验证都通过了，用户主动停止也只记 cancelled——停止是一种
     # 主动意图，不是"自然完成"。同时保证 test_verdict 为 inconclusive。
@@ -1509,6 +1520,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                     "llm_call_count": llm_call_count,
                     "tool_call_400_count": tool_call_400_count,
                     "tool_call_400_rate": tool_call_400_rate,
+                    "llm_elapsed_ms": round(llm_elapsed_ms, 1),
                     "click_count": click_count,
                     "exact_click_count": exact_count,
                     "semantic_click_count": semantic_count,

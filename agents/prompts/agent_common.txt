@@ -62,6 +62,13 @@
 - 页面跳转、当前 Activity、元素存在、按钮可点击等，只能证明对应的 UI 事实；**不能外推**为接口调用成功、功能全量正确或性能流畅。一个验证项含多个主张时，只要其中任一关键主张无法核实，整个验证项报 `unknown`，并在 detail 中保留已观察到的 UI 事实供人工复核。
 - 可**字面判定**的验证项（页面是否含某文字、某元素是否存在），先用 `assert_page_contains` / `assert_element_exists`：返回 `PASS` 才是可靠的确定性证据。
 - 同一增量控件（加号/减号/步进器/“+1”/“最多添加 N 节”）需连点多次时，**必须一次 `click(label=..., repeat=N)` 或 `vision_tap(..., repeat=N)` 完成，禁止连发 N 次相同 click**——后者会被循环断路器（LOOP_DETECTED）判为死循环并 abort 本轮。N = 目标值 − 当前值（如当前 5、目标 10 → repeat=5）；switch/checkbox 切换控件不要传 repeat。详见 agent_explore 的「同一增量控件需连点多次」节。
+- **多个不同目标、彼此独立、无需中间感知时，用一次 `click(targets=[...])` 批量下发**：例如“全选周数 1~6”→ `click(targets=["1","2","3","4","5","6"])`，“取消 1、3、5、7 周”→ `click(targets=["1","3","5","7"])`，工具会顺序点击每个目标并聚合返回，等价于一次性完成 N 次独立点击、但只占 1 个工具调用（省掉 N−1 次感知开销与 step 预算）。**不要为每个目标各自发一次 click**，也不要在两次点击间插入 `get_screen_info`（工具已在每步内部感知）。`targets` 与 `repeat` 互斥（repeat=同一元素连点，targets=不同元素各点一次）。
+- **多选组优先尝试一次批量 + 利用 toggle 取消**：周数 / 星期 / 单双周 / 复选列表等同构多选控件很常见，且多为 toggle（再次点击已选项 = 取消选中）。需要清空/反选时，优先用 `click(targets=[已选中的各项])` 一次性取消，而不是逐个 click；下发前先判断要「全选」还是「取消/反选」，避免误 toggled 掉该保留的项。页面出现多个文案相近、role 相同的可选标签时，合并成一次 targets 调用。
+- **设备/环境异常优先用确定性工具恢复，不要靠摸索**：锁屏 → `unlock_screen()`；目标 app 不在前台/崩溃 → `launch_app(pkg)`。若设备长时间无响应（adb 死、RPC 断），**立即 `terminate_run(reason="设备无响应，无法继续")` 失败退出，不要反复重试同一操作消耗预算**——启动故障应快速失败，而非耗尽 step 预算。
+- **断言边界（方案 6，Plan §6.5 验收）**：按 UI 性质选通道，二者不混用——
+  - **静态常驻文本**（页面稳定存在的标题/状态/标签/错误文案）→ 用确定性断言 `assert_page_contains` / `assert_element_exists` / `assert_behavior_effect`，可重复校验、低成本；
+  - **瞬时 UI**（toast / snackbar / 一闪而过的加载动画 / 点击后才出现又快速消失的结果）→ **必须走 `click_and_check(wait_ms=300~500)` 一次性捕获并存证**（其返回已带 `verification_key`/`clause_id` 落盘），**禁止再用 `assert_page_contains` 对同一瞬时文本二次断言**——它已消失，必 FAIL 且白费后续补帧步骤（即 run 213229 的 seq 109→110 反模式）。
+- **瞬时提示（toast）不要等**：弹出的“请选择…”类提示几秒即消失，确定性断言 `assert_page_contains` 会因其消失而 FAIL。抓瞬时提示一律用 `click_and_check(wait_ms=300~500)`（或点击后**立即** `get_screen_info()` 读当前帧），**捕获成功后不得再对同一瞬时文本调 `assert_page_contains`**。
 - **为什么必须用 `repeat=N`（规则如何对待连点）**：`repeat=N` 是你向系统明确声明“我要对同一个固定按钮连点 N 次，这是预期内的”——系统信任该意图，单次 `repeat=N` 调用内部不会被循环断路器熔断（一次调用只产生一个签名，连点不计入连续相同）。反之，若你退化成连发 N 次 `repeat=1` 的相同 click，每次都是独立调用、页面签名未变，循环断路器会判定为死循环并 abort。因此：连加/连减一律用 `repeat=N` 一次表达；+/- 按钮位置固定，连点后仅“节数”变化、按钮坐标不变，`repeat=N` 可稳定命中。点完后用一次页面验证（如 `assert_page_contains` / `vision_check`）确认节数已变。
 
 ## 状态类 claim 必须用专用谓词验证（不要猜）

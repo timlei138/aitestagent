@@ -510,6 +510,8 @@ def click(
     path_contains: str = "",
     index: int = -1,
     repeat: int = 1,
+    targets: list[str] | None = None,
+    stop_on_first_failure: bool = True,
     permission_hint: str = "",
 ) -> str:
     """点击页面上指定文本, 描述, 资源 id 或关联标签的元素。
@@ -528,11 +530,40 @@ def click(
     相同 click —— 否则会触发循环断路器（LOOP_DETECTED）直接 abort 本轮。
     repeat 对 switch / checkbox 类“切换”控件无意义（连点会来回切），此类忽略 repeat。
 
+    targets: 可选，多个**不同**定位依据的列表（如多个 week chip 的 label）。一次性下发
+    多个不同目标，工具顺序点击每个并聚合返回（每个目标的命中/翻转/未命中摘要）。
+    这是“同构连续操作批处理”的契约表达（Plan §4 方案 2），用于把 N 次独立 click 的
+    工具执行开销与 step 预算合并为 1 次。与 repeat 互斥（repeat=同一元素连点，
+    targets=不同元素各点一次）。`stop_on_first_failure=True`（默认）时任一目标
+    NOT_FOUND/ERROR 即停止后续、返回已完成的摘要；设为 False 则跳过失败继续。
+
     permission_hint: 可选，"grant" 或 "deny"。点击后若系统权限弹窗出现，
     自动点击对应按钮（毫秒级响应，消除 LLM 时延竞态）。
     不传则保持原有行为（仅回写弹窗存在性字段，不自动点选）。
     """
     ctx = get_tool_context()
+
+    # ── 方案 2 批处理入口：targets 分发（与 repeat 互斥）──
+    # 递归复用本函数单目标逻辑，零逻辑分叉；子调用不带 targets，避免无限递归。
+    _targets = [t.strip() for t in (targets or []) if str(t).strip()]
+    if _targets:
+        if repeat and repeat > 1:
+            return make_result(
+                ERROR,
+                "targets 与 repeat 互斥：targets=多个不同目标各点一次，"
+                "repeat=同一元素连点 N 次，不能同时使用",
+            )
+        _summaries = []
+        for _t in _targets:
+            # 注意：click 是 @tool 装饰的 StructuredTool，不可直接调用，
+            # 须走 .invoke(...)（或 .func(...)）才能触发底层函数并拿到字符串结果。
+            _r = click.invoke(
+                {"label": _t, "permission_hint": permission_hint}
+            )
+            _summaries.append(f"{_t}: {_r}")
+            if stop_on_first_failure and parse_status(_r) in (NOT_FOUND, ERROR):
+                break
+        return "BATCH_OK: " + " | ".join(_summaries)
     # 测试场景中所有操作均可执行（数据为临时测试数据）
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
@@ -842,6 +873,12 @@ def click(
         permission_fields = _maybe_auto_handle_permission(ctx, permission_hint, label)
         if permission_fields:
             evidence.update(permission_fields)
+        # §9(c)（Plan）：点击成功后复用本次感知结果附上当前可点列表摘要，
+        # 避免 LLM 为拿 [n] 列表再发一次 get_screen_info（第三次感知冗余）。
+        # 仅附前若干条可点元素，控制长度；复用 tools.__init__._format_element_line 渲染。
+        _clickable_list = _build_clickable_summary(understanding)
+        if _clickable_list:
+            parts.append(_clickable_list)
         return make_result("OK", " | ".join(parts), evidence)
 
     def _resolved_from_element(element: Any | None) -> dict[str, str]:
@@ -1008,6 +1045,31 @@ def click(
             f"未找到可点击元素: {label} | 提示：权限弹窗刚被 auto-handler 自动处理（可能已消失），请 get_screen_info() 确认当前页面。",
         )
     return make_result(NOT_FOUND, f"未找到可点击元素: {label}")
+
+
+def _build_clickable_summary(understanding, limit: int = 12):
+    """§9(c)（Plan）：从点击后已感知的 understanding 生成可点元素摘要，避免重复 get_screen_info。
+
+    复用 understanding.elements（click 内部已 perceive 一次），仅列 clickable 元素，
+    返回 '[n] [SELECTED] label' 片段；无感知结果时返回空串。
+    """
+    if understanding is None:
+        return ""
+    _els = getattr(understanding, "elements", None) or []
+    _lines = []
+    _idx = 0
+    for _el in _els:
+        if not getattr(_el, "clickable", False):
+            continue
+        _idx += 1
+        _label = (getattr(_el, "label", "") or "").strip() or "<无文本>"
+        _mark = " [SELECTED]" if getattr(_el, "selected", False) else ""
+        _lines.append(f"[{_idx}]{_mark} {_label}")
+        if len(_lines) >= limit:
+            break
+    if not _lines:
+        return ""
+    return "当前可点列表: " + " | ".join(_lines)
 
 
 def _is_checkbox_like(el: Any) -> bool:

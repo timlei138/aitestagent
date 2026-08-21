@@ -209,6 +209,177 @@ class TestOrchestrator:
 
     # ── 同步执行 ──
 
+    # 方案 1（Plan §4）：启动自愈 / 健康预检 / 快速失败。
+    # 返回 None 表示健康；返回 dict 表示快速失败（调用方直接 return）。
+    def _preflight_device_health(self, ctx: Any) -> dict | None:
+        """廉价设备健康探针：在进 agent 循环前确认设备真实可用（非僵尸连接）。
+
+        检查项（均为可快速判定、失败即给出可操作指引）：
+        1. uiautomator2 设备可达（ctx.device 是 DeviceController 包装，底层 u2 设备为
+           ctx.device.device），用 info/echo 探针排除"连上但不响应"的僵尸连接；
+        2. 屏幕已点亮（keyevent 唤醒 + 读 power 状态），排除 screen-off 导致后续 perceive 全黑。
+
+        注意：DeviceController 本身不暴露 .shell，shell 要走底层 u2 设备 ctx.device.device。
+        """
+        import time as _t
+
+        _tid = getattr(ctx, "_run_tag", "") or ""
+        _ctl = getattr(ctx, "device", None)
+        if _ctl is None:
+            return None
+        _u2 = getattr(_ctl, "device", None)  # 底层 uiautomator2 设备
+        if _u2 is None:
+            return None
+
+        # 1) 最轻量存活探针：u2 device.info 是 ping 式调用；同时 echo 探针确认 shell 通道。
+        #    有界重试（3 次，~1s 间隔）规避偶发 RPC 抖动误判（Plan §7 风险）。
+        _ok = False
+        _last_exc: Exception | None = None
+        for _attempt in range(3):
+            try:
+                _ = _u2.info  # 存活 ping（controller.py:62 同款）
+                _probe = _u2.shell("echo 1")
+                _out = str(getattr(_probe, "output", _probe) or "").strip()
+                if _out != "1":
+                    raise RuntimeError(f"adb 探针返回异常: {_out!r}")
+                _ok = True
+                break
+            except Exception as exc:
+                _last_exc = exc
+                if _attempt < 2:
+                    _t.sleep(1.0)
+        if not _ok:
+            msg = (
+                f"设备 ADB 无响应（僵尸连接），请重连 USB/ADB 后重试。"
+                f"诊断: {_last_exc}"
+            )
+            logger.warning("[preflight] device health probe failed: %s", _last_exc)
+            self._emit("error", {"message": msg})
+            return self._preflight_fail(_tid, msg, "device_unresponsive")
+
+        # 2) 屏幕唤醒：先发 WAKEUP（无害，锁屏也会解到亮屏），再读电源状态。
+        #    注意：dumpsys power 输出随 ROM/Android 版本差异大，grep 不匹配≠屏幕灭。
+        #    仅当输出**显式**出现屏幕 OFF 标记才判失败；解析不到/模糊一律按"已亮屏"处理，
+        #    避免把"亮屏但 dumpsys 格式不认识"误杀成 screen_off（Plan Review 实测误报）。
+        try:
+            _u2.shell("input keyevent KEYCODE_WAKEUP")
+            _st = _u2.shell(
+                "dumpsys power | grep -E 'mScreenOn|mScreenState|Display Power' | head -n3"
+            )
+            _stxt = str(getattr(_st, "output", _st) or "")
+            _screen_off = (
+                "mScreenOn=false" in _stxt
+                or "mScreenState=OFF" in _stxt
+                or "Display Power: state=OFF" in _stxt
+            )
+            if _screen_off:
+                # 明确读到 OFF：再唤醒一次仍 OFF 才判失败（避免偶发锁屏误杀）
+                _t.sleep(0.3)
+                _u2.shell("input keyevent KEYCODE_WAKEUP")
+                _st = _u2.shell(
+                    "dumpsys power | grep -E 'mScreenOn|mScreenState|Display Power' | head -n3"
+                )
+                _stxt = str(getattr(_st, "output", _st) or "")
+                if (
+                    "mScreenOn=false" in _stxt
+                    or "mScreenState=OFF" in _stxt
+                    or "Display Power: state=OFF" in _stxt
+                ):
+                    msg = "设备屏幕未点亮，请手动点亮屏幕或检查熄屏策略后重试"
+                    logger.warning("[preflight] screen off detected")
+                    self._emit("error", {"message": msg})
+                    return self._preflight_fail(_tid, msg, "screen_off")
+        except Exception as exc:
+            # 屏幕状态读取失败不致命（部分设备 dumpsys 差异），仅告警
+            logger.warning("[preflight] screen state probe skipped: %s", exc)
+
+        logger.info("[preflight] device health OK")
+        return None
+
+    # 想法 #1（Plan §10）：fixture 前置编排。
+    # 返回 None 表示通过（或开关关闭）；返回 dict 表示快速失败。
+    def _preflight_fixture(
+        self, ctx: Any, app_package: str, app_name: str
+    ) -> dict | None:
+        """run 前 fixture 契约：clear_app_data + 冷启动 + 启动可用性检查。
+
+        clear_app_data 原语在 tools/device_ops.py（@tool 封装，经 .invoke 调用）；
+        _cold_start_app 是本类 orchestrator.py 的方法（force_fresh 冷启动）。
+        此处按 self.config.run_fixture_precheck 触发编排；默认关闭以兼容既有 run。
+        开启后消除脏数据 / 残留页面栈导致的"前提重演"（Plan 估算 ~40% 步骤）。
+        """
+        from tools.device_ops import clear_app_data
+
+        if not self.config.run_fixture_precheck:
+            return None
+        _pkg = (app_package or "").strip()
+        if not _pkg:
+            return None  # 无包名无法夹具化，跳过（不致命）
+        _tid = getattr(ctx, "_run_tag", "") or ""
+
+        # 1) 清理用户数据（clear_app_data 是 @tool 装饰的 StructuredTool，须走 .invoke）
+        try:
+            _r = clear_app_data.invoke(
+                {"package": _pkg, "confirmation": f"CLEAR_DATA:{_pkg}"}
+            )
+            if _r.startswith(("ERROR", "NEEDS_HUMAN")):
+                msg = f"fixture 清理应用数据失败: {_r}"
+                logger.warning("[preflight] fixture clear failed: %s", _r)
+                self._emit("error", {"message": msg})
+                return self._preflight_fail(_tid, msg, "fixture_clear_failed")
+        except Exception as exc:
+            msg = f"fixture 清理应用数据异常: {exc}"
+            logger.warning("[preflight] fixture clear exception: %s", exc)
+            self._emit("error", {"message": msg})
+            return self._preflight_fail(_tid, msg, "fixture_clear_failed")
+
+        # 2) 冷启动（force_fresh 确保从主 Activity 起，消除残留页面栈）
+        try:
+            self._cold_start_app(ctx, _pkg, _tid)
+        except Exception as exc:
+            msg = f"fixture 冷启动异常: {exc}"
+            logger.warning("[preflight] fixture launch exception: %s", exc)
+            self._emit("error", {"message": msg})
+            return self._preflight_fail(_tid, msg, "fixture_launch_failed")
+
+        # 3) 启动可用性检查（契约收敛）：pm clear 成功本身即"已清空"的 ground truth，
+        #    故此处不引入任何业务关键词 if/else（那违反 §0 随场景增长的特例补丁）。
+        #    仅做一次感知连通性确认——能成功 perceive 说明设备/页面栈可用，
+        #    若 perceive 直接抛错说明环境异常，提前快速失败而非把预算耗在脏环境。
+        try:
+            _screen = ctx.perceiver.perceive()
+            _els = getattr(_screen, "elements", []) or []
+            if not _els:
+                # 首屏无任何可交互元素：多半卡在崩溃/黑屏，判为环境异常
+                msg = "fixture 启动可用性检查未通过：清理冷启动后首屏无可见元素，请检查应用是否可正常启动"
+                logger.warning("[preflight] fixture clean-check: empty screen")
+                self._emit("error", {"message": msg})
+                return self._preflight_fail(_tid, msg, "fixture_not_clean")
+        except Exception as exc:
+            msg = f"fixture 已空预检异常: {exc}"
+            logger.warning("[preflight] fixture clean-check exception: %s", exc)
+            self._emit("error", {"message": msg})
+            return self._preflight_fail(_tid, msg, "fixture_not_clean")
+
+        logger.info("[preflight] fixture OK pkg=%s", _pkg)
+        return None
+
+    @staticmethod
+    def _preflight_fail(
+        thread_id: str, msg: str, code: str
+    ) -> dict[str, Any]:
+        """方案 1 / 想法 #1 共用：统一快速失败返回结构。"""
+        return {
+            "thread_id": thread_id or "",
+            "status": code,
+            "execution_status": code,
+            "test_verdict": "inconclusive",
+            "verification_results": [],
+            "mode": "run",
+            "conclusion": msg,
+            "steps": [],
+        }
+
     def start(
         self,
         user_request: str,
@@ -257,6 +428,21 @@ class TestOrchestrator:
                 "conclusion": msg,
                 "steps": [],
             }
+
+        # ── 方案 1（Plan §4）：启动自愈 / 健康预检 / 快速失败 ──
+        # 设备对象存在，但可能是"僵尸连接"（adb 连上但 screen off / 无响应）。
+        # 在进入 agent 循环前做一次廉价健康探针，异常则快速失败，避免把 10 分钟
+        # 探索预算浪费在一个已坏的设备上（A 类损耗的"启动即失败"子集）。
+        _health = self._preflight_device_health(ctx)
+        if _health is not None:
+            return _health
+
+        # ── 想法 #1（Plan §10）：fixture 前置（编排层）──
+        # clear_app_data + 冷启动 + 已空预检 的原语已就绪；此处按 cfg.run_fixture_precheck
+        # 触发编排。默认关闭以兼容既有 run；开启后消除脏数据/残留页面栈导致的"前提重演"。
+        _fixture = self._preflight_fixture(ctx, app_package, app_name)
+        if _fixture is not None:
+            return _fixture
 
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"

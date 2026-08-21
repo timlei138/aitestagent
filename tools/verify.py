@@ -613,10 +613,18 @@ def assert_behavior_effect(
                 actual_checked = bool(matched.checked)
                 inferred = None
             else:
-                inferred = _infer_state_from_text(matched.label) or _infer_state_from_text(
-                    getattr(matched, "associated_label", "")
-                )
-                actual_checked = inferred == "on" if inferred is not None else False
+                # 方案 3a（Plan §4）：chip/TextView 等无 checkbox 子控件的元素，其选中态
+                # 真实来源是 element.selected（已通过 F3 渲染为 [SELECTED]），而非 on/off 文本。
+                # 优先读 selected，避免把"已选中的 chip"误判为未选中→FAIL→逼 LLM 走 visual_check。
+                _selected = getattr(matched, "selected", None)
+                if _selected is True:
+                    actual_checked = True
+                    inferred = None
+                else:
+                    inferred = _infer_state_from_text(matched.label) or _infer_state_from_text(
+                        getattr(matched, "associated_label", "")
+                    )
+                    actual_checked = inferred == "on" if inferred is not None else False
             fact.update({"anchor": anchor, "checked": actual_checked})
             if inferred:
                 fact["inferred_from_text"] = inferred

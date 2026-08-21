@@ -93,6 +93,11 @@ def build_run_trace(
             "observation": obs,
             "screenshot": e.get("screenshot_path", ""),
             "tool_input": e.get("tool_input", {}),
+            # 方案 5 步级耗时埋点（Plan §6.0）：每步耗时 + 执行模式 + plan_id，
+            # 用于成本归因（explore/guided/direct 对比）与战略重构立项论证。
+            "elapsed_ms": e.get("elapsed_ms", ""),
+            "mode": e.get("mode", ""),
+            "plan_id": e.get("plan_id", ""),
         }
         if e.get("name") == "click":
             step["match_mode"] = e.get("match_mode", "")

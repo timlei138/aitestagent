@@ -211,6 +211,25 @@ def main() -> None:
     )
     logger.info("已写入联想日历专属规则 (scope=app) #7: 课程表导航路径")
 
+    # ── 条目八：创建空课程表 ≠ 清空数据（负知识，堵错误理解）──
+    _save(
+        kb,
+        app_package="com.zui.calendar",
+        knowledge_type="negative_knowledge",
+        content=(
+            "「创建空课程表」≠「清空应用数据 / clear_app_data」。\n"
+            "测试前提「创建空课程表」的正确做法：在 TimetableListActivity 点「添加课程表」"
+            "新建一个空课表（进入 EditTimetableActivity 后命名、关闭「周末是否有课」、保存）。\n"
+            "看到残留课程（如已存在的「语文」课）时，用「新建课表」绕开即可，"
+            "不要清除/重置 App 数据（clear_app_data 会删除全部用户数据，不可恢复）。"
+        ),
+        scope="app",
+        reviewed_by="dev",
+        domain="ui_interaction",
+        scenario="create_empty_timetable",
+    )
+    logger.info("已写入联想日历专属规则 (scope=app) #8: 创建空课程表≠清空数据")
+
     logger.info(
         "RAG 知识写入完成。重启服务后规则将在首轮/App 切换时自动注入 agent prompt。"
     )

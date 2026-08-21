@@ -92,6 +92,7 @@ class TestState(TypedDict, total=False):
     budget_violation_count: Annotated[int, operator.add]  # P0.4: token budget violations
     llm_call_count: Annotated[int, operator.add]
     tool_call_400_count: Annotated[int, operator.add]
+    llm_elapsed_ms: Annotated[float, operator.add]  # 方案 5 回合级 LLM 耗时（D 类最大隐藏成本）
     tool_call_400_rate: Annotated[float, _last_value]  # 派生比率，后写覆盖
     token_usage: (
         dict  # O1: 单次运行 token 消耗汇总（input/output/total/cached/llm_calls）

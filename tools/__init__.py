@@ -38,7 +38,6 @@ from tools.element_match import (
 )
 from tools.device_ops import (
     check_desktop_mode,
-    clear_app_data,
     copy,
     launch_app,
     open_app_permission_settings,
@@ -392,7 +391,6 @@ AGENT_TOOLS: list[Any] = [
     set_orientation,
     toggle_auto_rotate,
     check_desktop_mode,
-    clear_app_data,
     launch_app,
     open_app_permission_settings,
     visual_check,
