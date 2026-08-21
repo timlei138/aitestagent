@@ -3,7 +3,7 @@ base_url: https://api.deepseek.com
 perception_mode: ui_tree
 safety_level: strict
 click_mode: legacy
-context_history_steps: 5
+context_history_steps: 4
 llm_vision_capable: false
 # 视觉备用模型（当主模型不是多模态时启用）
 vision_model: qwen3.7-plus
@@ -11,8 +11,6 @@ vision_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 vision_timeout: 60
 
 # Phase 3: 计划执行与环境兼容
-# fixture 指纹占位符；真实 fixture 生命周期指纹接入前保持默认值。
-fixture_profile: default
 # 动作质量每日衰减系数（0 表示不衰减）。
 quality_decay_lambda: 0.01
 # plan action 平均质量低于此值时撤销 direct 准入。

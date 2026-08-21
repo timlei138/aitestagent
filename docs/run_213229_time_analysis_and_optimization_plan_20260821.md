@@ -290,7 +290,7 @@ trace steps：`vision_tap=4`、`visual_check=7`、`assert_page_contains=5`、`as
 | **方案 5 工具级 elapsed_ms** | §6「地基」 | `llm_runtime.py:481,632` + `run_trace.py:98` | ✅ **已落地** | 步级 elapsed_ms 已埋 |
 | **方案 5 回合级 llm_elapsed_ms** | 上轮升「必选」 | `llm_runtime.py:331` + `nodes.py:796-1047` + reporter metrics | ✅ **已落地** | 包裹 LLM 调用累计 `llm_elapsed_ms`，经 loop_meta→state→reporter metrics 透出（D 类最大隐藏成本现已可测） |
 | **想法 #2 mode/plan_id per step** | §10 | `llm_runtime.py:633-634` + `run_trace.py:99-100` | ✅ **已落地** | 每步带 mode + plan_id |
-| **想法 #1 fixture 契约** | §10「最高杠杆」 | `orchestrator.py:_preflight_fixture` | ✅ **已落地** | 编排层接好：clear_app_data + 冷启动 + 已空预检；`config.run_fixture_precheck` 默认关（兼容既有 run），原语早已就绪 |
+| **想法 #1 fixture 契约** | §10「最高杠杆」 | `orchestrator.py:_preflight_fixture` | ❌ **已移除** | 经自测场景确认：不存在"每次都要清空"的场景，且强行清空会多步数与引入授权/系统弹窗处理，故移除 `run_fixture_precheck` 开关与 `_preflight_fixture` 编排（清理意图仍可由提示词让 LLM 驱动 clear_app_data，见 agent_common.txt） |
 | **想法 #3 沉淀→检索→guided 闭环** | §10「10x 杠杆」 | `nodes.py:1365 extract_candidate_plan` | 🟡 **部分** | 沉淀管线已接；端到端未验证（213229 仍 no_matching_plan） |
 | **方案 6（新）瞬时 UI 捕获契约** | 中（原 §9(a)） | `agent_common.txt` 断言边界 + `click_and_check`（已注册） | ✅ **已落地** | prompt 通道契约已写（静态→确定性断言，瞬时→click_and_check 且捕获后禁二次断言）；代码无需扩 |
 | **§9(c) click 返回 [n] 列表** | 中 | `click.py:1046 _build_clickable_summary` + `click.py:875` | ✅ **已落地** | 单/多目标 click 成功消息均附"当前可点列表: [n]"；原表"❌"为误判 |
@@ -359,7 +359,7 @@ trace steps：`vision_tap=4`、`visual_check=7`、`assert_page_contains=5`、`as
 战术层（方案 1–6）优化的是"explore 内部损耗"。但 trace 的 `execution.mode=explore` + `mode_selection_reason=no_matching_plan` 说明：**本次慢的根因是"无计划可复用"，不是 explore 慢**。治本方向是"让这个任务下次根本不需要 explore"——这正是 `explore_mode_learning` 大重构的立项目标。以下三个想法把它与该战术 Plan 焊接起来。
 
 ### 想法 #1（最高杠杆）：把"前提条件"做成 fixture 契约，而非 LLM 探索
-> **状态：🟡 部分**（原语已具备，`clear_app_data` 已注册：`tools/__init__.py:395` + `device_ops.py:227` + `controller.py:250`；`agent_explore.txt:44,53` 已有冷启动/脏状态指引）。**缺的只是把它们升级成"fixture 契约"**（pre-run 自动 clear + "已空"预检 + 唯一命名 + 可回收 fingerprint）——落地成本远低于"从零实现"，应作为紧接方案 1 的第二步优先做。
+> **状态：❌ 已移除**（决策依据：自测场景确认不存在"每次都要清空"的通用场景；强行 pre-run 自动清空会**增加步数与引入授权/系统弹窗处理**，与降时目标相悖）。`clear_app_data` 原语仍保留并已在 `agent_common.txt` 通过提示词驱动（LLM 按需调用），不再做编排层强制前置。
 - **真凶（§3 已确认）**：seq 0–53（占 40% 步数）只是"到达用例起点"——创建一个空课程表是**确定性操作**，却让 LLM 花 54 步探索。这等于让"活"干了"稳"的活，违反 §0。
 - **做法**：提供 `setup_fixture`（或 `pm clear` + 唯一命名建表脚本 + "已空"预检），**跑 run 前先判定/建立干净前置，跑完可回收**。`explore_mode_learning §2.7.2` 已点名残留数据（"Zzz"/"Aa"）污染决策空间，run 213229 seq 27 就是活例子。
 - **收益**：单独消掉 40% 步数，比方案 1–5 战术之和对这个用例的收益都大。且属"契约收敛"（fixture 指纹 + 可回收 cleanup，§2.7.2 已有设计），非补丁。

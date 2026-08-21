@@ -514,7 +514,7 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
     budget_violation_count = 1 if rag_truncated else 0
     if include_rag and rag_summary and ctx:
         _apply_click_preferences(ctx, rag_summary, effective_app_package)
-    _cfg_steps = max(1, getattr(cfg, "context_history_steps", 5) or 5)
+    _cfg_steps = max(1, getattr(cfg, "context_history_steps", 4) or 4)
     hist_lines = [
         f"  [{s.get('status','')}] {s.get('intent','')}: {str(s.get('observation',''))[:100]}"
         for s in history[-_cfg_steps:]
@@ -1374,7 +1374,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 # 永远不触发（候选 plan 的 page 只含 package/activity/screen_profile）。
                 _app_pkg = state.get("app_package", "")
                 _env_app_version = _get_app_version(ctx, _app_pkg)
-                _env_fixture = cfg.fixture_profile
+                _env_fixture = ""  # fixture 维度已废弃（不再每次清空场景）
                 # 注意：action_events 来自 ctx._action_events（reporter 之前可能还持有同一引用），
                 # 因此这里对 page 字典做浅拷贝后再注入，避免 in-place 改写污染上层持有的副本。
                 for _ev in action_events:
@@ -1787,7 +1787,7 @@ def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
         screen_size = ctx.screen_size if ctx else (0, 0)
         screen_profile = "x".join(str(value) for value in screen_size)
         app_version = _get_app_version(ctx, state.get("app_package", ""))
-        fixture_fingerprint = cfg.fixture_profile
+        fixture_fingerprint = ""  # fixture 维度已废弃（不再每次清空场景）
         # 语义说明：environment_key 由「执行时前台 app 的 package/activity」+「目标 app 的
         # app_version/fixture」混合组成。find_matching_execution_plan 已按 app_package 过滤，
         # package/activity 是弱信号不会误判；严格对齐 Plan 4.1 时应改用「目标 App 启动后首屏

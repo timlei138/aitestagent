@@ -57,7 +57,7 @@ class TestConfig:
 
     # ── 上下文历史步数（摘要层）──
     # agent 每轮注入的 step_history 摘要条数（原硬编码 10）
-    context_history_steps: int = 5
+    context_history_steps: int = 4
 
     # ── 上下文优化 (O2) ──
     # 历史消息中，除最新一次外的 get_screen_info 大输出折叠为占位符，
@@ -83,12 +83,6 @@ class TestConfig:
     click_mode: str = "legacy"
 
     # ── Phase 3: 计划执行与环境兼容 ──
-    # fixture 指纹占位符；真实 fixture 生命周期指纹接入前使用稳定配置值。
-    fixture_profile: str = "default"
-    # 想法 #1（Plan §10）：run 前是否执行 fixture 前置（clear_app_data + 冷启动 + 已空预检）。
-    # 默认 False 以保持与既有 run 行为兼容；开启后消除脏数据/残留页面栈导致的"前提重演"。
-    # 该开关是"fixture 契约"的编排入口——clear_app_data / 冷启动原语已就绪，此处只做编排触发。
-    run_fixture_precheck: bool = False
     # 动作质量每日衰减系数（0 表示不衰减）。
     quality_decay_lambda: float = 0.01
     # plan action 平均质量低于此值时撤销 direct 准入。

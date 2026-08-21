@@ -111,7 +111,7 @@ TimetableActivity → click_exact("手动创建课程表") → EditTimetableActi
 
 ### 2.6 上下文治理仍有压力，但不是“只有粗裁剪”
 
-- [config.yaml:8](config.yaml#L8) `context_history_steps: 5`
+- [config.yaml:8](config.yaml#L8) `context_history_steps: 4`
 - [agents/nodes.py](../agents/nodes.py#L2069-L2118) 会先折叠历史 `get_screen_info` 大输出，再默认保留 14 条消息。
 
 当前实现已减轻旧屏幕快照的积累，但长任务中高频屏幕信息、反复感知和 100 次 LLM 调用仍会增加延迟，并使早期路径信息更难被持续有效利用。该问题是性能与上下文生命周期治理问题，不应简单归因为“LLM 忘记”。

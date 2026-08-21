@@ -296,79 +296,11 @@ class TestOrchestrator:
         logger.info("[preflight] device health OK")
         return None
 
-    # 想法 #1（Plan §10）：fixture 前置编排。
-    # 返回 None 表示通过（或开关关闭）；返回 dict 表示快速失败。
-    def _preflight_fixture(
-        self, ctx: Any, app_package: str, app_name: str
-    ) -> dict | None:
-        """run 前 fixture 契约：clear_app_data + 冷启动 + 启动可用性检查。
-
-        clear_app_data 原语在 tools/device_ops.py（@tool 封装，经 .invoke 调用）；
-        _cold_start_app 是本类 orchestrator.py 的方法（force_fresh 冷启动）。
-        此处按 self.config.run_fixture_precheck 触发编排；默认关闭以兼容既有 run。
-        开启后消除脏数据 / 残留页面栈导致的"前提重演"（Plan 估算 ~40% 步骤）。
-        """
-        from tools.device_ops import clear_app_data
-
-        if not self.config.run_fixture_precheck:
-            return None
-        _pkg = (app_package or "").strip()
-        if not _pkg:
-            return None  # 无包名无法夹具化，跳过（不致命）
-        _tid = getattr(ctx, "_run_tag", "") or ""
-
-        # 1) 清理用户数据（clear_app_data 是 @tool 装饰的 StructuredTool，须走 .invoke）
-        try:
-            _r = clear_app_data.invoke(
-                {"package": _pkg, "confirmation": f"CLEAR_DATA:{_pkg}"}
-            )
-            if _r.startswith(("ERROR", "NEEDS_HUMAN")):
-                msg = f"fixture 清理应用数据失败: {_r}"
-                logger.warning("[preflight] fixture clear failed: %s", _r)
-                self._emit("error", {"message": msg})
-                return self._preflight_fail(_tid, msg, "fixture_clear_failed")
-        except Exception as exc:
-            msg = f"fixture 清理应用数据异常: {exc}"
-            logger.warning("[preflight] fixture clear exception: %s", exc)
-            self._emit("error", {"message": msg})
-            return self._preflight_fail(_tid, msg, "fixture_clear_failed")
-
-        # 2) 冷启动（force_fresh 确保从主 Activity 起，消除残留页面栈）
-        try:
-            self._cold_start_app(ctx, _pkg, _tid)
-        except Exception as exc:
-            msg = f"fixture 冷启动异常: {exc}"
-            logger.warning("[preflight] fixture launch exception: %s", exc)
-            self._emit("error", {"message": msg})
-            return self._preflight_fail(_tid, msg, "fixture_launch_failed")
-
-        # 3) 启动可用性检查（契约收敛）：pm clear 成功本身即"已清空"的 ground truth，
-        #    故此处不引入任何业务关键词 if/else（那违反 §0 随场景增长的特例补丁）。
-        #    仅做一次感知连通性确认——能成功 perceive 说明设备/页面栈可用，
-        #    若 perceive 直接抛错说明环境异常，提前快速失败而非把预算耗在脏环境。
-        try:
-            _screen = ctx.perceiver.perceive()
-            _els = getattr(_screen, "elements", []) or []
-            if not _els:
-                # 首屏无任何可交互元素：多半卡在崩溃/黑屏，判为环境异常
-                msg = "fixture 启动可用性检查未通过：清理冷启动后首屏无可见元素，请检查应用是否可正常启动"
-                logger.warning("[preflight] fixture clean-check: empty screen")
-                self._emit("error", {"message": msg})
-                return self._preflight_fail(_tid, msg, "fixture_not_clean")
-        except Exception as exc:
-            msg = f"fixture 已空预检异常: {exc}"
-            logger.warning("[preflight] fixture clean-check exception: %s", exc)
-            self._emit("error", {"message": msg})
-            return self._preflight_fail(_tid, msg, "fixture_not_clean")
-
-        logger.info("[preflight] fixture OK pkg=%s", _pkg)
-        return None
-
     @staticmethod
     def _preflight_fail(
         thread_id: str, msg: str, code: str
     ) -> dict[str, Any]:
-        """方案 1 / 想法 #1 共用：统一快速失败返回结构。"""
+        """方案 1 共用：统一快速失败返回结构。"""
         return {
             "thread_id": thread_id or "",
             "status": code,
@@ -436,13 +368,6 @@ class TestOrchestrator:
         _health = self._preflight_device_health(ctx)
         if _health is not None:
             return _health
-
-        # ── 想法 #1（Plan §10）：fixture 前置（编排层）──
-        # clear_app_data + 冷启动 + 已空预检 的原语已就绪；此处按 cfg.run_fixture_precheck
-        # 触发编排。默认关闭以兼容既有 run；开启后消除脏数据/残留页面栈导致的"前提重演"。
-        _fixture = self._preflight_fixture(ctx, app_package, app_name)
-        if _fixture is not None:
-            return _fixture
 
         if not thread_id:
             thread_id = f"test-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
