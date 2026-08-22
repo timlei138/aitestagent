@@ -553,17 +553,42 @@ def click(
                 "targets 与 repeat 互斥：targets=多个不同目标各点一次，"
                 "repeat=同一元素连点 N 次，不能同时使用",
             )
-        _summaries = []
-        for _t in _targets:
-            # 注意：click 是 @tool 装饰的 StructuredTool，不可直接调用，
-            # 须走 .invoke(...)（或 .func(...)）才能触发底层函数并拿到字符串结果。
-            _r = click.invoke(
-                {"label": _t, "permission_hint": permission_hint}
-            )
-            _summaries.append(f"{_t}: {_r}")
-            if stop_on_first_failure and parse_status(_r) in (NOT_FOUND, ERROR):
-                break
-        return "BATCH_OK: " + " | ".join(_summaries)
+        # ── P0-a 合并感知（time_optimization_plan §4.1）──
+        # 整个批处理只在入口 perceive 一次，子 click 通过 ctx._batch_understanding
+        # 复用这份缓存 understanding，不再逐个 re-perceive；结尾由本入口统一做一次
+        # 快照（_post_click_snapshot 在批处理模式下被跳过）。
+        # 这是「代码给事实地基、LLM 做判断」的体现：感知稳定性由代码保证一次，
+        # 每个目标的命中/未命中摘要仍由单目标逻辑完整回传，不替 LLM 做语义判断。
+        _batch_understanding = None
+        if ctx.perceiver is not None:
+            try:
+                _batch_understanding = ctx.perceiver.perceive()
+            except Exception as exc:
+                logger.warning("click targets: perceive failed | %s", exc)
+        ctx._batch_understanding = _batch_understanding
+        ctx._batch_mode = True
+        _pre_title = _capture_page_id(ctx)  # 复用缓存，不额外感知
+        try:
+            _summaries = []
+            for _t in _targets:
+                # 注意：click 是 @tool 装饰的 StructuredTool，不可直接调用，
+                # 须走 .invoke(...) 才能触发底层函数并拿到字符串结果；
+                # 子调用不带 targets，且复用 _batch_understanding，不再各自 perceive。
+                _r = click.invoke(
+                    {"label": _t, "permission_hint": permission_hint}
+                )
+                _summaries.append(f"{_t}: {_r}")
+                if stop_on_first_failure and parse_status(_r) in (NOT_FOUND, ERROR):
+                    break
+            _result = "BATCH_OK: " + " | ".join(_summaries)
+        finally:
+            ctx._batch_mode = False
+            ctx._batch_understanding = None
+        # 结尾统一一次快照（内部含一次 perceive，仅此一次在批处理尾）
+        _snap = _post_click_snapshot(ctx, _pre_title, f"targets({len(_targets)})")
+        if _snap:
+            _result += "\n" + _snap
+        return _result
     # 测试场景中所有操作均可执行（数据为临时测试数据）
     if ctx.device is None:
         return "ERROR: 未连接 Android 设备"
@@ -609,7 +634,10 @@ def click(
     # 语义搜索/精确搜索 → 最佳元素（内部已查询经验库，复用 known_ids）
     best_el, known_ids, matched_label = None, [], label
     ranked_candidates: list[tuple[int, int, Any]] = []
-    if ctx.perceiver is not None:
+    if getattr(ctx, "_batch_understanding", None) is not None:
+        # P0-a 快路径：复用 targets 入口的缓存 understanding，跳过感知
+        understanding = ctx._batch_understanding
+    elif ctx.perceiver is not None:
         try:
             understanding = ctx.perceiver.perceive()
             # 更新 _pre_title 为更精确的页面标识
@@ -1206,6 +1234,12 @@ _VOLATILE_LABEL_PATTERNS = [
 def _capture_page_id(ctx: Any) -> str:
     """捕获当前页面身份标识（activity + 页面标题 + 稳定可见元素签名）。
     过滤挥发性 label（时间、电量等），避免假页面变化干扰回退判定。"""
+    # P0-a 快路径：批处理入口已 perceive 一次，这里直接复用缓存标题，不额外感知
+    _cached = getattr(ctx, "_batch_understanding", None)
+    if _cached is not None:
+        _act = (_cached.activity or "").split(".")[-1]
+        _title = getattr(_cached, "page_title", "") or ""
+        return _act + "「" + _title + "」" if _title else _act
     try:
         app = ctx.device.current_app()
         act = (app.get("activity", "") or "").split(".")[-1]
@@ -1240,6 +1274,10 @@ def _capture_page_id(ctx: Any) -> str:
 
 def _post_click_snapshot(ctx: Any, pre_title: str, label: str) -> str:
     """点击后快速感知页面变化，返回简洁状态变化描述。"""
+    # P0-a 快路径：批处理模式下由 targets 入口统一做一次快照，这里跳过，
+    # 避免每个子目标各感知一次（那是原 seq62/68 耗时 53–58s 的根因）。
+    if getattr(ctx, "_batch_mode", False):
+        return ""
     if ctx.perceiver is None:
         return ""
     try:

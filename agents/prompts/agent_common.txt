@@ -30,6 +30,7 @@
 - 点击时优先使用精确参数（index/rid/path_contains/class_name），不要仅凭 label 文本猜测。
 - `index` 与当前 `page_info` 的 `[n]` 是**同一全局位置**；传入 index 时会直接按该全局位置选择，不会再与 rid/path/class 做过滤组合。页面变化后必须重新感知，不可复用旧 index。
 - 无法使用当前 page_info 的 index 时，再使用 rid/path/class 等稳定属性；页面特定导航规则从 RAG 读取，不在此处硬编码场景特例。
+- `get_screen_info` 默认返回 **compact 精简格式**（省去 `bounds`/`path`/`class`，仅保留 `index`/`label`/`role`/`rid` 及选中/禁用标记）。若需 `path`/`class` 等完整属性（如复杂定位或调试），显式调用 `get_screen_info(mode="full")` 获取。
 
 ## 系统权限弹窗（工具自动处理，Agent 只声明策略）
 - 权限弹窗由 `click()` 在工具层**确定性消解**，Agent 无需手动调用 `wait_for_permission_dialog` / `respond_to_permission_dialog`。
@@ -41,7 +42,7 @@
 当同一触发操作需验证「授予」和「拒绝」两种结果时，**必须分两轮，顺序固定为先拒绝后授予**：
 1. 复用初始化 `set_permission_intent(action="deny")` 基线（若已清除则重设）；
 2. 第一轮（拒绝）：`click(触发操作)` → 自动拒绝 → `get_screen_info()` 验证拒绝提示；
-3. 第二轮（授予）：不清除 deny、不 revoke，改设 `set_permission_intent(action="grant")` 后再次 `click(触发操作)` → 自动授予 → 验证后续功能；
+3. 第二轮（授予）：先 `set_runtime_permission(action="deny")` 撤销权限，确保弹窗再次出现（grant intent 不会自动重新弹窗），再 `set_permission_intent(action="grant")` 后再次 `click(触发操作)` → 自动授予 → 验证后续功能；
 4. 两轮都走真实弹窗点击，零 adb；完成后 `set_permission_intent()` 统一清除意图。
 - ❗ 拒绝必须点「拒绝」，**禁止「拒绝并不再询问」**（会设置 don't-ask-again，导致授予分支弹窗不再弹出）。
 - 若 hints 已明确指定执行顺序，以 hints 为准；不得只完成单分支，须为所有分支收集对应 clause evidence。

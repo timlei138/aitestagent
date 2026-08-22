@@ -156,12 +156,15 @@ except Exception:
 
 
 @tool
-def get_screen_info(mode: str = "full", offset: int = 0, limit: int = 50) -> str:
+def get_screen_info(mode: str = "compact", offset: int = 0, limit: int = 50) -> str:
     """获取当前页面的结构化语义信息。
 
-    mode 参数：
-    - "full"（默认）: 返回主要路径和元素概览，适合规划和分析。
+    mode 参数（默认 compact）：
+    - "compact"（默认）: 返回主要路径和元素概览，保留 index/label/role 与
+      [SELECTED]/[DISABLED]/[CLICKABLE] 状态标记，省去 bounds/path/class 等
+      LLM 不消费的噪声字段，token 占用最小。适合绝大多数规划与决策场景。
     - "clickable": 分页返回可点击元素及其全局 [n]；可用 offset/limit 查看后续项。
+    - "full": 完整字段（含 bounds/path/class），仅当确实需要坐标/路径时使用。
     """
     ctx = get_tool_context()
     if ctx.perceiver is None:
@@ -210,7 +213,21 @@ def get_screen_info(mode: str = "full", offset: int = 0, limit: int = 50) -> str
                 f"...（还有 {len(display_items) - end} 项；"
                 f"使用 get_screen_info(mode='clickable', offset={end}) 查看后续全局 [n]）"
             )
-    else:
+    elif mode == "compact":
+        # P0-b 默认紧凑：保留 index/label/role 与状态标记（LLM 决策所需），
+        # 省去 bounds/path/class/assoc（最大 token 噪声且 LLM 从不消费坐标）。
+        # rid 可选保留（click(rid=...) 契约使用）。
+        lines.append(f"primary_paths={len(understanding.primary_paths)}")
+        for item in understanding.primary_paths[:40]:
+            lines.append(
+                _format_element_line_compact(item, clickable_index_map.get(id(item)))
+            )
+        lines.append(f"all_elements={len(understanding.elements)}")
+        for item in understanding.elements[:60]:
+            lines.append(
+                _format_element_line_compact(item, clickable_index_map.get(id(item)))
+            )
+    else:  # mode == "full"（显式，含 bounds/path/class，向后兼容）
         # 全量概览：导航项 + 所有元素。大型页面请改用 clickable 分页查看 index。
         lines.append(f"primary_paths={len(understanding.primary_paths)}")
         for item in understanding.primary_paths[:40]:
@@ -220,6 +237,31 @@ def get_screen_info(mode: str = "full", offset: int = 0, limit: int = 50) -> str
             lines.append(_format_element_line(item, clickable_index_map.get(id(item))))
 
     return "\n".join(lines)
+
+
+def _format_element_line_compact(item: Any, clickable_index: int | None = None) -> str:
+    """P0-b 紧凑版元素行：保留 LLM 决策所需事实，省去坐标/路径噪声。
+
+    与 _format_element_line 的区别：去掉 bounds/path/class/assoc（LLM 从不消费
+    坐标，且 path/class 已在 click 证据块重复）。rid 可选保留（click(rid=) 契约）。
+    """
+    rid = item.resource_id or ""
+    has_switch = getattr(item, "has_switch_child", False)
+    checked = item.checked
+    _enabled = getattr(item, "enabled", True)
+    if getattr(item, "clickable", False):
+        mark = " [DISABLED]" if not _enabled else " [CLICKABLE]"
+    else:
+        mark = ""
+    if getattr(item, "selected", False):
+        mark += " [SELECTED]"
+    extra = f" rid={rid}" if rid else ""
+    if has_switch:
+        state = "on" if checked is True else ("off" if checked is False else "?")
+        extra += f" switch_state={state}"
+    idx_prefix = f"[{clickable_index}] " if clickable_index is not None else ""
+    label = (getattr(item, "label", "") or "").strip() or "<无文本>"
+    return f'- {idx_prefix}[{item.region}/{item.role}] "{label}"{extra}{mark}'
 
 
 def _append_panel_summary(

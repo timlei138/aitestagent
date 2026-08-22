@@ -6,41 +6,13 @@
 get_screen_info → click("目标元素") 或 long_press("目标元素") → 查看返回值
 → 如果 verification 条件已满足 → 调用对应验证工具产生 clause evidence，等待 evaluator 自动结束
 → 否则继续下一步
-
-## 验证证据必须带精确的 clause 身份（关键，否则证据错配导致「未验证」）
-每次调用 assert_* 验证工具，都必须把系统注入给你的「verification_key::clause_id」**原样**填进该工具的 verification_key / clause_id 参数，并且使用标注的 channel 对应的工具：
-- 系统会在每轮注入【已通过验证】与【待验证清单】，每条都形如 `[v1::v1.0 | channels:ui_text] 课程表名称为必填项`。
-- 验证 v1.0 这条时，必须调用 `assert_page_contains(..., verification_key="v1", clause_id="v1.0")`；
-  验证开关/切换类 clause（标注 channel 为 behavior_effect）时，必须调用
-  `assert_behavior_effect(expected="toggled(周末有课,on)", verification_key="v2", clause_id="v2.0")`
-  ——**同样要带 verification_key/clause_id**，否则这条开关类 clause 收不到证据会被判 unknown。
-  验证 v2.1 时必须用 `clause_id="v2.1"`，以此类推。**严禁把所有 assert 都打同一个 clause_id（如全打 v0.0）**——
-  那样证据会全部错配到 v0，其余 clause 因收不到对应身份的证据而被判 unknown（即前端「未验证」），
-  即使你看到 assert 返回 PASS 也没用。每条 clause 用各自真实的 clause_id。
-
-## 同一增量控件需连点多次时，用 repeat 一次性完成（禁止发 N 次相同 click）
-测试步骤常要求对**同一个增量控件**（加号/减号/步进器/“+1”/“最多添加 N 节”等）连点多次，
-例如“最多添加10节”= 连点 + 号 10 次。这种**是正常的重复操作，不是死循环**。
-- ✅ 正确：一次性 `click(label="加号", repeat=10)`（或 `vision_tap(..., repeat=10)`）。
-  先读当前值，N = 目标值 − 当前值（如当前 5、目标 10 → repeat=5）。
-- ❌ 错误：连发 10 次 `click(label="加号")` —— 这会让循环断路器（LOOP_DETECTED）
-  判定“连续点击同一目标”并**直接 abort 本轮**，导致任务失败。
-- repeat 对 switch/checkbox 切换控件无意义（连点会来回切），不要给这类控件传 repeat。
-- **连点节奏（读一次 → repeat 一次 → 验一次）**：进入该页面后先用 `get_screen_info` 读一次当前值，
-  然后**一次性** `repeat=N` 完成连点，连点结束后**只做一次**验证（如 `assert_page_contains` / `vision_check`
-  确认节数已变）。**严禁在每次连点之间穿插视觉检查**——节数按钮位置固定、连点只改数值不改坐标，
-  `repeat=N` 内部连续命中即可；中间插 visual_check 既无必要（UI 树已能满足），又会膨胀步骤数。
-  例：“默认 4 节、最多 10 节”——读当前=4 → `repeat=6` → 验一次=10；减到 0 同理：读当前 → `repeat=当前值` → 验一次=0。
 ```
 
-## 多选组 / 列表「全选」优先用一次 targets 批量完成（不要逐个 click）
-Android 里「多选 chip / 标签 / 周数 / 星期 / 单双周 / 复选列表项」等同构连续控件很常见：组内每项是独立、彼此无依赖的点击目标，点选后无需中间感知即可继续点下一项。
+## 验证证据必须带精确的 clause 身份
+（规则见 agent_common「验证报告与人工复核边界」节：assert_* 必须原样带 `verification_key::clause_id`，严禁全打同一 clause_id。此处不再重复。）
 
-- ✅ **优先尝试一次批量**：需要选多个项（如全选周数 1~6、取消 1/3/5）时，用 `click(targets=["1","2","3",...])` 一次性下发，工具顺序点击每个并聚合返回，只占 1 个工具调用（省掉 N−1 次感知开销与 step 预算）。**不要为每个项各发一次 click，也不要在两次点击之间插 get_screen_info**（工具内部已逐项目感知）。
-- ✅ **利用 toggle 实现「全不选」**：这类控件多为 toggle——再次点击已选项会取消选中。若需清空选择，优先用 `click(targets=[已选中的各项])` 把它们一次性取消，而不是先逐个取消再逐个重选。
-- ⚠️ 先判断「全选」还是「反选 / 部分取消」再下发，避免误 toggled 掉本应保留的项。
-- ❌ 与 repeat 互斥：repeat 只用于「同一增量控件连点」（加号/减号），多选组必须用 targets（不同元素各点一次）。
-- 判据：页面出现多个文案相近、role 相同的可选标签（如 week chip 组的 1~6），就合并成一次 targets 调用，而不是逐个 click。
+## 同一增量控件连点 / 多选组批量
+（规则见 agent_common：「同一增量控件需连点多次」用 `repeat=N` 一次性完成、「多选组全选」用 `click(targets=[...])` 批量下发。此处不再重复，按 common 节执行。）
 
 ## 错误流程（禁止）
 ```

@@ -62,10 +62,12 @@ _SCREENSHOT_ACTIONS = {
     "long_press",
     "scroll_find_and_click",
     "launch_app",
-    "assert_page_contains",
-    "assert_element_exists",
     "swipe",
 }
+# P1 截图去重：assert_page_contains / assert_element_exists 已在内部经
+# _save_evidence_screenshot 显式落 evidence 图，若再放入 _SCREENSHOT_ACTIONS
+# 会额外产生一份 step 截图造成"双截图"冗余（同页连续 assert 连拍时尤甚）。
+# 故从集合移除，让 assert 仅保留 evidence 单截图。
 
 
 def _take_step_screenshot(ctx, run_id: str, tool_seq: int) -> str:

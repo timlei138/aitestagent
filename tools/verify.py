@@ -42,10 +42,13 @@ def _simple_activity_match(expected: str, ual: str) -> bool:
     return exp_simple == act_simple
 
 
-def _save_evidence_screenshot(ctx, verification_key: str, seq: int) -> None:
-    """验证证据点显式截图：保存到 screenshots/{run_id}/evidence_{key}_{seq}.png
+def _save_evidence_screenshot(ctx, verification_key: str) -> None:
+    """验证证据点显式截图：保存到 screenshots/{run_id}/evidence_{key}.png
     并写回 ctx._last_screenshot_path，便于 artifact_ref 引用。
 
+    P1 截图去重：文件名按 verification_key 去重（去掉 seq 后缀、同 key 覆盖），
+    对齐 _save_perceive_evidence_screenshot 的 evidence_{key}_vision.png 命名。
+    语义：同一验证条件只保留一张证据图（同页连续 assert 连拍不再重复落盘）。
     perceiver 已不再自动落盘，因此所有验证证据截图必须由本函数显式产生。
     """
     try:
@@ -54,22 +57,12 @@ def _save_evidence_screenshot(ctx, verification_key: str, seq: int) -> None:
         run_id = getattr(ctx, "_run_tag", "") or "unknown"
         shot_dir = app_paths.SCREENSHOT_DIR / str(run_id)
         shot_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"evidence_{verification_key or 'v'}_{seq}.png"
+        filename = f"evidence_{verification_key or 'v'}.png"
         path = str(shot_dir / filename)
         ctx.device.screenshot().save(path)
         ctx._last_screenshot_path = path
     except Exception as exc:  # 截图失败不应中断验证流程
         logger.warning("evidence screenshot failed: %s", exc)
-
-
-_evidence_seq = 0
-
-
-def verification_seq() -> int:
-    """递增生成验证证据截图序号，避免同 run 内文件名冲突。"""
-    global _evidence_seq
-    _evidence_seq += 1
-    return _evidence_seq
 
 
 def _legal_clause_refs(ctx) -> tuple[set[str], set[str], dict[str, set[str]]]:
@@ -203,7 +196,7 @@ def assert_page_contains(
     _hint = ""
     if verification_key and clause_id:
         _save_evidence_screenshot(
-            get_tool_context(), verification_key, verification_seq()
+            get_tool_context(), verification_key
         )
         _hint = _record_deterministic_check(
             text,
@@ -303,7 +296,7 @@ def assert_element_exists(
     understanding = ctx.perceiver.perceive()
     matched = any(label in (element.label or "") for element in understanding.elements)
     if verification_key and clause_id and valid:
-        _save_evidence_screenshot(ctx, verification_key, verification_seq())
+        _save_evidence_screenshot(ctx, verification_key)
     for element in understanding.elements:
         if label in (element.label or ""):
             _record_deterministic_check(
@@ -354,7 +347,7 @@ def assert_page_state(
         if not valid:
             logger.warning("assert_page_state skip orphan clause ref: %s", hint)
             return ("PASS" if passed else f"FAIL: page state {fact}") + " | 归因被拒：" + hint
-        _save_evidence_screenshot(ctx, verification_key, verification_seq())
+        _save_evidence_screenshot(ctx, verification_key)
         ctx._evidence_events.append(
             {
                 "verification_key": verification_key,
@@ -734,7 +727,7 @@ def assert_behavior_effect(
         if not valid:
             logger.warning("assert_behavior_effect skip orphan clause ref: %s", hint)
             return ("PASS" if passed else f"FAIL: behavior effect not observed: {expected}") + " | 归因被拒：" + hint
-        _save_evidence_screenshot(ctx, verification_key, verification_seq())
+        _save_evidence_screenshot(ctx, verification_key)
         ctx._evidence_events.append(
             {
                 "verification_key": verification_key,
