@@ -699,6 +699,8 @@ def _match_spec(
     target = str(spec.get("target", "") or "")
     expected = spec.get("expected")
     activity = _activity_short(str((current_app or {}).get("activity", "") or ""))
+    # label 兜底链含 associated_label（兄弟 TextView 文本）——只拼 text/desc 会漏掉
+    # 字段标签类元素（2026-08-24 run103147 实证），与手动 verify 的匹配口径保持一致。
     page_text = " ".join(
         [
             str(getattr(u, "page_title", "") or ""),
@@ -708,6 +710,8 @@ def _match_spec(
                 + str(getattr(e, "content_desc", "") or "")
                 + " "
                 + str(getattr(e, "resource_id", "") or "")
+                + " "
+                + str(getattr(e, "label", "") or "")
                 for e in getattr(u, "elements", []) or []
             ],
         ]
@@ -886,7 +890,10 @@ def auto_record_evidence(
     （留给 LLM 手动 verify）。保守原则：_match_spec 返回 None 不写；已存在相同
     非权威证据去重；authoritative FAIL 例外（总写入，触发 fail-fast）。
     """
-    if not isinstance(contract, dict) or not hasattr(ctx, "_evidence_events"):
+    if not isinstance(contract, dict):
+        # 注意不要用 `not hasattr(ctx, "_evidence_events")` 早退：该属性由首个手动
+        # verify 才创建，早退会使之前所有 perceive 的自动匹配静默空转（2026-08-24
+        # run103147 实证）。缺属性时由下方惰性初始化补上。
         return 0
     written = 0
     # 注意：不能用 `getattr(ctx, "_evidence_events", []) or []` —— 当属性本身是

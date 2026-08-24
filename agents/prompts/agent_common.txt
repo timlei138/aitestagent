@@ -99,6 +99,7 @@
 - **业务弹窗（确认/取消/允许等对话框）用 `detect_popup()`**：基于 UI 树，不依赖 vision，任何配置下都可用，内置重试。
 - **浮层/遮挡判断用 `detect_overlay()`**：仅在 vision 可用时有效；若返回 `available: false` 或 reason 含“vision disabled”，不要将其当作“无弹窗”结论。
 - **视觉语义判断用 `visual_check("描述")`**：判断颜色、布局、Toast、图标状态等。
+- **断言描述禁止自造渲染细节**：`visual_check` / `vision_tap(verify=...)` 的描述只写「用例声明的意图 + 状态语义」（如「目标色块出现选中标记」「背景色发生变化」）。用例原文没有明确写的样式——具体颜色名、描边/外框样式、字体等——一律不得自行补进断言：你无法预知 app 的真实渲染（选中标记可能是蓝色边框也可能是深色外圈），预言具体样式会被 VLM 按字面对照否决（高置信 NO = 权威 FAIL，会直接中止整条 run）。仅当用例原文明确描述了样式（如「字体红色」「背景为红色」），才把该样式原样写入断言。
 - **渠道选择原则（引导优先 view tree，不滥用 vision）**：UI 树（`get_screen_info` / `assert_page_contains` / `assert_element_exists` / `assert_behavior_effect`）能确定回答的问题，**优先用 UI tree**，不要在每一步都调用视觉工具。只有当问题本质属于观感/像素级（颜色、图标形态、Toast 飘字、自绘 canvas 内容）且 UI 树无法证实时，才用 `visual_check` / `vision_tap`。对"数量是否变了/某文字是否出现/控件是否可点"这类可字面判定的问题，反复 `visual_check` 既慢又易漂移——一次 UI 树断言即可。**视觉工具是补充通道，不是默认通道。**
 - 如果连续两次视觉工具返回 unknown/不可用，回退 UI tree 路径继续执行，必要时 ABORT
 

@@ -4,15 +4,15 @@
 只输出一个 JSON 对象，不要 markdown、代码块、解释文字。
 
 ## 输出格式
-{"goal":"一句话测试目标","app_package":"com.example","app_name":"App","target_pages":["需到达的页面"],"verification":["验证条件"],"hints":["导航提示"],"parameter_slots":[],"action_semantics":["动作语义"]}
+{"goal":"一句话测试目标","app_package":"com.example","app_name":"App","target_pages":["需到达的页面"],"verification":["纯字符串验证条件",{"claim":"验证条件","spec":{"predicate":"page_is","target":"页面Activity短名","expected":null}}],"hints":["导航提示"],"parameter_slots":[],"action_semantics":["动作语义"]}
 
 ## 字段说明
 - goal: 测试目标（如 "验证设置中切换时区后日期格式正确变化"）
 - target_pages: 关键页面（如 ["通用设置页","日期和时间设置页","时区选择页"]）
 - verification: 验证条件（如 ["美国时区下日期为月/日/年格式","英国时区下日期为日/月/年格式"]）
-- verification 项的 spec（可选，结构化期望）：若某验证项描述「终态/可见状态」且能用下方谓词判定，把它写成对象并加 `spec`：
+- verification 项的 spec（结构化期望）：描述「终态/可见状态」的验证项**默认都要写 spec**——spec 是该验证点获得确定性自动证据的唯一途径；不写 spec 只能靠 LLM 手动 verify（慢、贵、易漏判）。能用下方谓词判定的，把它写成对象并加 `spec`：
   `{"claim":"课程表页面成功打开","spec":{"predicate":"page_is","target":"TimetableActivity","expected":null}}`
-  映射不了（依赖自绘/渲染内容）则保持纯字符串（spec:null，走手动 verify）。
+  仅当验证点依赖自绘/渲染内容、确实无法用谓词表达时才退回纯字符串（spec:null，走手动 verify）。
   **谓词词汇表（写结构化 spec 时用）**：
   - `page_is(target)`：当前 activity 匹配 target（target 用 activity 短名，如 TimetableActivity）
   - `page_contains(text)`：页面文本/元素文本含 text
@@ -25,7 +25,7 @@
   **expected 字段如何填**：只有 `element_checked` 和 `list_count` 需要非 null 的 expected，其余谓词 expected 一律填 null。
   - `element_checked`：expected 填 true/false。例：`{"predicate":"element_checked","target":"免打扰开关","expected":true}`
   - `list_count`：expected 填数字。例：`{"predicate":"list_count","target":"课程节","expected":4}`
-  **规则**：target 尽量用稳定的 resource-id 叶子名或元素文本；activity 用短名。`element_*` 的 target 拿不准就别写 spec（避免误判），保持字符串走手动。
+  **规则**：target 必须照抄界面真实可见文本或 resource-id 叶子名，不得同义改写（控件叫「全选」就不要写「全部」）；activity 用短名。`element_absent` 仅限以弹窗独有标题/rid 为靶（证弹窗已关闭），不得拿泛化词做间接推断。toast 等瞬时提示不进 UI Tree，不要为其写 spec。仅当验证点依赖自绘/渲染内容、确实无法用谓词表达时才退回纯字符串，不得因省事跳过 spec。谓词必须严格取自上方词汇表，不臆造谓词名。
 - hints: 给 Agent 的导航提示，写清楚页面层级关系和常见坑：
   * "左侧导航可能需要向下滚动才能找到通用设置"
   * "日期和时间在通用设置的右侧列表里"

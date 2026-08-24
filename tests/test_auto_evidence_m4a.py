@@ -112,6 +112,14 @@ def test_match_unknown_predicate_returns_none():
     assert _match_spec({"predicate": "click_then_change", "target": "x"}, _make_u(), {}) is None
 
 
+def test_match_page_contains_covers_associated_label():
+    # 可见文本只在 label（associated_label 兜底链）上、text/desc 为空时，
+    # page_contains 也要能命中——锁定 2026-08-24 run103147 漏配修复。
+    u = _make_u(elements=[_make_element(label="课程名称", text="", desc="")])
+    r = _match_spec({"predicate": "page_contains", "target": "课程名称"}, u, {})
+    assert r and r["status"] == "PASS"
+
+
 # ── M3: auto_record_evidence ────────────────────────────────────────────
 
 def _contract_with_spec(predicate, target=None, expected=None):
@@ -172,6 +180,22 @@ def test_auto_record_authoritative_fail_not_deduped():
     n2 = auto_record_evidence(ctx, c, u, {})  # 第二次仍应写入（触发 fail-fast）
     assert n1 == 1 and n2 == 1
     assert all(e["authoritative"] for e in ctx._evidence_events)
+
+
+def test_auto_record_initializes_events_when_attr_missing():
+    """ctx 尚无 _evidence_events 属性时不得静默跳过——首个 perceive 即应落证据。
+
+    锁定 2026-08-24 初始化门 bug：该属性由首个手动 verify 才创建，此前若用
+    hasattr 早退，之前所有 perceive 的自动匹配全部空转。
+    """
+    ctx = SimpleNamespace()  # 故意不带 _evidence_events
+    u = _make_u(activity="com.xxx.TimetableActivity")
+    n = auto_record_evidence(
+        ctx, _contract_with_spec("page_is", "TimetableActivity"), u,
+        {"activity": "com.xxx.TimetableActivity"},
+    )
+    assert n == 1
+    assert ctx._evidence_events[0]["status"] == "PASS"
 
 
 # ── M1: build_verification_contract 保留 spec ───────────────────────────
