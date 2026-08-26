@@ -5,13 +5,21 @@
 
 from __future__ import annotations
 
+import difflib
+import logging
 import re
 from typing import Any
 
 from agents.budget import _calc_budget_from_state
 from agents.loop_control import _detect_termination
 
-_CLAUSE_BOUNDARY = re.compile(r"[，,；;]+|(?:并且|同时|以及|且)")
+logger = logging.getLogger(__name__)
+
+# F3（agent_evolution_plan §5）：去掉 ASCII `,` 边界——枚举逗号不拆
+# （「周一,周三,周五」是一个判定点，不是三个）；中文全角分隔符仍拆。
+# 该机械切分已降级为仅处理旧字符串项的 fallback；新格式由 planner 在
+# 规划期以 {"claim", "clauses":[...]} 对象显式给出语义合并结果。
+_CLAUSE_BOUNDARY = re.compile(r"[，；;]+|(?:并且|同时|以及|且)")
 
 # M1-4: 删除关键词通道推断（discrepancy_detection_core_plan Phase 0）。
 # 原 _default_channels_for_claim 依据 claim 关键词（"状态"/"提示"/"显示"...）猜测
@@ -31,7 +39,11 @@ _ALL_CHANNELS_FALLBACK = (
 
 
 def _split_claims(statement: str) -> list[str]:
-    """Split only explicit conjunction boundaries; review can refine remaining ambiguity."""
+    """Split only explicit conjunction boundaries; review can refine remaining ambiguity.
+
+    F3 后仅作旧字符串项的机械兜底：planner 已升级为在规划期以嵌套对象
+    （{"claim", "clauses":[...]}）显式给出语义合并后的 clause，不再依赖此处切分。
+    """
     return [
         part.strip(" ，,；;")
         for part in _CLAUSE_BOUNDARY.split(str(statement or ""))
@@ -152,6 +164,71 @@ def evaluate_verification(
     }
 
 
+def _parse_explicit_clauses(raw_clauses: Any) -> list[dict] | None:
+    """F3：解析 planner 显式给出的语义 clause 列表（agent_evolution_plan §5）。
+
+    每项为 {"claim":..., "spec":{...}|null}；容忍纯字符串项（spec=null）。
+    无有效 clause 时返回 None，调用方回退 _split_claims 机械兜底。
+    """
+    if not isinstance(raw_clauses, list):
+        return None
+    clauses: list[dict] = []
+    for entry in raw_clauses:
+        if isinstance(entry, dict):
+            claim = str(entry.get("claim", "") or "").strip()
+            if not claim:
+                continue
+            spec = entry.get("spec")
+            clauses.append(
+                {"claim": claim, "spec": spec if isinstance(spec, dict) else None}
+            )
+        else:
+            claim = str(entry or "").strip()
+            if claim:
+                clauses.append({"claim": claim, "spec": None})
+    return clauses or None
+
+
+def _explicit_clause_spans(item: str, claims: list[str]) -> list[list[int]]:
+    """F3：planner 语义 clause 的 goal_source_span。
+
+    全部逐字子串（按序可定位）→ 用实际位置；任一条被 planner 改写措辞
+    （非逐字子串）→ 整组按声明长度占比顺序占位。占位保证无重叠、完整覆盖
+    statement——span 此时是近似溯源而非精确对位（与既有 find 失败时
+    cursor 兜底的口径一致），validate_contract_spans 不产生 gap/overlap 误报。
+    """
+    n = len(item)
+    found: list[list[int]] = []
+    cursor = 0
+    all_literal = bool(claims)
+    for claim in claims:
+        offset = item.find(claim, cursor)
+        if offset < 0:
+            all_literal = False
+            break
+        found.append([offset, offset + len(claim)])
+        cursor = offset + len(claim)
+    if all_literal:
+        return found
+
+    weights = [max(1, len(claim)) for claim in claims]
+    total_w = sum(weights)
+    spans: list[list[int]] = []
+    pos = 0
+    for i, weight in enumerate(weights):
+        start = pos
+        if i == len(weights) - 1:
+            end = n
+        else:
+            ideal = pos + max(1, round(n * weight / total_w))
+            # 每条后续 clause 至少留 1 字符，避免末条零宽/倒退
+            upper = n - (len(weights) - 1 - i)
+            end = min(max(ideal, start + 1), max(upper, start + 1))
+        spans.append([start, end])
+        pos = end
+    return spans
+
+
 def build_verification_contract(
     goal: dict[str, Any], user_request: str = ""
 ) -> dict[str, Any]:
@@ -164,44 +241,74 @@ def build_verification_contract(
     and overlap detection can be performed deterministically.
     """
     request = str(user_request or "")
-    # M4a (M1): verification 项支持对象形式 {"claim":..., "spec":{...}} 或
-    # 旧字符串形式。spec 描述 clause 的结构化期望，由自动匹配器(auto_record_evidence)
+    # M4a (M1): verification 项支持对象形式 {"claim":..., "spec":{...}}、
+    # F3 嵌套对象形式 {"claim":..., "clauses":[...]} 或旧字符串形式。
+    # spec 描述 clause 的结构化期望，由自动匹配器(auto_record_evidence)
     # 在 perceive 后落成证据；spec:null 的 clause 回退 M1 手动 verify。
     raw_items = goal.get("verification", []) if isinstance(goal, dict) else []
-    parsed_items: list[tuple[str, dict | None]] = []
+    parsed_items: list[tuple[str, dict | None, list[dict] | None]] = []
     for raw in raw_items:
         if isinstance(raw, dict):
             parsed_items.append(
-                (str(raw.get("claim", "") or "").strip(), raw.get("spec"))
+                (
+                    str(raw.get("claim", "") or "").strip(),
+                    raw.get("spec"),
+                    _parse_explicit_clauses(raw.get("clauses")),
+                )
             )
         else:
-            parsed_items.append((str(raw or "").strip(), None))
+            parsed_items.append((str(raw or "").strip(), None, None))
 
     verifications = []
-    for index, (item, item_spec) in enumerate(parsed_items):
+    for index, (item, item_spec, explicit_clauses) in enumerate(parsed_items):
         if not item:
             continue
         key = f"v{index}"
-        claims = _split_claims(item)
-        cursor = 0
+        # F3：planner 显式给出语义 clause 时直接采用（规划期完成语义合并，
+        # 对应「人类一个操作顺带验多个点」）；仅旧字符串项走 _split_claims 机械兜底。
+        prepared: list[tuple[str, dict | None, list[int]]] = []
+        if explicit_clauses:
+            claims = [
+                (
+                    c["claim"],
+                    c["spec"] if c["spec"] is not None else (item_spec if j == 0 else None),
+                )
+                for j, c in enumerate(explicit_clauses)
+            ]
+            spans = _explicit_clause_spans(item, [claim for claim, _ in claims])
+            prepared = [
+                (claim, spec, span) for (claim, spec), span in zip(claims, spans)
+            ]
+        else:
+            cursor = 0
+            for clause_index, claim in enumerate(_split_claims(item)):
+                claim_offset = item.find(claim, cursor)
+                if claim_offset < 0:
+                    claim_offset = cursor
+                end = claim_offset + len(claim)
+                cursor = end
+                # spec 只挂首条 clause（代表整条 verification 的终态期望），
+                # 其余子 clause 保持 spec=None 走手动。
+                spec = item_spec if clause_index == 0 else None
+                prepared.append((claim, spec, [claim_offset, end]))
         clauses = []
-        for clause_index, claim in enumerate(claims):
-            claim_offset = item.find(claim, cursor)
-            if claim_offset < 0:
-                claim_offset = cursor
-            cursor = claim_offset + len(claim)
-            # spec 只挂首条 clause（代表整条 verification 的终态期望），
-            # 其余子 clause 保持 spec=None 走手动。
-            spec = item_spec if clause_index == 0 else None
+        for clause_index, (claim, spec, span) in enumerate(prepared):
             clauses.append(
                 {
                     "id": f"{key}.{clause_index}",
                     "claim": claim,
                     "spec": spec,
-                    "goal_source_span": [claim_offset, cursor],
-                    # M1-4: 删关键词推断（Plan Phase 0）。M1 阶段 spec:null 回退全通道
-                    # （含 behavior_effect），与 §6 要点4 一致；M4 后由 spec 谓词决定。
-                    "channels": list(_ALL_CHANNELS_FALLBACK),
+                    "goal_source_span": span,
+                    # M1-4: 删关键词推断（Plan Phase 0）。spec:null 保持全通道回退。
+                    # F1 已开闸（agent_evolution_plan §3）：带 spec 的 clause 只认
+                    # 其确定性证据通道（写读同源 _spec_channel）——UI 树可判定的事实
+                    # 不再被 vision PASS 兜底放行。开闸依据：2026-08-24 真机采样
+                    # 分桶，谓词/结构不支持类占比 20% ≤ 30% 硬阈值。
+                    "channels": (
+                        [_spec_channel(str(spec.get("predicate", "") or ""))]
+                        if isinstance(spec, dict)
+                        else list(_ALL_CHANNELS_FALLBACK)
+                    ),
                 }
             )
         # Gaps between clauses (connectors/punctuation) are context, not condition.
@@ -505,8 +612,21 @@ def _normalize_verification_text(value: Any) -> str:
 
 
 def _goal_verification_items(goal: dict) -> list[str]:
+    """verification 项的纯文本形式（供 key 映射 / agent 提示）。
+
+    F4/F3 对象项（{"claim":...} / {"claim":..., "clauses":[...]}）取其 claim 文本，
+    避免 str(dict) 把 Python repr 当验证文本喂给 agent。
+    """
     raw_items = goal.get("verification", []) if isinstance(goal, dict) else []
-    return [str(item or "").strip() for item in raw_items if str(item or "").strip()]
+    items: list[str] = []
+    for raw in raw_items:
+        if isinstance(raw, dict):
+            text = str(raw.get("claim", "") or "").strip()
+        else:
+            text = str(raw or "").strip()
+        if text:
+            items.append(text)
+    return items
 
 
 def _build_verification_key_maps(goal: dict) -> tuple[dict[str, str], dict[str, str]]:
@@ -520,6 +640,56 @@ def _build_verification_key_maps(goal: dict) -> tuple[dict[str, str], dict[str, 
         if normalized:
             key_lookup[normalized] = key
     return key_lookup, key_to_item
+
+
+def _clause_evidence_hints(
+    merged_verifications: list[dict[str, Any]],
+    key_to_item: dict[str, str],
+) -> tuple[list[str], list[str]]:
+    """生成 agent 历史注入的「已通过 / 待验证」clause 身份标签列表。
+
+    返回 ``(passed_tags, pending_tags)``。pending 只收 unknown 且证据尝试 <3 的
+    clause——已有 ≥3 条匹配证据仍 unknown 视为「尽力仍不可证」（典型：规划期拆出
+    了系统给不出权威 PASS 的手段性 clause），不再列入待验证清单、不再据此驳回
+    DONE，避免不可满足 clause 把 run 拖入回环（用例 168 实测：agent 从已到达的
+    目标页被逼导航回起点反复补证直至被取消）。最终报告仍如实 unknown +
+    review_required；F1「零证据漏验」判定不受影响（unverified 仅在零证据时标记）。
+    """
+    def _tag(vkey: str, clause: dict) -> str:
+        """生成「clause 身份」标签，供 agent 原样填进 assert 的 verification_key/clause_id。
+
+        关键：agent 之前把所有 assert 都打上 v0.0，导致证据错配、其余 clause 全部
+        unknown（即前端「未验证」）。这里把 evaluator 契约里**精确的 clause_id + 所需
+        channel** 直接给出来，让 agent 知道每次 assert 该 stamp 什么身份、用哪个通道工具。
+        """
+        cid = str(clause.get("id", "") or "")
+        chs = clause.get("channels") or []
+        ch_str = ",".join(str(c) for c in chs) if chs else "any"
+        claim = str(clause.get("claim", "") or key_to_item.get(vkey, "") or "")
+        return f"[{vkey}::{cid} | channels:{ch_str}] {claim}"
+
+    passed: list[str] = []
+    pending: list[str] = []
+    for entry in merged_verifications or []:
+        if not isinstance(entry, dict):
+            continue
+        vkey = str(entry.get("key", "") or "")
+        # failed 整项不进 pending：确定性矛盾走 authoritative FAIL 终止，
+        # 不该让 agent 去「补」。
+        entry_failed = str(entry.get("result", "") or "") == "failed"
+        for clause in entry.get("clauses", []) or []:
+            if not isinstance(clause, dict):
+                continue
+            status = str(clause.get("status", "") or "")
+            if status == "passed":
+                passed.append(_tag(vkey, clause))
+            elif (
+                status == "unknown"
+                and not entry_failed
+                and int(clause.get("evidence_count", 0) or 0) < 3
+            ):
+                pending.append(_tag(vkey, clause))
+    return passed, pending
 
 
 def _determine_execution_status(state: dict) -> str:
@@ -550,8 +720,13 @@ def _determine_execution_status(state: dict) -> str:
         return "exhausted"
     # 兜底：若 Agent 已实际推进了较多步骤（自然结束但 conclusion 无标准前缀，
     # 例如中途遇到可恢复的权限/系统弹窗被绕过后正常走完），不应误判为 error。
-    # 仅当几乎未推进（step 极少，疑似一进来就崩）才保留 error。
-    if len(history) >= 3:
+    # F6①（plan §8）收窄：必须有真实推进（至少一步 success/continue）才算
+    # completed——纯失败的 3 步崩溃不再因步数达标被洗白成 completed。
+    if len(history) >= 3 and any(
+        isinstance(s, dict)
+        and str(s.get("status", "") or "") in ("success", "continue")
+        for s in history
+    ):
         return "completed"
     return "error"
 
@@ -683,6 +858,83 @@ def _find_elements(u: Any, target: str) -> list[Any]:
     return [e for e in elements if _element_matches(e, target)]
 
 
+def _fuzzy_candidates(u: Any, target: str) -> list[str]:
+    """埋点辅助：给 spec target 找页面上最接近的真实控件名（同义改写检测线索）。
+
+    仅用于 None 归因日志，不参与判定；cutoff 0.6 下「课程名称 vs 课程名」类
+    近似词能被召回，帮助人工区分「同义改写落空」与「真没走到该页面」。
+    """
+    t = str(target or "").strip().lower()
+    if not t:
+        return []
+    vocab: set[str] = set()
+    for e in getattr(u, "elements", []) or []:
+        for attr in ("label", "text", "content_desc"):
+            val = str(getattr(e, attr, "") or "").strip()
+            if val:
+                vocab.add(val)
+        rid_leaf = str(getattr(e, "resource_id", "") or "").split("/")[-1].split(".")[-1]
+        if rid_leaf:
+            vocab.add(rid_leaf)
+    if not vocab:
+        return []
+    return difflib.get_close_matches(t, sorted(vocab), n=3, cutoff=0.6)
+
+
+def _match_none_reason(
+    spec: dict[str, Any], u: Any, current_app: dict[str, Any]
+) -> tuple[str, list[str]]:
+    """埋点辅助：分类 `_match_spec` 返回 None 的原因（只归因，不改判定行为）。
+
+    分桶口径见 agent_evolution_plan §3：`page_not_arrived` / `element_not_found`
+    属「控件缺失类」（用例没走到那步，不计入 F1 开闸分母）；其余归「谓词或结构
+    不支持类」。code 无法语义区分「同义改写落空」与「真不在页面上」——由
+    fuzzy hints 字段供人工/聚合脚本判别。
+    """
+    predicate = str(spec.get("predicate", "") or "").strip().lower()
+    if predicate not in _PREDICATES:
+        return "unsupported_predicate", []
+    target = str(spec.get("target", "") or "")
+    activity = _activity_short(str((current_app or {}).get("activity", "") or ""))
+    if predicate == "page_is":
+        if not target or not activity:
+            return "missing_target", []
+        return "page_not_arrived", []
+    if predicate == "page_contains":
+        if not target:
+            return "missing_target", []
+        return "text_missing", _fuzzy_candidates(u, target)
+    if not target:
+        # 元素类谓词缺 target 属结构问题（planner 漏填），非页面缺失
+        return "missing_target", []
+    matched = _find_elements(u, target)
+    n = len(matched)
+    if predicate == "list_count":
+        try:
+            int(str(spec.get("expected")))  # noqa: B007 — 只验可解析性
+        except (TypeError, ValueError):
+            return "missing_expected", []
+        if n >= 2:
+            return "element_ambiguous", []
+        if n == 0:
+            return "element_not_found", _fuzzy_candidates(u, target)
+        return "unclassified", []  # n==1 理应出判定，理论不可达
+    if predicate in ("element_enabled", "element_disabled"):
+        # n==1 必出 PASS/FAIL 判定，None 只可能来自 n!=1
+        if n >= 2:
+            return "element_ambiguous", []
+        return "element_not_found", _fuzzy_candidates(u, target)
+    if predicate == "element_checked":
+        if n >= 2:
+            return "element_ambiguous", list(_fuzzy_candidates(u, target))
+        if n == 1:
+            # 唯一元素 checked 态读不到（AccessibilityNodeInfo 抖动）→ None
+            return "checked_unreadable", []
+        return "element_not_found", _fuzzy_candidates(u, target)
+    # element_exists / element_absent：absent 有 n==0→PASS 兜底，落到这里即 exists n==0
+    return "element_not_found", _fuzzy_candidates(u, target)
+
+
 def _match_spec(
     spec: dict[str, Any], u: Any, current_app: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -798,9 +1050,12 @@ def _match_spec(
             return {
                 "status": "PASS" if ok else "FAIL",
                 "authoritative": bool(getattr(el, "enabled", False)),
+                # expected_disabled 供 reporter 差异报告 _extract_expected_actual
+                # 提取「期望 vs 实际」（自动证据与手动 verify 的 fact 同构）。
                 "fact": {
                     "predicate": predicate,
                     "target": target,
+                    "expected_disabled": True,
                     "enabled": bool(getattr(el, "enabled", False)),
                     "rid": str(getattr(el, "resource_id", "") or ""),
                 },
@@ -878,6 +1133,26 @@ def _has_same_evidence(
     return False
 
 
+def _log_none_outcome(
+    key: str, clause: dict[str, Any], spec: dict[str, Any], u: Any, current_app: dict[str, Any]
+) -> None:
+    """埋点（plan §6 最小埋点）：_match_spec 返回 None 的归因分桶日志。
+
+    分桶码见 `_match_none_reason`；hints 为页面上与 target 近似的真实控件名，
+    用于区分「同义改写落空」（如「课程名称」vs「课程名」）与「真没走到该页面」。
+    """
+    reason, hints = _match_none_reason(spec, u, current_app)
+    logger.info(
+        "[auto-evidence] outcome=none key=%s clause=%s pred=%s target=%r reason=%s hints=%s",
+        key,
+        str(clause.get("id", "") or ""),
+        str(spec.get("predicate", "") or ""),
+        str(spec.get("target", "") or ""),
+        reason,
+        "|".join(hints) or "-",
+    )
+
+
 def auto_record_evidence(
     ctx: Any,
     contract: dict[str, Any],
@@ -914,6 +1189,7 @@ def auto_record_evidence(
                 continue  # spec:null → 手动 verify
             r = _match_spec(spec, u, current_app)
             if r is None:
+                _log_none_outcome(key, clause, spec, u, current_app)
                 continue  # 无法判定 → 不写
             channel = _spec_channel(str(spec.get("predicate", "") or ""))
             status = str(r.get("status", "") or "").upper()
@@ -921,6 +1197,12 @@ def auto_record_evidence(
             if not bool(r.get("authoritative", False)) and _has_same_evidence(
                 events, key, str(clause.get("id", "")), channel, status
             ):
+                logger.info(
+                    "[auto-evidence] outcome=dedup_skip key=%s clause=%s pred=%s",
+                    key,
+                    str(clause.get("id", "")),
+                    str(spec.get("predicate", "")),
+                )
                 continue
             events.append(
                 {
@@ -932,6 +1214,14 @@ def auto_record_evidence(
                     "fact": r.get("fact", {}),
                     "auto": True,  # 标记自动证据，区别于 LLM 手动 assert
                 }
+            )
+            logger.info(
+                "[auto-evidence] outcome=hit key=%s clause=%s pred=%s status=%s auth=%s",
+                key,
+                str(clause.get("id", "")),
+                str(spec.get("predicate", "")),
+                status,
+                bool(r.get("authoritative", False)),
             )
             written += 1
     return written

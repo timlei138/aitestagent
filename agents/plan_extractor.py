@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from datetime import datetime
 from typing import Any
 
 from data.relational import RelationalBackend
+
+logger = logging.getLogger(__name__)
 
 _READ_ONLY_TOOLS = {"get_screen_info", "check_page_health", "request_knowledge"}
 _SUCCESS_STATUSES = {"OK", "PASS", "YES"}
@@ -431,6 +434,35 @@ def environment_fingerprint(page: dict[str, Any], screen_profile: str = "") -> s
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
+def _deposition_environment_key(
+    actions: list[dict[str, Any]], app_package: str
+) -> str:
+    """R6（agent_evolution_plan §12）：沉淀侧环境键 = 目标 App 包内稳定首屏。
+
+    旧口径 ``actions[0].page_before`` 是「第一个动作执行前的前台」，会被系统
+    弹窗污染（实测沉淀过权限对话框 GrantPermissionsActivity）或中途跳转干扰。
+    新口径优先级：
+    1. 最后一条落在目标包内的 launch_app ``page_after`` —— 最接近冷启动首屏；
+    2. 第一条 ``page_after.package`` == 目标包的动作 ``page_after``；
+    3. 回退旧行为 ``actions[0].page_before``（拿不到目标首屏时诚实沿用旧口径）。
+    """
+    def _in_target(page: dict[str, Any]) -> bool:
+        return bool(app_package) and str(page.get("package", "") or "") == app_package
+
+    for event in reversed(actions or []):
+        if str(event.get("tool_name", "") or "") != "launch_app":
+            continue
+        page = event.get("page_after", {}) or {}
+        if _in_target(page):
+            return environment_fingerprint(page)
+    for event in actions or []:
+        page = event.get("page_after", {}) or {}
+        if _in_target(page):
+            return environment_fingerprint(page)
+    legacy = (actions[0].get("page_before", {}) or {}) if actions else {}
+    return environment_fingerprint(legacy)
+
+
 def verification_fingerprint(
     contract: dict[str, Any],
     parameter_slots: list[dict[str, Any]] | None = None,
@@ -489,6 +521,94 @@ def verification_fingerprint(
     return __import__("hashlib").sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _normalize_action_input(
+    tool_input: dict[str, Any], locator: dict[str, Any]
+) -> dict[str, Any]:
+    """R4①（agent_evolution_plan §12）：沉淀时剥离全局 index，归一化定位子。
+
+    全局 index 跨快照漂移（UI 元素增删即错位），是 direct 回放误命中→降级 guided
+    的已知根因；click 本身支持 label/rid/path_contains 定位。剥离 index 后若输入
+    失去一切可定位字段，则从执行期沉淀的 resolved_locator 按 rid>label>path 回填。
+    """
+    normalized = {
+        key: value
+        for key, value in dict(tool_input or {}).items()
+        if key != "index"
+    }
+    has_locator_key = any(
+        str(normalized.get(key, "") or "").strip()
+        for key in ("label", "alternatives", "rid", "path_contains", "targets")
+    )
+    if not has_locator_key and isinstance(locator, dict):
+        rid = str(locator.get("rid", "") or "").strip()
+        label = str(locator.get("label", "") or "").strip()
+        path = str(locator.get("path", "") or "").strip()
+        if rid:
+            normalized["rid"] = rid
+        elif label:
+            normalized["label"] = label
+        elif path:
+            normalized["path_contains"] = path
+    return normalized
+
+
+def _prune_detour_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """R5（agent_evolution_plan §12）：沉淀时剪掉「重试型」no-op 绕路动作。
+
+    启发式（保守版，宁漏剪不误剪——误剪会把必要动作从 plan 里永久删掉）：
+    动作 i 执行前后前台无位移（page_before 与 page_after 同 package+activity）
+    且其后存在「同名工具 + 归一化输入相同」的重试动作，则 i 是无效试错，
+    可剪除——保留的末次同款尝试证明该动作语义仍完整（幂等动作只执行一次，
+    重复弹窗类操作也由末次覆盖）。页面数据缺失时视为有位移，不剪。
+
+    已知边界（P4 诚实）：绕路后未原样重试的 detour（点错页再返回）不在本版
+    剪枝范围；观测先行，待真实 trace 数据再决定是否放宽。
+    """
+    if len(actions) < 2:
+        return actions
+
+    def _key(page: Any) -> tuple[str, str]:
+        p = page if isinstance(page, dict) else {}
+        return (
+            str(p.get("package", "") or "").strip(),
+            str(p.get("activity", "") or "").strip(),
+        )
+
+    def _sig(event: dict[str, Any]) -> str:
+        payload = json.dumps(
+            _normalize_action_input(
+                event.get("tool_input", {}) or {},
+                event.get("resolved_locator", {}) or {},
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return f"{event.get('tool_name', '')}:{payload}"
+
+    sigs = [_sig(event) for event in actions]
+    last_of_sig: dict[str, int] = {}
+    for index, sig in enumerate(sigs):
+        last_of_sig[sig] = index
+
+    kept: list[dict[str, Any]] = []
+    pruned_indexes: list[int] = []
+    for index, event in enumerate(actions):
+        before, after = _key(event.get("page_before")), _key(event.get("page_after"))
+        stationary = bool(before[0] or before[1]) and before == after
+        if stationary and last_of_sig[sigs[index]] > index:
+            pruned_indexes.append(index)
+            continue
+        kept.append(event)
+    if pruned_indexes:
+        logger.info(
+            "R5 detour prune: dropped %d/%d no-op retries (indexes=%s)",
+            len(pruned_indexes),
+            len(actions),
+            pruned_indexes,
+        )
+    return kept
+
+
 def extract_candidate_plan(
     db: RelationalBackend,
     *,
@@ -514,6 +634,8 @@ def extract_candidate_plan(
         and str(event.get("tool_name", "") or "") not in _READ_ONLY_TOOLS
         and str(event.get("status", "") or "").upper() in _SUCCESS_STATUSES
     ]
+    # R5：先剪 no-op 重试再算签名/落库，保证沉淀 plan 与回放链一致
+    actions = _prune_detour_actions(actions)
     if not actions:
         return None
 
@@ -538,9 +660,8 @@ def extract_candidate_plan(
             "contract_status": "approved",
             "plan_trust": "candidate",
             "direct_approved": 0,
-            "environment_key": environment_fingerprint(
-                actions[0].get("page_before", {}) or {}
-            ),
+            # R6：目标 App 包内稳定首屏（不再取第一个动作前的前台，防弹窗/跳转污染）
+            "environment_key": _deposition_environment_key(actions, app_package),
             "attempt_count": 0,
             "success_count": 0,
             "quality_score": 0.0,
@@ -571,7 +692,10 @@ def extract_candidate_plan(
                 "action_index": index,
                 "tool_name": str(event.get("tool_name", "") or ""),
                 "tool_input_json": json.dumps(
-                    event.get("tool_input", {}) or {}, ensure_ascii=False
+                    _normalize_action_input(
+                        event.get("tool_input", {}) or {}, locator
+                    ),
+                    ensure_ascii=False,
                 ),
                 "precondition_json": json.dumps(page_before, ensure_ascii=False),
                 "locator_json": json.dumps(locator, ensure_ascii=False),
@@ -612,9 +736,8 @@ def extract_candidate_plan(
                     "user_request_template", ""
                 ),
                 parameter_slots=task_signature.get("parameter_slots", []),
-                environment_key=environment_fingerprint(
-                    actions[0].get("page_before", {}) or {}
-                ),
+                # R6：与关系库侧同口径（目标 App 包内稳定首屏）
+                environment_key=_deposition_environment_key(actions, app_package),
             )
         except Exception:
             # Vector indexing must not block relational plan creation.

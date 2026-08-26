@@ -70,6 +70,12 @@ class TestState(TypedDict, total=False):
     # 自动批准计划：CLI run --auto-approve 时置 True，plan_review_node 跳过
     # interrupt() 直接 approve，用于无人值守的一次性真机验证。
     auto_approve: bool
+    # R2（agent_evolution_plan §10）：显式回放意图（前端「回放」按钮）。配合
+    # auto_approved_reason=reuse_hit 在 mode_selection 解锁 direct 准入。
+    replay: bool
+    # §9 验收2：plan_review 审阅态区分提案来源（reused_plan=历史复用 / 空=new plan）。
+    # R1 复用命中（含 env 漂移落人工审的分支）置 reused_plan，正常 planner 路径留空。
+    proposal_source: str
     verification_contract: dict[str, Any]
     clause_state: dict[str, Any]
     step_history: Annotated[list[dict[str, Any]], operator.add]
@@ -80,6 +86,11 @@ class TestState(TypedDict, total=False):
     conclusion: Annotated[str, _last_value]
     status: Annotated[str, _last_value]
     started_at: str
+    # 时间账三段拆分（agent_evolution_plan §13）：planner 段由 planner_node 累计，
+    # review 等待段存 tool ctx（interrupt 节点更新不提交，state 存不住进入时刻），
+    # 执行段 = duration − 前两者（reporter 反推），三段之和 == duration_seconds。
+    planner_elapsed_seconds: float
+    plan_review_wait_seconds: float
     step_times: list[dict[str, Any]]
     # V2: 双维度结果
     execution_status: str  # completed / exhausted / error / cancelled / device_offline
@@ -102,6 +113,9 @@ class TestState(TypedDict, total=False):
     plan_id: str
     plan_trust: str
     mode_selection_reason: str
+    # R1（agent_evolution_plan §9）：复用命中自动过审的审计标记（"reuse_hit"），
+    # 空串表示走人工审。仅作 trace 透出，不参与任何模式决策。
+    auto_approved_reason: str
     selected_plan_actions: list[dict[str, Any]]
     mode_transition_events: list[dict[str, Any]]
     actual_environment_key: str
@@ -110,6 +124,10 @@ class TestState(TypedDict, total=False):
     _guided_downgrade_count: int
     _direct_action_cursor: int
     _direct_downgrade_count: int
+    # R3（agent_evolution_plan §11）：direct 导航动作耗尽收口标志。进入收尾分支时
+    # 即刻置位（不等 evaluator verdict），与 unknown 回环互斥——置位后路由不再回
+    # direct 重放动作，unknown 只送 agent 补验。
+    _direct_exhausted: bool
     _tool_calls_log: list  # 工具调用实时日志（存入 state，不依赖 ctx）
     _finalization_hint_injected: bool
     _rag_injected_once: bool

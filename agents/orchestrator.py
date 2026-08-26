@@ -58,6 +58,11 @@ def _reset_run_scoped(ctx) -> None:
         ):
             if hasattr(ctx, _rag_attr):
                 setattr(ctx, _rag_attr, 0)
+        # 时间账三段拆分（plan §13）：plan_review 计时器跨 run 清零。auto-approve
+        # 路径（R1 reuse_hit）不经过 interrupt，不写这两个属性——不清会残留上一跑
+        # 的等待时长，让零等待的复用跑虚报 plan_review_wait（168 复跑实测虚报 32s）。
+        ctx._plan_review_wait_seconds = 0.0
+        ctx._plan_review_entered_at = ""
     except Exception:
         pass
 
@@ -320,6 +325,7 @@ class TestOrchestrator:
         thread_id: str = "",
         goal_description: dict | None = None,
         auto_approve: bool = False,
+        replay: bool = False,
     ) -> dict[str, Any]:
         """启动测试执行（同步）。设备未连接时直接返回错误。"""
         logger.info(
@@ -390,6 +396,7 @@ class TestOrchestrator:
             "app_package": app_package,
             "app_name": app_name,
             "auto_approve": bool(auto_approve),
+            "replay": bool(replay),
             "goal_description": goal_description or {},
             "step_history": [],
             "messages": [],
@@ -517,6 +524,7 @@ class TestOrchestrator:
         thread_id: str = "",
         goal_description: dict | None = None,
         auto_approve: bool = False,
+        replay: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """流式执行测试 — 通过 astream_events 实时推送每个事件。"""
         if not thread_id:
@@ -554,6 +562,7 @@ class TestOrchestrator:
             "app_package": app_package,
             "app_name": app_name,
             "auto_approve": bool(auto_approve),
+            "replay": bool(replay),
             "goal_description": goal_description or {},
             "step_history": [],
             "messages": [],

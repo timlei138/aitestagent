@@ -48,6 +48,7 @@ from agents.rag_context import (
 )
 from agents.verification import (
     _build_verification_key_maps,
+    _clause_evidence_hints,
     _determine_execution_status,
     _goal_verification_items,
     _normalize_verification_text,
@@ -211,6 +212,215 @@ Target app: {app_name} ({app_package})
 # ═══ NODES ═══
 
 
+def _target_app_page_payload(ctx: Any, app_package: str) -> dict[str, Any]:
+    """R6（agent_evolution_plan §12）回放侧环境口径 = 「目标 App 包内当前页」。
+
+    前台在目标 App 内 → 精确取 package/activity；在桌面/其它 App → 目标 App
+    状态未知，双字段置空。environment_compatibility_score 只在双侧非空且不同时
+    判 critical 冲突，因此「未知」不会误杀复用；运行期真实安全网由 direct_node
+    的逐动作 precondition 承担。与沉淀侧 _deposition_environment_key 配对。
+    """
+    try:
+        current_app = (
+            ctx.device.current_app() if ctx and getattr(ctx, "device", None) else {}
+        )
+    except Exception:
+        current_app = {}
+    cap = current_app or {}
+    in_target = bool(app_package) and str(cap.get("package", "") or "") == app_package
+    return {
+        "package": str(cap.get("package", "") or "") if in_target else "",
+        "activity": str(cap.get("activity", "") or "") if in_target else "",
+    }
+
+
+def _current_environment_key_weak(ctx: Any, state: TestState) -> str:
+    """R1：planner 阶段的弱信号环境键（R6 后与 mode_selection 同口径）。"""
+    from agents.plan_extractor import environment_fingerprint
+
+    try:
+        page_payload = _target_app_page_payload(
+            ctx, str(state.get("app_package", "") or "")
+        )
+        screen_size = ctx.screen_size if ctx else (0, 0)
+        screen_profile = "x".join(str(value) for value in screen_size)
+        app_version = _get_app_version(ctx, str(state.get("app_package", "") or ""))
+        page_payload["app_version"] = app_version
+        page_payload["fixture_fingerprint"] = ""
+        return environment_fingerprint(page_payload, screen_profile)
+    except Exception:
+        return ""
+
+
+def _try_plan_reuse(state: TestState) -> dict[str, Any] | None:
+    """R1（agent_evolution_plan §9）：检索前移——同一用例重跑复用已审批契约。
+
+    高置信判据（P4：不发明阈值）：向量召回候选的 task_signature.user_request
+    与本次 user_request 逐字相等（同一条用例重跑），契约 approved 且带可执行动作。
+    env 不兼容时仍返回命中但 env_compatible=False —— 契约照常作为提案复用，
+    仅收回 auto_approve（§9③：落人工确认，走 guided 路径仍有人工环节）。
+    """
+    try:
+        ctx = get_tool_context()
+        kb = getattr(ctx, "knowledge_base", None) if ctx else None
+        if not kb:
+            return None
+        from agents.graph import _relational_db
+        from agents.plan_extractor import environment_compatibility_score
+
+        db = _relational_db
+        request = str(state.get("user_request", "") or "").strip()
+        app_package = str(state.get("app_package", "") or "")
+        if not request or not db:
+            return None
+        current_env_key = _current_environment_key_weak(ctx, state)
+        matches: list[dict[str, Any]] = []
+        for candidate in kb.query_task_plan_summaries(
+            app_package, request, top_k=5
+        ) or []:
+            metadata = candidate.get("metadata", {}) or {}
+            plan_id = metadata.get("plan_id")
+            if not plan_id:
+                continue
+            full_plan = db.get_full_execution_plan(str(plan_id))
+            if not full_plan:
+                continue
+            signature = full_plan.get("task_signature", {}) or {}
+            if str(signature.get("user_request", "") or "").strip() != request:
+                continue  # 措辞不同 → 不自动复用，回落现状 planner 路径
+            contract = json.loads(full_plan.get("verification_contract_json") or "{}")
+            if (
+                full_plan.get("contract_status") != "approved"
+                or not isinstance(contract, dict)
+                or contract.get("status") != "approved"
+                or not full_plan.get("actions")
+            ):
+                continue
+            env_score = environment_compatibility_score(
+                str(full_plan.get("environment_key", "") or ""),
+                current_env_key,
+            )
+            logger.info(
+                "Plan reuse candidate: plan_id=%s env_score=%s compatible=%s",
+                plan_id,
+                env_score.get("score"),
+                env_score.get("compatible"),
+            )
+            matches.append(
+                {
+                    "plan_id": str(plan_id),
+                    "contract": contract,
+                    "parameter_slots": list(
+                        signature.get("parameter_slots", []) or []
+                    ),
+                    # 沉淀侧 action_semantics 原样透传：重建 goal 携带它后，回放侧
+                    # task_signature 与沉淀侧逐字一致，兼容检查不再依赖请求文本推断。
+                    "action_semantics": list(
+                        signature.get("action_semantics", []) or []
+                    ),
+                    "env_compatible": bool(env_score.get("compatible")),
+                }
+            )
+        # R6 转型期：同一请求可能同时存在旧口径脏键 plan 与 R6 后净键 plan。
+        # 优先返回 env 兼容者，避免召回顺序让旧沉淀遮蔽新沉淀（下游真实检索
+        # 本就按 env_score 择优，此处对齐）；全不兼容时回落首个命中 —— 契约
+        # 照常提案、仅收回自动过审落人工确认（§9③ 自愈路径）。
+        for match in matches:
+            if match["env_compatible"]:
+                return match
+        return matches[0] if matches else None
+    except Exception as exc:
+        logger.warning("plan reuse lookup skipped: %s", exc)
+        return None
+
+
+def _goal_from_stored_contract(
+    contract: dict[str, Any],
+    user_request: str,
+    parameter_slots: list[dict[str, Any]],
+    action_semantics: list[str],
+) -> dict[str, Any]:
+    """R1：跳过 planner 时由存储契约原文重建 goal_description。
+
+    仅供审阅展示与 mode_selection 的 task_signature（parameter_slots /
+    action_semantics 原样透传，保证回放侧签名与沉淀侧逐字一致）；
+    不再喂给 planner 重新规划。
+    """
+    verifications: list[Any] = []
+    for v in contract.get("verifications", []) or []:
+        if not isinstance(v, dict):
+            continue
+        statement = str(v.get("statement", "") or "")
+        clauses = [c for c in v.get("clauses", []) or [] if isinstance(c, dict)]
+        spec = clauses[0].get("spec") if clauses else None
+        verifications.append({"claim": statement, "spec": spec} if spec else statement)
+    return {
+        "goal": user_request,
+        "target_pages": [],
+        "verification": verifications,
+        "hints": [],
+        "parameter_slots": list(parameter_slots or []),
+        "action_semantics": list(action_semantics or []),
+    }
+
+
+def _plan_reuse_command(
+    state: TestState,
+    config: RunnableConfig,
+    ctx: Any,
+    reused: dict[str, Any],
+    budget_violation_count: int,
+) -> Command:
+    """R1 命中路径：跳过 planner LLM，用契约原文重建 goal + plan_review 自动过审。"""
+    env_ok = bool(reused.get("env_compatible"))
+    logger.info(
+        "Planner skipped (reuse_hit): plan_id=%s env_compatible=%s",
+        reused.get("plan_id"),
+        env_ok,
+    )
+    # 与正常路径同款 per-run 清理（reuse 分支提前 return，跳过了原清理块）
+    try:
+        if ctx:
+            ctx._planner_elapsed_seconds = 0.0
+            ctx._rag_query_cache = {}
+            ctx._run_tag = (
+                config.get("configurable", {}).get("thread_id", "") or ""
+            )
+            ctx._rag_query_count = 0
+            ctx._rag_same_app_count = 0
+            ctx._rag_cross_app_count = 0
+            ctx._rag_empty_hit_count = 0
+    except Exception:
+        pass
+    return Command(
+        update={
+            "goal_description": _goal_from_stored_contract(
+                reused["contract"],
+                str(state.get("user_request", "") or ""),
+                reused["parameter_slots"],
+                reused["action_semantics"],
+            ),
+            "verification_contract": reused["contract"],
+            # env 兼容才自动过审；env 漂移收回自动过审（§9③ 落人工确认）
+            "auto_approve": env_ok,
+            "auto_approved_reason": "reuse_hit" if env_ok else "",
+            # §9 验收2：人工审时前端据此标注「来源=reused plan」
+            "proposal_source": "reused_plan",
+            "step_history": [],
+            "messages": [],
+            "started_at": datetime.now().isoformat(),
+            "planner_elapsed_seconds": 0.0,
+            "step_times": [],
+            "budget_violation_count": budget_violation_count,
+            "_rag_injected_once": False,
+            "_rag_last_app_package": "",
+            "_knowledge_query_hint_injected": False,
+            "_last_page_app_key": "",
+            "_last_clickable_count": 0,
+        }
+    )
+
+
 def planner_node(state: TestState, config: RunnableConfig) -> Command:
     cfg: TestConfig = config["configurable"]["test_config"]
     llm = _llm_cfg(cfg)
@@ -224,6 +434,15 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     rag, rag_truncated = _clip_to_token_budget(rag, 500)
     # reducer 通道：只上报本次增量（delta），不要读旧值累加，也不要重置。
     budget_violation_count = 1 if rag_truncated else 0
+
+    # R1 (plan section 9): same-request rerun reuses the approved contract
+    # and skips the planner LLM entirely; plan_review auto-approves via
+    # auto_approve with reason=reuse_hit. Must run BEFORE any LLM call.
+    _reused = _try_plan_reuse(state)
+    if _reused is not None:
+        return _plan_reuse_command(
+            state, config, ctx, _reused, budget_violation_count
+        )
     msgs = PLANNER_TEMPLATE.format_messages(
         user_request=state.get("user_request", ""),
         app_name=state.get("app_name", ""),
@@ -237,6 +456,10 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
     )
     import time as _time
 
+    # 时间账三段拆分（plan §13）：started_at 提前到 graph 起点（原在下方 Command
+    # 更新时才打点，planner 耗时会漏出 duration）；planner 段耗时单独累计。
+    _run_started_at = datetime.now().isoformat()
+    _planner_t0 = _time.time()
     goal: dict[str, Any] | None = None
     for _attempt in range(3):
         _t0 = _time.time()
@@ -259,6 +482,11 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
                 )
             ),
         ]
+    planner_elapsed_seconds = round(_time.time() - _planner_t0, 1)
+    try:
+        ctx._planner_elapsed_seconds = planner_elapsed_seconds
+    except Exception:
+        pass
     if goal is None:
         goal = {
             "goal": state.get("user_request", ""),
@@ -287,13 +515,15 @@ def planner_node(state: TestState, config: RunnableConfig) -> Command:
             ctx_cleanup._rag_empty_hit_count = 0
     except Exception:
         pass
+
     return Command(
         update={
             "goal_description": goal,
             "verification_contract": verification_contract,
             "step_history": [],
             "messages": [],
-            "started_at": datetime.now().isoformat(),
+            "started_at": _run_started_at,
+            "planner_elapsed_seconds": planner_elapsed_seconds,
             "step_times": [],
             "budget_violation_count": budget_violation_count,
             "_rag_injected_once": False,
@@ -367,20 +597,16 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
             page_activity_short = act
             title = u.page_title or ""
             pid = act + "「" + title + "」" if title else act
-            pkg = (
-                (ctx.device.current_app() or {}).get("package", "")
-                if ctx.device
-                else ""
-            )
+            # F6②（plan §8）：感知块内两次 current_app() RPC 合并为一次复用
+            # （原 585/596 各查一次前台，仅用于取 package）。
+            _current_app = (ctx.device.current_app() if ctx.device else {}) or {}
+            pkg = str(_current_app.get("package", "") or "")
             current_app_key = f"{pkg}:{act}"
             # M4a (M4): perceive 后自动匹配确定性事实成证据（spec 覆盖的 clause
             # 自动落盘，agent 无需手动 assert）。失败不应阻断主流程。
             try:
                 from agents.verification import auto_record_evidence
 
-                _current_app = (
-                    ctx.device.current_app() if ctx and ctx.device else {}
-                ) or {}
                 auto_record_evidence(
                     ctx,
                     state.get("verification_contract", {}) or {},
@@ -546,44 +772,20 @@ def agent_node(state: TestState, config: RunnableConfig) -> Command:
         merged_verifications = (getattr(ctx, "_clause_state", {}) or {}).get(
             "verifications", []
         )
-
-        def _clause_tag(vkey: str, clause: dict) -> str:
-            """生成「clause 身份」标签，供 agent 原样填进 assert 的 verification_key/clause_id。
-
-            关键：agent 之前把所有 assert 都打上 v0.0，导致证据错配、其余 clause 全部
-            unknown（即前端「未验证」）。这里把 evaluator 契约里**精确的 clause_id + 所需
-            channel** 直接给出来，让 agent 知道每次 assert 该 stamped 什么身份、用哪个通道工具。
-            """
-            cid = str(clause.get("id", "") or "")
-            chs = clause.get("channels") or []
-            ch_str = ",".join(str(c) for c in chs) if chs else "any"
-            claim = str(clause.get("claim", "") or key_to_item.get(vkey, "") or "")
-            return f"[{vkey}::{cid} | channels:{ch_str}] {claim}"
-
-        # 已通过验证：逐 clause 列出已拿到证据的 clause 身份（含 clause_id/channel），
-        # 让 agent 知道哪些已满足、不必重复验证。failed 走 authoritative FAIL 终止，不列。
-        passed_items = []
-        for entry in merged_verifications:
-            if str(entry.get("result", "") or "") != "passed":
-                continue
-            for clause in entry.get("clauses", []) or []:
-                if str(clause.get("status", "") or "") == "passed":
-                    passed_items.append(_clause_tag(str(entry.get("key", "")), clause))
+        # 已通过/待验证清单（_clause_evidence_hints）：pending 只含证据尝试 <3 的
+        # unknown clause；≥3 次仍 unknown 视为「尽力不可证」，不再驳回 DONE 强行
+        # 回环补证（用例 168 实测：不可满足的手段性 clause 把 run 拖到被取消）。
+        passed_items, pending_items = _clause_evidence_hints(
+            merged_verifications, key_to_item
+        )
         if passed_items:
             hist_str += "\n\n已通过验证（clause 身份，勿重复验证）: " + "; ".join(passed_items)
         # 证据驱动终止机制 · 第 2 层：待验证清单。
-        # 逐 clause 列出 result=="unknown"（缺证据）的 clause 身份；failed 不在此列
+        # 逐 clause 列出尚未拿到足够证据的 clause 身份；failed 不在此列
         # （确定性矛盾，走 authoritative FAIL 终止，不该让 agent 去「补」）。
-        pending_items = []
-        for entry in merged_verifications:
-            if str(entry.get("result", "") or "") == "failed":
-                continue
-            for clause in entry.get("clauses", []) or []:
-                if str(clause.get("status", "") or "") == "unknown":
-                    pending_items.append(_clause_tag(str(entry.get("key", "")), clause))
         if pending_items:
             hist_str += (
-                "\n\n待验证清单（以下 clause 尚未拿到任何证据；把上面给出的"
+                "\n\n待验证清单（以下 clause 尚未拿到足够证据；把上面给出的"
                 "「verification_key::clause_id」原样填进 assert 的 verification_key / clause_id"
                 " 参数，且使用标注的 channel 工具；不得仅用肉眼观察替代，也不得把所有 assert"
                 " 都打同一个 clause_id）: "
@@ -1079,6 +1281,28 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
         except:
             pass
 
+    # 时间账三段拆分（plan §13）：执行段 = 总时长 − planner − review 等待（差值反推）。
+    # 先取整再相减，保证 trace 中三段之和与 duration_seconds 精确相等。
+    # review 等待段存 tool ctx（interrupt 节点更新不提交）；planner 段 state/ctx 双写。
+    _time_ctx = get_tool_context()
+    _planner_elapsed = float(state.get("planner_elapsed_seconds", 0.0) or 0.0)
+    if not _planner_elapsed:
+        _planner_elapsed = float(
+            getattr(_time_ctx, "_planner_elapsed_seconds", 0.0) or 0.0
+        )
+    _review_wait = float(getattr(_time_ctx, "_plan_review_wait_seconds", 0.0) or 0.0)
+    _dur_r = round(duration, 1)
+    _planner_elapsed = round(_planner_elapsed, 1)
+    _review_wait = round(_review_wait, 1)
+    _execution_elapsed = round(max(_dur_r - _planner_elapsed - _review_wait, 0.0), 1)
+    logger.info(
+        "Reporter[time]: total=%.1fs planner=%.1fs review_wait=%.1fs execution=%.1fs",
+        _dur_r,
+        _planner_elapsed,
+        _review_wait,
+        _execution_elapsed,
+    )
+
     # dd 初始化（后面 try 块内会覆盖）
     dd = history
 
@@ -1512,7 +1736,10 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 app_name=state.get("app_name", ""),
                 execution_status=execution_status,
                 test_verdict=test_verdict,
-                duration_seconds=duration,
+                duration_seconds=_dur_r,
+                planner_elapsed_seconds=_planner_elapsed,
+                plan_review_wait_seconds=_review_wait,
+                execution_elapsed_seconds=_execution_elapsed,
                 tool_log=_tool_log,
                 verification_results=verification_results,
                 token_usage=token_usage,
@@ -1536,6 +1763,7 @@ def reporter_node(state: TestState, config: RunnableConfig) -> Command:
                 plan_id=_plan_id,
                 plan_trust=_plan_trust,
                 mode_selection_reason=_mode_reason,
+                auto_approved_reason=str(state.get("auto_approved_reason", "") or ""),
                 mode_transition_events=_mode_transitions,
             )
             _trace_path = write_run_trace(_trace)
@@ -1599,6 +1827,16 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
         if isinstance(verification_contract, dict)
         else None
     )
+    # 时间账三段拆分（plan §13）：interrupt 触发时本节点的 Command 更新不提交、
+    # 恢复后节点从头重跑，等待起点只能存 graph state 之外的 tool ctx 上；
+    # 进程重启等异常导致取不到时记 0（诚实兜底，宁小勿猜）。
+    # ⚠️ 只在未打点时写入：恢复路径会再次执行到这里，若无条件覆盖，
+    # 进入时刻会被重跑时刻冲掉 → 等待段恒为 0（8/24 真机两跑实测）。
+    try:
+        if not str(getattr(_ctx, "_plan_review_entered_at", "") or ""):
+            _ctx._plan_review_entered_at = datetime.now().isoformat()
+    except Exception:
+        pass
     result = interrupt(
         {
             "type": "plan_review",
@@ -1609,8 +1847,28 @@ def plan_review_node(state: TestState, config: RunnableConfig) -> Command:
             "user_request": state.get("user_request", ""),
             "verification_contract": verification_contract,
             "span_validation": _initial_span_validation,
+            # §9 验收2：审阅态标注提案是历史复用还是新规划（空=new plan）
+            "proposal_source": str(state.get("proposal_source", "") or ""),
         }
     )
+    # 等待时长 = resume 时刻 − 进入时刻（ctx 上的进入时刻跨 interrupt 存活）
+    _review_wait = 0.0
+    _entered_at = str(getattr(_ctx, "_plan_review_entered_at", "") or "")
+    if _entered_at:
+        try:
+            _review_wait = round(
+                (datetime.now() - datetime.fromisoformat(_entered_at)).total_seconds(),
+                1,
+            )
+        except Exception:
+            _review_wait = 0.0
+    try:
+        _ctx._plan_review_wait_seconds = _review_wait
+        # 消费后清空：下一轮 run 从干净状态开始（否则残留旧进入时刻）
+        _ctx._plan_review_entered_at = ""
+    except Exception:
+        pass
+    logger.info("Plan review wait: %.1fs", _review_wait)
     # If user edited the goal, use the edited version
     if isinstance(result, dict) and result.get("action") == "confirm":
         # 在原计划基础上覆盖用户编辑的字段，保留 execution_plan 等其余字段
@@ -1724,6 +1982,19 @@ def _action_postcond_rate(action: dict[str, Any]) -> float:
         return 0.0
 
 
+# R2（plan §10）：direct 重演只保留导航动作。验证类动作（assert_* / vision_tap /
+# click_and_check）不重演——assert 重演无意义、vision_tap 重演一次是一次 VLM 钱，
+# 验证统一交 R3 收尾由 auto_record_evidence + evaluator 纯代码判定。
+_VERIFICATION_TOOL_NAMES = frozenset({"vision_tap", "click_and_check"})
+
+
+def _is_verification_action(name: str) -> bool:
+    return name.startswith("assert_") or name in _VERIFICATION_TOOL_NAMES
+
+
+
+
+
 def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
     """Select a one-way v2 execution mode from an approved task plan."""
     from agents.verification import validate_contract_spans
@@ -1783,21 +2054,16 @@ def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
     actual_environment_key = ""
     try:
         ctx = get_tool_context()
-        current_app = ctx.device.current_app() if ctx and ctx.device else {}
         screen_size = ctx.screen_size if ctx else (0, 0)
         screen_profile = "x".join(str(value) for value in screen_size)
         app_version = _get_app_version(ctx, state.get("app_package", ""))
         fixture_fingerprint = ""  # fixture 维度已废弃（不再每次清空场景）
-        # 语义说明：environment_key 由「执行时前台 app 的 package/activity」+「目标 app 的
-        # app_version/fixture」混合组成。find_matching_execution_plan 已按 app_package 过滤，
-        # package/activity 是弱信号不会误判；严格对齐 Plan 4.1 时应改用「目标 App 启动后首屏
-        # activity」而非当前前台 app，但当前侧与沉淀侧口径一致，匹配自洽。
-        page_payload = {
-            "package": (current_app or {}).get("package", ""),
-            "activity": (current_app or {}).get("activity", ""),
-            "app_version": app_version,
-            "fixture_fingerprint": fixture_fingerprint,
-        }
+        # R6：口径 = 「目标 App 包内当前页」。前台在目标包内则精确比对
+        # package/activity；在桌面/其它 App 时目标态未知置空——未知不误杀，
+        # 与沉淀侧 _deposition_environment_key（目标首屏）配对。
+        page_payload = _target_app_page_payload(ctx, state.get("app_package", ""))
+        page_payload["app_version"] = app_version
+        page_payload["fixture_fingerprint"] = fixture_fingerprint
         actual_environment_key = environment_fingerprint(page_payload, screen_profile)
         # For matching, use the same key (candidate plans store their own page facts).
         environment_key = actual_environment_key
@@ -1857,6 +2123,40 @@ def mode_selection_node(state: TestState, config: RunnableConfig) -> Command:
         for action in actions
         if isinstance(action, dict)
     )
+
+    # R2（plan §10）：显式回放意图解锁 direct —— 准入收窄为三条硬安全条件：
+    # 契约复用命中（R1 保证：auto_approved_reason=reuse_hit）+ env 兼容
+    # （score ≥ guided 阈值）+ 过滤后仍有可执行动作。只重演导航动作
+    # （assert_*/vision_tap/click_and_check 交 R3 收尾自动判定）；「任一动作失败
+    # 立即降级 guided」护栏由 direct_node 原有 precondition/首败降级保留。
+    # 非 replay 重跑维持现有保守阶梯不动（验收 3）。
+    _replay_unlock = (
+        bool(state.get("replay", False))
+        and str(state.get("auto_approved_reason", "") or "") == "reuse_hit"
+        and env_score >= float(cfg.environment_guided_threshold)
+    )
+    if _replay_unlock:
+        replay_actions = [
+            action
+            for action in actions
+            if isinstance(action, dict)
+            and not _is_verification_action(
+                str(action.get("tool_name", "") or "")
+            )
+        ]
+        if replay_actions:
+            return Command(
+                update={
+                    **base_update,
+                    "execution_mode": "direct",
+                    "lifecycle_state": "Direct",
+                    "plan_id": str(plan["plan_id"]),
+                    "plan_trust": str(plan.get("plan_trust", "") or "candidate"),
+                    "mode_selection_reason": "replay_direct_reuse_hit",
+                    "selected_plan_actions": replay_actions,
+                    "_direct_action_cursor": 0,
+                }
+            )
 
     # Plan 4.1 direct 准入闸门（码级强制，除人工批准外还需满足）：
     # (a) 同一兼容键下累计成功运行 >= direct_min_runs（连续 N 次 guided 成功近似）；
@@ -1971,73 +2271,132 @@ def direct_node(state: TestState, config: RunnableConfig) -> Command:
 
     cursor = int(state.get("_direct_action_cursor", 0) or 0)
     actions = list(state.get("selected_plan_actions", []) or [])
+    ctx = get_tool_context()
     if cursor >= len(actions) or cursor >= _calc_mode_phase_budget(state, "direct"):
         transitions = list(state.get("mode_transition_events", []) or [])
+        _phase_budget_hit = cursor < len(actions)
+        reason = (
+            "direct_phase_budget_exhausted"
+            if _phase_budget_hit
+            else "direct_actions_exhausted"
+        )
         transitions.append(
             {
                 "from": "direct",
-                "to": "guided",
-                "reason": (
-                    "direct_phase_budget_exhausted"
-                    if cursor < len(actions)
-                    else "direct_actions_exhausted"
-                ),
+                "to": "guided" if _phase_budget_hit else "evaluator",
+                "reason": reason,
                 "step_index": cursor,
                 "plan_id": _direct_plan_id,
                 "action_id": "",
                 "phase_budget": _direct_phase_budget,
             }
         )
+        if not _phase_budget_hit:
+            # R3（plan §11）：导航动作真耗尽 → 零 LLM 收口。耗尽标志即刻置位
+            # （不等 evaluator verdict，与 unknown 回环互斥）；一次 perceive +
+            # auto_record_evidence 后交 evaluator 纯代码判定——verdict=passed/failed
+            # 直达 reporter，unknown 由路由守卫送 agent 补验且不再重放动作。
+            logger.info(
+                "Direct closeout: actions exhausted at %d, recording evidence (zero LLM)",
+                cursor,
+            )
+            try:
+                from agents.verification import auto_record_evidence
+
+                _u = (
+                    ctx.perceiver.perceive()
+                    if ctx and getattr(ctx, "perceiver", None)
+                    else None
+                )
+                if _u is not None:
+                    _current_app = (
+                        ctx.device.current_app() if ctx and ctx.device else {}
+                    ) or {}
+                    auto_record_evidence(
+                        ctx,
+                        state.get("verification_contract", {}) or {},
+                        _u,
+                        _current_app,
+                    )
+            except Exception as _close_exc:
+                # 收口证据失败不阻断判定流程（诚实兜底：evaluator 会按现有证据判）
+                logger.warning("direct closeout evidence failed: %s", _close_exc)
+            return Command(
+                update={
+                    "execution_mode": "direct",
+                    "lifecycle_state": "Direct",
+                    "mode_selection_reason": "direct_actions_exhausted_closeout",
+                    "_direct_exhausted": True,
+                    "mode_transition_events": transitions,
+                }
+            )
         return Command(
             update={
                 "execution_mode": "guided",
                 "lifecycle_state": "Guided",
-                "mode_selection_reason": transitions[-1]["reason"],
+                "mode_selection_reason": reason,
                 "_direct_downgrade_count": 1,
                 "mode_transition_events": transitions,
             }
         )
     action = actions[cursor]
-    ctx = get_tool_context()
     tool_input: dict[str, Any] = {}
     before_app: dict[str, Any] = {}
     output = ""
+
+    def _activity_short(value: Any) -> str:
+        return str(value or "").strip().split(".")[-1].lower()
+
     try:
         tool_input = json.loads(action.get("tool_input_json") or "{}")
         precondition = json.loads(action.get("precondition_json") or "{}")
         before_app = ctx.device.current_app() if ctx and ctx.device else {}
-        if (
-            precondition.get("package")
-            and precondition.get("package") != before_app.get("package")
-        ) or (
-            precondition.get("activity")
-            and precondition.get("activity") != before_app.get("activity")
-        ):
+        # R4②（plan §12）：precondition activity 短名宽松匹配——沉淀侧与运行侧
+        # 对同一 Activity 可能报全名/短名（如 .MainActivity vs com.x.MainActivity），
+        # 字符串不等但短名相等视为满足；package 仍严格。
+        _stored_act = str(precondition.get("activity", "") or "")
+        _live_act = str(before_app.get("activity", "") or "")
+        _act_ok = (
+            (not _stored_act)
+            or _stored_act == _live_act
+            or _activity_short(_stored_act) == _activity_short(_live_act)
+        )
+        _pkg_ok = (not precondition.get("package")) or precondition.get(
+            "package"
+        ) == before_app.get("package")
+        if not (_pkg_ok and _act_ok):
             raise RuntimeError("direct precondition mismatch")
         tool = next(
             tool for tool in AGENT_TOOLS if tool.name == action.get("tool_name")
         )
         output = str(tool.invoke(tool_input))
-        postcondition = json.loads(action.get("postcondition_json") or "{}")
-        after_app = ctx.device.current_app() if ctx and ctx.device else {}
-        if (
-            postcondition.get("package")
-            and postcondition.get("package") != after_app.get("package")
-        ) or (
-            postcondition.get("activity")
-            and postcondition.get("activity") != after_app.get("activity")
-        ):
-            raise RuntimeError("direct postcondition mismatch")
     except Exception as exc:
         output = f"ERROR: {exc}"
+
+    # R4②（plan §12）：单动作 current_app() RPC 3→2 —— after 只查一次，
+    # postcondition 校验与下方 action_events 落盘共用（原 2371/2389 各查一次）。
+    # 仅在动作干净执行后校验 postcondition（与原 try 内语义一致：
+    # 前置失败/工具异常时不覆盖更具体的错误信息）。
+    after_app = ctx.device.current_app() if ctx and ctx.device else {}
+    if output and not output.startswith("ERROR:"):
+        try:
+            postcondition = json.loads(action.get("postcondition_json") or "{}")
+            if (
+                postcondition.get("package")
+                and postcondition.get("package") != after_app.get("package")
+            ) or (
+                postcondition.get("activity")
+                and str(postcondition.get("activity", "")) != str(after_app.get("activity", ""))
+            ):
+                raise RuntimeError("direct postcondition mismatch")
+        except Exception as exc:
+            output = f"ERROR: {exc}"
 
     parsed_status = parse_status(output)
     if parsed_status:
         status = parsed_status
     else:
         status = "OK" if output.startswith(("OK", "PASS")) else "ERROR"
-
-    after_app = ctx.device.current_app() if ctx and ctx.device else {}
     if ctx:
         screen_profile = ""
         try:

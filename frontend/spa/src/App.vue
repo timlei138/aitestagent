@@ -312,6 +312,9 @@
         <span class="pr-title-icon">🎯</span>
         <span>测试目标确认</span>
         <span class="pr-title-badge">可编辑</span>
+        <!-- §9 验收2：区分历史复用提案与新规划（人工审场景无自动通过审计，这是唯一来源线索） -->
+        <el-tag v-if="planReviewProposalSource === 'reused_plan'" size="small" type="warning" effect="dark">来源=reused plan</el-tag>
+        <el-tag v-else size="small" type="info" effect="plain">来源=new plan</el-tag>
       </div>
     </template>
 
@@ -336,11 +339,35 @@
       </div>
       <div class="pr-section">
         <div class="pr-section-label"><span class="pr-label-ico">✅</span>验证条件与覆盖状态</div>
-        <div v-for="(v, i) in planReviewVerifications" :key="i" class="pr-verify-edit-row">
-          <el-input v-model="planReviewVerifications[i]" size="small" @input="onEditDraft" />
-          <el-button size="small" type="danger" text @click="planReviewVerifications.splice(i,1); onEditDraft()">×</el-button>
+        <div v-for="(row, i) in planReviewRows" :key="i" class="pr-verify-edit-block">
+          <div class="pr-verify-edit-row">
+            <el-input v-model="row.claim" size="small" @input="onEditDraft" />
+            <el-button size="small" type="danger" text @click="planReviewRows.splice(i,1); onEditDraft()">×</el-button>
+          </div>
+          <template v-if="row.clauses">
+            <div v-for="(c, j) in row.clauses" :key="j" class="pr-clause-edit-row">
+              <span class="pr-clause-badge">{{ i }}.{{ j }}</span>
+              <el-input v-model="c.claim" size="small" placeholder="子句（完整语义单元）" @input="onEditDraft" />
+              <el-button size="small" type="danger" text @click="row.clauses.splice(j,1); onEditDraft()">×</el-button>
+              <div class="pr-spec-editor">
+                <el-select v-model="c.spec.predicate" size="small" style="width:140px" clearable placeholder="无 spec" @change="onEditDraft">
+                  <el-option v-for="p in SPEC_PREDICATES" :key="p" :label="p" :value="p" />
+                </el-select>
+                <el-input v-if="c.spec.predicate" v-model="c.spec.target" size="small" style="width:130px" placeholder="target(照抄界面文本)" @input="onEditDraft" />
+                <el-input v-if="c.spec.predicate === 'element_checked' || c.spec.predicate === 'list_count'" v-model="c.spec.expected" size="small" style="width:70px" placeholder="expected" @input="onEditDraft" />
+              </div>
+            </div>
+            <el-button size="small" text type="primary" class="pr-clause-add" @click="row.clauses.push({claim:'', spec:_draftSpec(null)}); onEditDraft()">+ 子句</el-button>
+          </template>
+          <div v-else class="pr-spec-editor pr-spec-flat">
+            <el-select v-model="row.spec.predicate" size="small" style="width:140px" clearable placeholder="无 spec（手动 verify）" @change="onEditDraft">
+              <el-option v-for="p in SPEC_PREDICATES" :key="p" :label="p" :value="p" />
+            </el-select>
+            <el-input v-if="row.spec.predicate" v-model="row.spec.target" size="small" style="width:130px" placeholder="target(照抄界面文本)" @input="onEditDraft" />
+            <el-input v-if="row.spec.predicate === 'element_checked' || row.spec.predicate === 'list_count'" v-model="row.spec.expected" size="small" style="width:70px" placeholder="expected" @input="onEditDraft" />
+          </div>
         </div>
-        <el-button size="small" class="pr-add-btn" @click="planReviewVerifications.push(''); onEditDraft()">+ 添加验证</el-button>
+        <el-button size="small" class="pr-add-btn" @click="planReviewRows.push({claim:'', spec:_draftSpec(null), clauses:null}); onEditDraft()">+ 添加验证</el-button>
         <div v-if="isEditingDraft" class="pr-draft-hint">⚠ 草稿态：覆盖图已隐藏，以服务端最终校验为准（确认后后端重建）</div>
         <div v-else-if="planReviewContract" class="pr-coverage-section">
           <div v-for="verification in planReviewContract.verifications" :key="verification.key" class="pr-verification-card">
@@ -360,6 +387,7 @@
                 <span class="pr-clause-span">[{{ clause.goal_source_span[0] }}-{{ clause.goal_source_span[1] }}]</span>
               </div>
               <div class="pr-clause-channels">
+                <el-tag v-if="clause.spec" size="small" type="warning" effect="plain">{{ clause.spec.predicate }}:{{ clause.spec.target }}</el-tag>
                 <el-tag v-for="ch in clause.channels" :key="ch" size="small" type="info" effect="plain">{{ ch }}</el-tag>
               </div>
             </div>
@@ -428,7 +456,7 @@
 
   <!-- ═══════════ 报告详情 ═══════════ -->
   <el-dialog v-model="reportDetailVisible" title="测试报告详情" width="720px" top="3vh">
-    <ReportDetail :report="selectedReport" />
+    <ReportDetail :report="selectedReport" @replay="onReplayReport" />
   </el-dialog>
 
   <!-- ═══════════ 知识库新增/编辑对话框 ═══════════ -->
@@ -563,10 +591,22 @@ const visionTestResult = ref(null);
 const planReviewVisible = ref(false);
 const planReviewGoal = ref("");
 const planReviewPages = ref([]);
-const planReviewVerifications = ref([]);
-// 与 planReviewVerifications 平行：verification 项若为对象 {claim, spec}，
-// 这里存对应 index 的 spec（plan_review_node 重建 contract 时需回传以保留 M4a 自动证据）。
-const planReviewSpecs = ref([]);
+// F3（agent_evolution_plan §5）：审阅编辑行保留完整结构，不再把对象项拍平成
+// 字符串（旧写法会把 {"claim","clauses":[...]} 的嵌套结构在写回时销毁）。
+// 行草稿：{claim, spec:{predicate,target,expected}, clauses:[{claim, spec}] | null}
+// spec 用内部草稿三字段（空 predicate ⇒ 无 spec），确认时归一化回传。
+const planReviewRows = ref([]);
+// §9 验收2：reused_plan=历史复用提案（头部标签「来源=reused plan」）
+const planReviewProposalSource = ref("");
+const SPEC_PREDICATES = [
+  "page_is",
+  "page_contains",
+  "element_exists",
+  "element_absent",
+  "element_disabled",
+  "element_checked",
+  "list_count",
+];
 const planReviewHints = ref([]);
 const planReviewSubmitting = ref(false);
 const planReviewUserRequest = ref("");
@@ -577,10 +617,61 @@ const newPageName = ref("");
 
 function addReviewPage() {
   const name = newPageName.value.trim();
-  if (name && !planReviewPages.value.includes(name)) {
-    planReviewPages.value.push(name);
-  }
+  if (planReviewPages.value.includes(name)) return;
+  if (!name) return;
+  planReviewPages.value.push(name);
   newPageName.value = "";
+}
+
+// ── F3 行草稿转换：后端三种形态 ⇄ 前端编辑草稿 ──
+// 后端形态：字符串 | {"claim","spec"} | {"claim","clauses":[{claim,spec}]}
+function _draftSpec(spec) {
+  const s = spec && typeof spec === "object" ? spec : {};
+  return {
+    predicate: s.predicate || "",
+    target: s.target ?? "",
+    expected:
+      s.expected === null || s.expected === undefined ? "" : String(s.expected),
+  };
+}
+
+function _toRow(v) {
+  if (typeof v === "string") return { claim: v, spec: _draftSpec(null), clauses: null };
+  const clauses =
+    Array.isArray(v.clauses) && v.clauses.length
+      ? v.clauses.map((c) =>
+          typeof c === "string"
+            ? { claim: c, spec: _draftSpec(null) }
+            : { claim: c.claim || "", spec: _draftSpec(c.spec) },
+        )
+      : null;
+  return { claim: v.claim || "", spec: _draftSpec(v.spec), clauses };
+}
+
+// 空 predicate ⇒ 无 spec；expected 按谓词词汇表归一化（checked→bool / count→number）
+function _normalizeSpec(draft) {
+  const pred = String(draft?.predicate || "").trim();
+  if (!pred) return null;
+  const s = { predicate: pred, target: String(draft.target || "").trim(), expected: null };
+  if (pred === "element_checked") s.expected = String(draft.expected).trim() === "true";
+  else if (pred === "list_count") {
+    const n = Number(draft.expected);
+    if (Number.isFinite(n)) s.expected = n;
+  }
+  return s;
+}
+
+function _fromRow(row) {
+  const claim = String(row.claim || "").trim();
+  if (!claim) return null;
+  const spec = _normalizeSpec(row.spec);
+  if (row.clauses) {
+    const clauses = row.clauses
+      .map((c) => ({ claim: String(c.claim || "").trim(), spec: _normalizeSpec(c.spec) }))
+      .filter((c) => c.claim);
+    if (clauses.length) return { claim, clauses };
+  }
+  return spec ? { claim, spec } : claim;
 }
 
 // 契约收敛：前端不再维护第二份 span/channel 算法。contract 与 span 校验结果
@@ -778,7 +869,7 @@ function handleEvent(data) {
       }
       break;
     case "status": wp?.addEntry({ type: "log", text: typeof content === 'object' ? JSON.stringify(content) : String(content) }); refreshSnapshot(); break;
-    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; const _rawV = pd.verification || content.verification || []; planReviewVerifications.value = _rawV.map(v => typeof v === "string" ? v : (v.claim || "")); planReviewSpecs.value = _rawV.map(v => (v && typeof v === "object" ? (v.spec || null) : null)); planReviewHints.value = pd.hints || []; planReviewUserRequest.value = content.user_request || ""; planReviewContract.value = content.verification_contract || null; planReviewSpanStatus.value = content.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
+    case "plan_review": { const pd = content.plan || content; planReviewGoal.value = pd.goal || content.goal || ""; planReviewPages.value = pd.target_pages || content.pages || []; const _rawV = pd.verification || content.verification || []; planReviewRows.value = _rawV.map(_toRow); planReviewProposalSource.value = content.proposal_source || ""; planReviewHints.value = pd.hints || []; planReviewUserRequest.value = content.user_request || ""; planReviewContract.value = content.verification_contract || null; planReviewSpanStatus.value = content.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; if (content.thread_id) currentThreadId.value = content.thread_id; wp?.addEntry({ type: "planner", icon: "🎯", text: planReviewGoal.value }); break; }
 
     case "plan_ready": wp?.addEntry({ type: "planner", icon: "🎯", text: content.goal || content.steps || "?" }); break;
     case "stream_token": wp?.onToken(); break;
@@ -803,7 +894,7 @@ function handleEvent(data) {
 
     case "need_human_approval": currentThreadId.value = content.thread_id || currentThreadId.value; humanQuestion.value = content.question || "是否继续执行?"; humanStep.value = content.step || 0; humanAction.value = content.action || ""; humanDialogVisible.value = true; executing.value = false; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认: " + humanQuestion.value }); break;
     case "result":
-      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; const _rawV2 = planData.verification || intr.verification || []; planReviewVerifications.value = _rawV2.map(v => typeof v === "string" ? v : (v.claim || "")); planReviewSpecs.value = _rawV2.map(v => (v && typeof v === "object" ? (v.spec || null) : null)); planReviewHints.value = planData.hints || []; planReviewUserRequest.value = intr.user_request || ""; planReviewContract.value = intr.verification_contract || null; planReviewSpanStatus.value = intr.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
+      if (content.status === "need_human" || content.interrupt) { const intr = content.interrupt || content; if (intr.type === "plan_review") { const planData = intr.plan || {}; planReviewGoal.value = planData.goal || intr.goal || ""; planReviewPages.value = planData.target_pages || intr.pages || []; const _rawV2 = planData.verification || intr.verification || []; planReviewRows.value = _rawV2.map(_toRow); planReviewProposalSource.value = intr.proposal_source || ""; planReviewHints.value = planData.hints || []; planReviewUserRequest.value = intr.user_request || ""; planReviewContract.value = intr.verification_contract || null; planReviewSpanStatus.value = intr.span_validation || { valid: true, gaps: [], overlaps: [] }; isEditingDraft.value = false; planReviewVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "⏸", text: "需要确认测试目标" }); } else { humanQuestion.value = intr.question || "是否继续?"; humanStep.value = intr.step || 0; humanAction.value = intr.action || ""; humanDialogVisible.value = true; wp?.addEntry({ type: "log", icon: "⏸", text: "需要人工确认" }); } executing.value = false; stopping.value = false; /* keep currentThreadId for sendHumanDecision */ break; } { const pendingIds = content.pending_identities || []; if (content.status === "success" && pendingIds.length > 0) { const level2 = pendingIds.filter(p => p.level === 2); if (level2.length > 0) { identityPending.value = level2; identityDialogVisible.value = true; currentThreadId.value = content.thread_id || ""; wp?.addEntry({ type: "log", icon: "🔍", text: "发现 " + level2.length + " 个待确认的元素映射" }); } } } executing.value = false; stopping.value = false; currentThreadId.value = "";
       // 工具调用已通过 tool_start/tool_end 事件实时推送，无需 fallback
       wp?.addResult(content.execution_status || "error", content.test_verdict || "inconclusive", content.conclusion || content.message || "", content.verification_results || []); refreshSnapshot(); loadReports();
       break;
@@ -843,7 +934,7 @@ function connectWS() {
 
 // ═══════════ 一键执行 ═══════════
 
-async function startRun(text) {
+async function startRun(text, opts = {}) {
   if (!text || !text.trim()) return;
   text = text.trim();
   if (!deviceOnline.value) {
@@ -866,7 +957,8 @@ async function startRun(text) {
 
   if (wsConnected.value && ws && ws.readyState === WebSocket.OPEN) {
     console.log("[stop-debug] startRun -> WS send type=run, msg=", text.slice(0, 60));
-    ws.send(JSON.stringify({ type: "run", message: text }));
+    // R2（§10）：replay=true 时后端解锁 direct 准入（报告页「回放」按钮）
+    ws.send(JSON.stringify({ type: "run", message: text, replay: !!opts.replay }));
     console.log("[stop-debug] startRun WS sent. currentThreadId (will be set by run_started via broadcast)=", currentThreadId.value);
     return;
   }
@@ -876,7 +968,7 @@ async function startRun(text) {
     const res = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, replay: !!opts.replay }),
     });
     const data = await res.json();
     const payload = data.data || data;
@@ -889,6 +981,15 @@ async function startRun(text) {
   } catch (e) {
     handleEvent({ type: "error", content: String(e) });
   }
+}
+
+// ═══════════ 报告页回放（R2 §10：replay=true 解锁 direct） ═══════════
+
+function onReplayReport(report) {
+  if (!report || !report.user_request) return;
+  reportDetailVisible.value = false;
+  if (workspaceRef.value) workspaceRef.value.addEntry({ type: "log", icon: "▶", text: `回放报告 ${report.run_id || ""}` });
+  startRun(report.user_request, { replay: true });
 }
 
 // ═══════════ 手动停止 ═══════════
@@ -1039,14 +1140,10 @@ async function confirmPlan(action) {
   executing.value = true;
 
   // 契约收敛：前端不重建 contract（第二份算法已删），只回传编辑后的 verification。
-  // verification 项兼容两种形态：对象 {claim, spec}（保留 M4a 自动证据的 spec）或纯字符串。
-  const editedVerifications = planReviewVerifications.value
-    .map((claim, i) => {
-      const c = typeof claim === "string" ? claim.trim() : String(claim ?? "").trim();
-      if (!c) return null;
-      const spec = planReviewSpecs.value[i] || null;
-      return spec ? { claim: c, spec } : c;
-    })
+  // F3：行草稿按原始形态回传——嵌套行 {claim, clauses:[{claim,spec}]}、
+  // 平面对象 {claim, spec}、纯字符串，三种形态后端 build_verification_contract 全兼容。
+  const editedVerifications = planReviewRows.value
+    .map(_fromRow)
     .filter(Boolean);
   const resumePayload = action === "cancel" ? "cancel" : {
     action: "confirm",

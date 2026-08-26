@@ -8,6 +8,8 @@
           <span>模式: {{ report.execution_mode || 'explore' }}</span>
           <span>阶段: {{ report.lifecycle_state || 'Terminal' }}</span>
           <span>{{ (report.created_at || '').replace('T', ' ').substring(0, 19) }}</span>
+          <!-- R2（§10）：带 replay 意图重跑同请求，复用命中即直通 direct -->
+          <el-button size="small" type="primary" plain class="rd-replay-btn" @click="$emit('replay', report)">▶ 回放</el-button>
         </div>
       </div>
     </div>
@@ -160,6 +162,7 @@
 import { computed, ref } from 'vue'
 
 const props = defineProps({ report: { type: Object, default: null } })
+defineEmits(['replay'])
 const actions = computed(() => props.report?.actions || [])
 const evidence = computed(() => props.report?.evidence || [])
 const modeTransitions = computed(() => props.report?.mode_transitions || [])
@@ -307,6 +310,7 @@ function screenshotUrl(path) {
 .rd-banner-icon { font-size: 40px; }
 .rd-banner-title { font-size: 22px; font-weight: 700; color: var(--text-primary); }
 .rd-banner-meta { display: flex; gap: 16px; font-size: 13px; color: var(--text-secondary); margin-top: 4px; }
+.rd-replay-btn { margin-left: auto; }
 .rd-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
 .rd-metric-item { background: #fafbfc; border: 1px solid var(--line-light); border-radius: var(--radius-sm); padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; }
 .rd-metric-label { font-size: 12px; color: var(--text-muted); }

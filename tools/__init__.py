@@ -38,6 +38,7 @@ from tools.element_match import (
 )
 from tools.device_ops import (
     check_desktop_mode,
+    clear_app_data,
     copy,
     launch_app,
     open_app_permission_settings,
@@ -434,6 +435,10 @@ AGENT_TOOLS: list[Any] = [
     toggle_auto_rotate,
     check_desktop_mode,
     launch_app,
+    # prompt 驱动的按需清数据（agent_common「冷启动意图识别」节引用）：
+    # 原语与防误触确认早已实现（device_ops），注册曾随自动 fixture 移除而脱落，
+    # 导致 agent 被提示调用一个工具箱里不存在的工具、只能退化为 force_fresh 冷启动。
+    clear_app_data,
     open_app_permission_settings,
     visual_check,
     vision_tap,

@@ -4,11 +4,13 @@
 > 来源：v1 分支全量代码现状核对 + 8/21-8/24 真实 run 复盘 + 外部评审四轮反馈闭环。
 > 文档定位：本 Plan 是**唯一活跃的实现规划**；phase0 文档作为「第零批只读摸底 + 复测」交付物保留引用，不再独立演进规划。
 
+> 🛑 **核心原则护栏（改任何条目前必读 §0）**：P1 人类测试员模型 / P2 契约收敛代码管稳 / P3 观测先行不考古 / P4 诚实兜底不假装管住。任何改动若与四条原则冲突即视为设计错误，除非在改动处显式标注「豁免：违反 Px，理由…」并经评审确认。详见 §19 修改护栏。
+
 ---
 
 ## 0. 核心原则（不可违反）
 
-本 Plan 所有条目都必须在这四条原则下成立，任何一条与原则冲突即视为设计错误：
+本 Plan 所有条目都必须在这四条原则下成立，任何一条与原则冲突即视为设计错误。**每次修改本 Plan 或按本 Plan 写代码前，先逐条自检下方「修改前自检清单」。**
 
 **P1 — 人类测试员模型（产品形态锚）**
 - 测试员脑子里的"计划"是隐式的：知道要测什么 → 看当前是否满足 → 顺手做（一次感知、批量判定多个点）→ 满足就过 → 全过出报告。
@@ -27,6 +29,13 @@
 **P4 — 诚实兜底，不假装管住**
 - 覆盖不到的主战场（spec:null 状态类 claim）承认只能由 prompt 软约束 + evaluator 的 `unverified` 标记兜底并暴露给人工复核，不在代码里假装管住。
 - n=1 样本不作趋势结论；均值结论必须等埋点上线后多轮聚合。
+
+### 修改前自检清单（每条改动逐条过）
+- [ ] **P1**：是否让 agent 更像"隐式计划 + 顺手做 + 跑过一次就复用"？是否新增了独立 plan 阶段产物 / 把验证拆得比人类步骤还碎 / 削弱了记忆复用？
+- [ ] **P2**：确定性判定是否仍由代码不变量保证（非 prompt 软约束）？是否又往 prompt 堆了本可下沉为工具契约/报错信息的规则？
+- [ ] **P3**：是否先有埋点再下性能/正确性结论？是否引入需要手工翻 log 考古才能定位的增量？时间账/命中率是否分桶可观测？
+- [ ] **P4**：是否对覆盖不到的主战场诚实标记 `unverified` 而非假装管住？是否用 n=1 样本下了趋势结论？
+- 若任一格打 × 且无法豁免 → 该改动**不通过**；若必须破例，在改动处写「豁免：违反 Px，理由…，评审确认人…」。
 
 ---
 
@@ -100,6 +109,8 @@
 
 Gate-B 零样本 → 误报率无样本可评。**按 P3 观测不足不动**：F2 不改 `_find_elements` 共用入口；等 F4 抬填充率、list_count 出现真实样本后再评估是否只动 list_count 分支。动之前必跑全量 pytest 留基线（phase0 已记）。
 
+> **解锁指针（防设计细节丢失）**：解锁时**必须**按 `code_review_findings_plan_20260822.md` 的 §F2 完整修法执行，不可凭新 Plan 这半句重做——旧 F2 节的完整设计（叶子口径计数、锚点多匹配→None「拿不准不写」、保持 `n==0→unknown` 不对称、四条验收含「容器+子元素同名」锁定用例）只存在于该旧文档，本 Plan 不再复述。届时从旧文档搬设计，不要改写。
+
 ---
 
 ## 5. F3（P1）：clause 合并到"人类步骤级"
@@ -119,6 +130,29 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
 1. 「勾选周一,周三,周五后显示3节课」经新格式 → 1~2 条完整语义 clause；
 2. 旧字符串输入回归不破；
 3. `validate_contract_spans` 适配无 gap/overlap 误报。
+
+> **实施记录（2026-08-25，真机用例 168 复盘：手段性 clause 死回环）**：实测暴露
+> 规划期粒度硬约束的自相矛盾点——预期结果原文「图库导入入口可点击」被「几句
+> 预期出几项」逼成单列验证项，而谓词表只有负向 `element_disabled`，正向能力
+> 永远拿不到权威 PASS → agent 3 次补证无果仍被待验证清单驳回 DONE，从已到达的
+> 图片选择器被逼导航回课程表页反复补证直至取消（342s / 45.7 万 token /
+> inconclusive）。两处修正：
+> ① planner.txt——`element_disabled` 收窄为**仅用例明确要求验证置灰/不可点等
+> 负向终态时使用**；正向能力预期（可点击/可进入）必须转写为可观察后果
+> （page_is 目标页 / element_exists 弹出物）并与同结果的预期句合并（项数少于
+> 预期句数属正确）；删除原「disabled() FAIL 自行判断」的走不通的 workaround。
+> ② 待验证清单诚实兜底（`_clause_evidence_hints`）：≥3 条匹配证据仍 unknown 的
+> clause 不再进清单、不再驳回 DONE；最终报告仍如实 unknown+review_required，
+> F1 零证据漏验判定不变。顺带修正原实现只列「整项 passed」下 clause 的漏报
+> （168 的 v1.0 已通过却未列入勿重复验证）。
+> 回归：tests/test_clause_evidence_hints.py 4 用例；全套 400 passed。
+
+### plan_review 前端适配（独立一等任务，与 F3 同批交付 ⚠️ 旧 Plan 曾掉成半句话，此处复位）
+verification 从字符串升级为 `{"claim","clauses":[...]}` 嵌套对象（含 spec 结构）后，**前端展示/编辑层必须同步改造**，否则人工审的是旧格式、编辑写回会破坏新结构。依赖前端的场景在本 Plan 里反而增多：
+- F3 嵌套对象展示/编辑；
+- R1 复用命中时审阅态需展示**历史契约**（标注 `来源=reused plan`）与当前快照 diff；
+- spec 编辑本身需要结构化 UI。
+**工作量按独立前端任务排期，不附属于 F3 代码项**——挂第三批与 F3 同批交付。
 
 ---
 
@@ -146,7 +180,10 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
 - 抽取 `tests/test_verification_contract.py` 已有的 `FakePerceiver/FakeDevice` 为共享测试基建（勿从零建）；
 - 从历史 passed trace 提炼「步骤→工具调用→页面快照」脚本入库（歧义/高频/恢复三类）；
 - CI 钩子：核心改动跑回放集 diff（verdict / clause 状态 / step 数 / 证据通道）。
+- 验收：人为注入一个回归 bug（改 matcher 或 planner 规则使已知用例 verdict 翻转），回放集必须红灯——这是回放集有效性的唯一反证手段（缺口4 补回，旧 Plan 原有一条）。
 - 边界诚实（P4）：mock 回放验不出感知竞态，保的是"决策/判定逻辑回归"不是"设备时序"。
+
+> **实施记录（2026-08-25，最小版）**：`tests/replay_harness.py`（共享基建：ScriptedDevice/ScriptedPerceiver/ScriptedChatModel/FakeKB/FakePlanDB + 整图 orchestrator.start 回放入口，R1 复用种子走真实生产路径）+ `tests/test_f5_replay_regression_set.py` 四测（高频 direct 全链零 LLM 通过 / 恢复权威 FAIL→failed / 歧义 unknown→R3 收口送 agent→inconclusive / matcher 恒 None 注入反证→红灯）。trace→脚本自动提炼**暂缓**（先手写 3 类场景验证体系有效性，P3 观测先行）。附带修复：自动 spec 证据的 `element_disabled` fact 补 `expected_disabled` 键，接通差异报告「期望 vs 实际」提取（此前自动证据路径期望侧恒空）。
 
 ---
 
@@ -157,6 +194,8 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
 | `_determine_execution_status` 兜底过松（`len(history)>=3` 即 completed） | 收窄：无 terminal_verdict/conclusion 且 step<阈值时维持 error | P2 |
 | agent_node 双 `current_app()` RPC | 合并为一次复用 | P2 |
 | prompt 补丁化倾向 | 场景规则下沉工具契约；**本次新增的"清单✓后禁重复操作""视觉断言禁自造细节"等 prompt 规则，待 F1/F3 代码侧修复后下沉，不再往 prompt 堆**（F6 反模式实证） | P2 |
+
+> **实施记录（2026-08-25）**：①兜底收窄为「≥3 步且至少一步 success/continue 才 completed」——纯失败 3 步崩溃回归 error（reporter 已有「证据 decisive 时 error→completed」纠偏路径兜住误伤）；②感知块两次 current_app() 合并为一次复用。③prompt 规则下沉暂缓：F1/F3 刚落地，待真实 run 观察确认无回归后再逐条下沉（P3 观测先行），避免同时动两个变量。
 
 ---
 
@@ -175,9 +214,17 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
 
 ### 验收
 1. 同一用例第二次运行（replay=true 且复用命中）：planner LLM 调用为 0 **且** trace 记 `auto_approved_reason=reuse_hit`、无 plan_review interrupt 等待、`execution.mode=direct`；
-2. 低置信/无命中：走现状 planner → plan_review 人工审，planner LLM 调用 ≥1；
+2. 低置信/无命中：走现状 planner → plan_review 人工审，planner LLM 调用 ≥1，**前端审阅态须标注提案「来源=reused plan」（或「来源=new plan」区分）——人工审场景无 trace 自动通过审计，这是唯一让审阅者知道契约是历史复用还是新规划的途径**；
 3. 用户在 plan_review 修改契约 → 走现状路径，不误用旧 plan；
 4. 「跑一次 + N 次回放」场景：N 段均无人工等待（自动通过留审计），run 开头段归零。
+
+> **实施记录（2026-08-25，R6 转型期补丁）**：`_try_plan_reuse` 原先在候选循环里
+> 首个逐字命中即返回，同请求并存旧口径脏键 plan 与 R6 后净键 plan 时，召回顺序
+> 可能让旧沉淀遮蔽新沉淀（mode_selection 真实检索本就按 env_score 择优，此处不
+> 一致）。改为：先收集全部合法候选，优先返回 `env_compatible=True` 者；全不兼容
+> 才回落首个命中 —— 契约照常提案、仅收回自动过审落人工确认（§9③ 自愈不变）。
+> 附带把 `_current_environment_key_weak` 提到循环外（每候选重复调 current_app → 1 次）。
+> 回归：tests/test_plan_reuse_r1.py 新增脏键遮蔽 / 全不兼容回落两用例；全套 396 passed。
 
 ---
 
@@ -217,7 +264,21 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
 |---|---|---|
 | R4 | **小步①（前置第二批，R2/R3 地基）**：沉淀时剥离全局 `index`，归一化为 `rid`/`path_contains`/`label`——实证 113252 沉淀 57 条动作里 9 条带全局 index（如 `[1] click input={"index":3}`），index 跨快照漂移是已知道的 R2/N2 教训，不先归一化 direct 回放会频繁误命中→降级 guided，R2/R3 验收（二跑 direct、llm≈0）不稳定。**小步②（留第五批）**：单动作 RPC 3→2；precondition activity 短名宽松匹配 | ①UI 微变（元素增删致 index 漂移）replay 仍命中；②RPC 3→2 |
 | R5 | 沉淀时启发式剪枝 no-op 绕路（page_after==前动作 page_before 且后续不依赖），产新版本 plan 不原地改 | 含绕路 trace 沉淀后动作数明显减少 |
+
+> **实施记录（2026-08-25）**：R4② 单动作 current_app 3→2（after 查一次，postcondition 校验与事件落盘共用；工具返回非异常 ERROR 时不再覆盖其原始错误信息——保留更具体的失败原因）+ precondition activity 短名宽松匹配（`.MainActivity` vs 全名短名相等即满足，package 仍严格）。R5 落地**保守版**（plan_extractor._prune_detour_actions）：仅剪「执行前后台无位移且有同款后续重试」的试错链（末次同款保留）；弹窗类不改变 current_app 的关键动作天然不被命中；绕路后未原样重试的 detour 暂不剪（宁漏剪不误剪，误剪会永久删掉 plan 必要动作），待真实 trace 数据再评估放宽。单测 tests/test_batch5_f6_r4_r5.py（11 测）。
 | R6 | 环境键双侧统一为「目标 App 冷启动后首屏 package+activity」 | 换桌面 launcher 不影响匹配 |
+
+> **实施记录（2026-08-26，回放起点归位）**：真机回放 168 实测 direct 首动作即降级——
+> 上轮遗留的系统照片选择器（他包窗口）盖在顶层，`launch_app(force_fresh)` 只杀目标
+> 包杀不掉它，到达契约 package_matched=False 误判失败。护栏「首败降级」行为正确，
+> 根因是起点脏。修法落在 launch_app 工具内（回放/复跑/探索三路径同享）：启动后检测
+> 到「他包在前台」→ 按 HOME 归位并重试启动一次（evidence 增 `foreground_healed`），
+> 仍不达才如实 ERROR。另发现 clear_app_data 工具早已实现且有防误触确认，但注册曾随
+> 自动 fixture 移除而脱落 → prompt 引用了工具箱里不存在的工具，「清空APP数据」前提被
+> 静默跳过；已重新注册 + tests/test_clear_app_data_tool.py 锁住。单测
+> tests/test_launch_app_foreground_heal.py（3 测）；全套 407 passed。
+> 待办：存量 plan（2ebd0903 等）首动作仍是 force_fresh 版本，未含 clear_app_data；
+> 需文本微调重沉淀一次，让「清空APP数据」类前提真正进契约。
 
 ---
 
@@ -238,6 +299,12 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
 1. 一轮 run 的 trace 含三段独立字段，且三段之和 == duration_seconds；
 2. 视觉调用耗时进 trace/metrics，可画分布。
 
+> **实施记录（2026-08-25）**：真机复用跑（168 复跑）实测发现 plan_review_wait
+> 残留 bug——auto-approve 路径（R1 reuse_hit）不经过 interrupt、不写计时器，
+> reporter 读到 ctx 上一跑的旧值，把零等待的复用跑虚报成 32s。已在
+> `_reset_run_scoped` 清零 `_plan_review_wait_seconds` / `_plan_review_entered_at`。
+> 全套 400 passed。
+
 ---
 
 ## 14. 视觉通道治理（回应"视觉贵"——半同意建议）
@@ -257,11 +324,16 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
    list_count 零样本。结论已吸收进本 Plan F1/F2/F4。
 
 第一批（正确性护栏 + 观测基建 + 粒度收敛）：
-   F1 通道收窄（命中率达标后开闸）
+   **批内顺序必须钉死（缺口3 隐雷 + 观测先行 P3）**：
+    ① planner.txt 粒度硬约束先落地（它改变 planner 写什么 spec）
+    → ② **最小埋点先落地**（F4 第 3 条：hit / dedup-skip / None+原因码 各打一行；phase0 已实证 `evidence_events` 不持久化 auto/authoritative、`_match_spec` 返回 None 无痕——埋点不先装，后续真机跑采不到任何分桶数据，只能再跑一轮白付设备时间）
+    → ③ 真机跑若干条采集样本（此时埋点已生效，且量到的是新粒度行为，非旧行为）
+    → ④ 分桶统计，对照 ≤30% 判定是否开闸 F1
+    顺序不可颠倒：先粒度（决定采什么）→ 再埋点（决定采得到）→ 再真机（采样本）→ 再判定（用样本）。其中 ②③ 先后是 P3「观测先行」的硬要求。
+   F1 通道收窄（按上述 ④ 判定后开闸）
    → 同步最小埋点（F4 并入：hit/dedup-skip/None 分桶）
    → 时间账三段拆分（§13，观测先行 P3）
-   → **planner.txt 粒度硬约束（10 分钟级，问题3）**：验证项数 ≤ 用例预期句数、禁止「可编辑/入口」类子特征项、交互验证只取一个代表样本（须在 R1 大量沉淀 plan 之前落地，否则细粒度契约先沉淀被永久复用）
-   → F2 搁置（Gate-B 零样本）
+   → F2 搁置（Gate-B 零样本，解锁按 §4 指针）
 
 第二批（记忆复用 —— 你的核心能力，对应 P1 人类模型）：
    **R4 小步① index 归一化（前置地基）**
@@ -270,8 +342,9 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
    → R3 direct 收尾零 LLM（只重演导航动作，验证交收尾自动判定；以 F1 命中率达标为前提）
    → verify: 同类用例二跑 direct、llm≈0、planner_elapsed=0、plan_review 无等待
 
-第三批（人类步骤级合并）：
+第三批（人类步骤级合并 + 前端适配）：
    F3 clause 合并到"一个操作顺带验多点"（复用 F4 对象格式）
+   → **plan_review 前端适配（独立一等任务，§5 末，与 F3 同批交付）**
 
 第四批（迭代速度基建）：
    F5 录制回放回归集 → verify: 3 条 trace 回放一致
@@ -285,6 +358,18 @@ F3 只管**机械切分**（代码侧 `_CLAUSE_BOUNDARY` 把一句话切碎）�
 - **R1 是 R2/R3 前置**：复用命中后才能跳过 planner，direct 匹配才通。
 - **F3 依赖 F4 对象格式**：随其后。
 - **观测基建（§13）与第一批并行**：不阻塞任何功能，但每批验收都依赖它，优先做。
+
+---
+
+## 19. 修改护栏（防偏离核心原则）
+
+本 Plan 是活文档，会随实现推进持续修订。为防止修订悄悄违背 §0 四条原则，定此护栏：
+
+1. **任何条目增删改，必须在改动处或 PR 说明里过一遍 §0 自检清单**；打 × 的条目要么改回，要么显式「豁免：违反 Px，理由…，评审确认人…」。
+2. **原则本身只可加严、不可放宽**：若发现某条原则表述不够准，应改写得更严，不得改写为「允许例外」的软约束。确需新增原则，追加 P5+，不得删改 P1-P4 的硬约束语义。
+3. **破坏性改动的连锁要求**：凡改动触及 R 系列（记忆复用）、F1（通道收窄）、§13（三段埋点）中任意一项，必须同步检查另外两项是否仍自洽——三者是「几十秒目标」的三角基石，任一动都可能影响其余（例：R1 auto-approve 生效必须同时保证 plan_review 真的跳过，否则 §16 目标落空）。
+4. **旧文档不再回填**：设计细节若需从 superseded 旧文档（code_review_findings_plan / phase0）引用，以「指针 + 不改写」方式搬入（见 §4 解锁指针），不得转述失真。
+5. **评审闭环**：本 Plan 每轮外部评审提出的「事实核对 / 自相矛盾 / 排序问题」类反馈，必须落到对应章节并保留「why」注解（如 §9 注记、§15 批内顺序注记），方便后人理解约束来源，不纯搬结论。
 
 ---
 

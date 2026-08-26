@@ -465,6 +465,8 @@ _set_kb_for_routes(_kb)
 class RunRequest(BaseModel):
     message: str
     session_id: str = "default"
+    # R2（plan §10）：显式回放意图 —— 前端报告页「回放」按钮置 true。
+    replay: bool = False
 
 
 class HumanDecisionRequest(BaseModel):
@@ -521,6 +523,7 @@ async def run_test(request: RunRequest):
         user_request=request.message,
         app_package=app_package,
         app_name=app_name,
+        replay=request.replay,
     )
     logging.getLogger(__name__).info(
         "[stop-debug] HTTP /api/run orchestrator.start returned, status=%s tid=%s",
@@ -547,6 +550,7 @@ async def run_test_stream(request: RunRequest):
             user_request=request.message,
             app_package=app_package,
             app_name=app_name,
+            replay=request.replay,
         ):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -692,6 +696,8 @@ async def websocket_chat(websocket: WebSocket):
 
             if msg_type == "run":
                 user_input = data.get("message", "")
+                # R2（§10）：回放意图透传（报告页「回放」按钮 → replay=true 解锁 direct）
+                replay_flag = bool(data.get("replay", False))
                 # 设备连接前置检查
                 if _device is None:
                     await ws_manager.send(
@@ -709,6 +715,7 @@ async def websocket_chat(websocket: WebSocket):
                     user_request=user_input,
                     app_package=app_package,
                     app_name=app_name,
+                    replay=replay_flag,
                 )
                 _ws_log.info(
                     "[stop-debug] WS run -> orchestrator.start returned, status=%s tid=%s",

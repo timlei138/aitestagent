@@ -47,6 +47,25 @@ except Exception:
         return wrapper(func) if func else wrapper
 
 
+def _timed_multimodal(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    """视觉调用耗时埋点（agent_evolution_plan §13/§14）：先观测分布，不设阈值。
+
+    包一层只为打一行耗时日志，透传全部参数；purpose 随日志透出便于分通道
+    （visual_check / locate_tap / click_and_check）画分布。
+    """
+    from tools import _run_multimodal_from_context  # 延迟 import 避免循环依赖
+
+    _t0 = time.time()
+    try:
+        return _run_multimodal_from_context(*args, **kwargs)
+    finally:
+        logger.info(
+            "[vision-timing] purpose=%s vlm_elapsed=%.1fs",
+            str(kwargs.get("purpose", "") or ""),
+            time.time() - _t0,
+        )
+
+
 @tool
 def visual_check(
     description: str, verification_key: str = "", clause_id: str = ""
@@ -102,7 +121,7 @@ def visual_check(
         "- 不要以'这是疑问句无法判断'为由拒绝，始终提取截图中的视觉事实\n"
         f"描述: {description}"
     )
-    result = _run_multimodal_from_context(
+    result = _timed_multimodal(
         prompt=prompt,
         image_base64=snap.image_base64,
         purpose="visual_check",
@@ -180,7 +199,7 @@ def detect_overlay() -> str:
         "只返回 JSON，字段: has_overlay(boolean), overlay_type(toast/dialog/popup/sheet/unknown/none),"
         " reason, evidence, blocking(boolean)。"
     )
-    result = _run_multimodal_from_context(
+    result = _timed_multimodal(
         prompt=prompt,
         image_base64=snap.image_base64,
         purpose="detect_overlay",
@@ -1209,7 +1228,7 @@ def vision_tap(
         )
 
         # 6) 调用 vision
-        res = _run_multimodal_from_context(
+        res = _timed_multimodal(
             prompt,
             img_base64,
             purpose="locate_tap",
@@ -1334,7 +1353,7 @@ def vision_tap(
                 f"请根据截图判断：{verify}。"
                 f'只返回 JSON: {{"decision": "yes/no", "reason": str, "evidence": str}}'
             )
-            vr = _run_multimodal_from_context(
+            vr = _timed_multimodal(
                 verify_prompt,
                 snap2.image_base64,
                 purpose="visual_check",
@@ -1462,7 +1481,7 @@ def click_and_check(
         f"观察截图，{check_description}。"
         f'只返回 JSON: {{"decision": "yes/no", "reason": str, "evidence": str}}'
     )
-    res = _run_multimodal_from_context(
+    res = _timed_multimodal(
         prompt,
         snap.image_base64,
         purpose="click_and_check",

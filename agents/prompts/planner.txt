@@ -4,7 +4,7 @@
 只输出一个 JSON 对象，不要 markdown、代码块、解释文字。
 
 ## 输出格式
-{"goal":"一句话测试目标","app_package":"com.example","app_name":"App","target_pages":["需到达的页面"],"verification":["纯字符串验证条件",{"claim":"验证条件","spec":{"predicate":"page_is","target":"页面Activity短名","expected":null}}],"hints":["导航提示"],"parameter_slots":[],"action_semantics":["动作语义"]}
+{"goal":"一句话测试目标","app_package":"com.example","app_name":"App","target_pages":["需到达的页面"],"verification":["纯字符串验证条件",{"claim":"验证条件","spec":{"predicate":"page_is","target":"页面Activity短名","expected":null}},{"claim":"一句含多个终态的预期","clauses":[{"claim":"终态子句1（完整语义单元）","spec":{"predicate":"element_disabled","target":"控件真实文本","expected":null}},{"claim":"终态子句2（完整语义单元）","spec":null}]}],"hints":["导航提示"],"parameter_slots":[],"action_semantics":["动作语义"]}
 
 ## 字段说明
 - goal: 测试目标（如 "验证设置中切换时区后日期格式正确变化"）
@@ -18,8 +18,8 @@
   - `page_contains(text)`：页面文本/元素文本含 text
   - `element_exists(target)`：View Tree 找到 resource-id 或文本为 target 的元素
   - `element_absent(target)`：View Tree 找不到 target（找到反而矛盾→FAIL）
-  - `element_disabled(target)`：找到的元素 enabled==False（enabled==True→FAIL）——**最常见**，置灰按钮、未选课程表时的"设为当前课程表"等；agent 侧用 `assert_behavior_effect(expected="disabled(控件名)")` 验证（见 agent_common「状态类 claim」节）
-  - （enabled 态**不要**单列谓词：`element_enabled` 无对应 assert 工具、会落空 channel。需要表达"未置灰/可交互"时，按 agent_common「状态类 claim」节的 `disabled()` FAIL 非权威 + `[SELECTED]`/`[DISABLED]` 标记自行判断，不必单列验证点）
+  - `element_disabled(target)`：找到的元素 enabled==False（enabled==True→FAIL）——**仅当用例原文明确要求验证「置灰/不可点/不可用」这类负向终态时才使用**（如「未选课程表时保存按钮应置灰」「删除后入口不可点」）；agent 侧用 `assert_behavior_effect(expected="disabled(控件名)")` 验证（见 agent_common「状态类 claim」节）
+  - （正向能力表述**没有**对应谓词：`element_enabled` 无底层 assert 工具、永远拿不到权威 PASS 证据。「可点击/可进入/可打开/未置灰」这类**手段性预期**一律转写成它的**可观察后果**——点击后去哪个页面就写该页的 `page_is`、弹出什么就写它的 `element_exists`，并与描述同一结果的预期句合并为一个验证项；此时 verification 项数少于预期结果句数是正确行为。**严禁**为「未置灰/可交互」单列验证点，也**严禁**用 `element_disabled` 反向表达它——那会产生必然 FAIL 的断言并把 agent 拖入无法满足的补证回环）
   - `element_checked(target,bool)`：找到的开关 checked==expected（不等→FAIL）
   - `list_count(anchor,n)`：以 anchor 文本/rid 为锚的元素计数 == n（不等→FAIL）
   **expected 字段如何填**：只有 `element_checked` 和 `list_count` 需要非 null 的 expected，其余谓词 expected 一律填 null。
@@ -57,7 +57,11 @@ verification 只验证「用户预期结果中声明的目标状态是否达成�
 - 当预期结果是「打开/进入/弹出/显示某界面或选择器」时，该界面出现即视为达成，**不要**再生成「并实际选择/点击进入下一页/完成后续动作」之类的子验证点。例如「打开相机」只需验证相机界面出现；「从图库导入弹出照片选择器」只需验证照片选择器出现且显示缩略图，不要要求真的选一张照片并进入裁剪页。
 - 每个验证项的 clause 应描述「终态/可见状态」，而非「需要执行的操作序列」。避免用「并能…」「并点击…」「并进入…」这类诱导额外步骤的措辞。
 - 若用户原文确实要求完成某后续动作（如「选择某张照片并完成导入」），才生成对应子验证点。
-- **clause 粒度与语义完整性（重要）**：一个验证项的 `clauses` 是对「陈述句可独立判定子目标」的拆分，**每条 clause 必须是一个完整、可独立读懂的语义单元**，绝不能按字符位置机械切碎。反例（错误）："创建选择1" / "3" / "5周的课程后" / "1" / "3" / "5周不可选" 这种把"1,3,5周不可选"拆成单字符碎片的切法——clause 失去独立含义、且每个碎片都要重复跑全套验证通道，既冗余又易漏判。正例（正确）：上面整句应拆为 2~3 条「终态」clause，例如「创建选择 1/3/5 周的课程」、「再次创建第一节课程并点开上课周数时 1/3/5 周呈现不可选（置灰）」、「其余周（依据总周数）可正常勾选」。同一语义概念（如"1,3,5周不可选"）应合并为一条 clause，不要在多 clause 间重复拆散同一个判定点。
+- **数量硬约束（违反即输出错误）**：
+  * verification 项数 **不得超过用例原文「预期结果」的句数**——原文写几句预期就出几项，禁止把一句预期拆成多项，禁止补充用例未写的验证点（多场景按分隔符拆分、权限双分支拆两条，属规则内拆分不受此限）。
+  * 禁止生成「提供 XX 可编辑入口」「可正常点击/编辑/设置」这类**子特征验证项**：字段、入口、面板在界面上可见即达成，不要为证明"可交互"生成额外验证项。若「预期结果」某句本身就是手段性表述（如「图库导入入口可点击」）而另一句已描述其结果（如「可正常进入图片选择入口」），把两者合并为一条验证项——`page_is` 目标选择器即同时证明两句，verification 项数因此少于预期句数属正确行为；
+  * 交互类预期只取**一个代表样本**：如「可在1～12节自由选择开始/结束节次」，只需生成一条验证（选一次代表值且生效），不要求穷举所有取值；同理「N 个颜色可切换」只验切一次。
+- **clause 粒度与语义完整性（重要）**：当一个验证项的预期句里含**多个可独立判定的终态**时，用嵌套对象形式在规划期显式给出语义合并结果：`{"claim":"整句预期","clauses":[{"claim":"终态子句1","spec":{...}},{"claim":"终态子句2","spec":null}]}`——每条 clause 自带 spec（无法用谓词表达的填 null）。**每条 clause 必须是一个完整、可独立读懂的语义单元**，绝不能按字符位置机械切碎。反例（错误）："创建选择1" / "3" / "5周的课程后" / "1" / "3" / "5周不可选" 这种把"1,3,5周不可选"拆成单字符碎片的切法——clause 失去独立含义、且每个碎片都要重复跑全套验证通道，既冗余又易漏判。正例（正确）：上面整句应拆为 2~3 条「终态」clause，例如「创建选择 1/3/5 周的课程」、「再次创建第一节课程并点开上课周数时 1/3/5 周呈现不可选（置灰）」、「其余周（依据总周数）可正常勾选」。同一语义概念（如"1,3,5周不可选"）应合并为一条 clause，不要在多 clause 间重复拆散同一个判定点。枚举取值（如「周一,周三,周五」）是一个判定点，写进一条 clause，不要按逗号拆开。整句只有一个终态时不嵌套，直接用 `{"claim","spec"}` 或纯字符串即可。
 - **clause 数量克制**：单条 verification 的 clause 数一般以 1~3 条为宜；只有当陈述句确实包含**多个性质不同的终态**（如"弹窗出现"且"toast 提示 X"）才拆多条。不要为"显得细致"而过度切分。
 - 目的：避免 Agent 为证明「可交互」而过做无关步骤，也避免把简单用例复杂化。
 

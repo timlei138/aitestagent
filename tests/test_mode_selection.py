@@ -108,17 +108,24 @@ def test_guided_phase_budget_downgrades_to_explore():
     assert command.update["mode_selection_reason"] == "guided_phase_budget_exhausted"
 
 
-def test_direct_actions_exhausted_downgrade_to_guided(monkeypatch):
+def test_direct_actions_exhausted_zero_llm_closeout(monkeypatch):
+    # R3（plan §11）：动作真耗尽不再降级 guided，改为零 LLM 收口——耗尽标志即刻
+    # 置位、保持 direct 由 static edge 进 evaluator 纯代码判定（无 perceiver 时
+    # 跳过证据采集但标志照常置位）。
     monkeypatch.setattr(nodes, "get_tool_context", lambda: None)
     command = nodes.direct_node(
         {"selected_plan_actions": [], "_direct_action_cursor": 0}, {}
     )
 
-    assert command.update["execution_mode"] == "guided"
+    assert command.update["execution_mode"] == "direct"
+    assert command.update["_direct_exhausted"] is True
+    assert command.update["mode_selection_reason"] == (
+        "direct_actions_exhausted_closeout"
+    )
     assert command.update["mode_transition_events"] == [
         {
             "from": "direct",
-            "to": "guided",
+            "to": "evaluator",
             "reason": "direct_actions_exhausted",
             "step_index": 0,
             "plan_id": "",

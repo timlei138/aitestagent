@@ -345,17 +345,40 @@ def launch_app(
             },
         )
 
-    _settle_after_action(ctx)
-    try:
+    def _observe_foreground() -> dict:
         try:
-            observed = ctx.device.current_app(refresh=True) or {}
-        except TypeError:
-            observed = ctx.device.current_app() or {}
-        observed_package = (observed.get("package", "") or "").strip()
-        observed_activity = (observed.get("activity", "") or "").strip()
-    except Exception:
-        observed_package = ""
-        observed_activity = ""
+            try:
+                return ctx.device.current_app(refresh=True) or {}
+            except TypeError:
+                return ctx.device.current_app() or {}
+        except Exception:
+            return {}
+
+    _settle_after_action(ctx)
+    foreground = _observe_foreground()
+    observed_package = (foreground.get("package", "") or "").strip()
+    observed_activity = (foreground.get("activity", "") or "").strip()
+
+    # 前台归位自愈（2026-08-25 用例168 回放复盘）：force_fresh 只杀目标包，杀不掉
+    # 其它包盖在屏幕上的遗留窗口（如上轮的系统照片选择器）——启动后前台仍是他包，
+    # 到达契约误判失败，direct 回放首动作即被降级 guided。检测到「他包在前台」时
+    # 按一次 HOME 归位并重试启动一次；仍不达则走下方如实的 ERROR 判定。
+    healed = False
+    if observed_package and observed_package != requested_package:
+        try:
+            ctx.device.shell(["input", "keyevent", "KEYCODE_HOME"])
+            time.sleep(0.6)
+            if target_activity:
+                ctx.device.app_start(requested_package, activity=target_activity)
+            else:
+                ctx.device.app_start(requested_package)
+            _settle_after_action(ctx, max_wait_ms=2500)
+            foreground = _observe_foreground()
+            observed_package = (foreground.get("package", "") or "").strip()
+            observed_activity = (foreground.get("activity", "") or "").strip()
+            healed = True
+        except Exception:
+            pass
 
     def _normalize_activity(value: str) -> str:
         return (value or "").split(".")[-1].strip()
@@ -382,6 +405,7 @@ def launch_app(
         "package_matched": package_matched,
         "activity_matched": activity_matched,
         "arrival_confirmed": arrival_confirmed,
+        "foreground_healed": healed,
     }
     if arrival_confirmed:
         message = (

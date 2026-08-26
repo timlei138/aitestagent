@@ -1,5 +1,6 @@
 # 第零批只读摸底结果（Gate-A / Gate-B）
 
+> ⚠️ **本文档为交付物（只读摸底 + 复测），规划职能不在此文档。** 其结论已吸收进 [`agent_evolution_plan_20260824.md`](./agent_evolution_plan_20260824.md) 的 §1/§3/§4/§6，新规划以该文档为准。本文件保持"已完结"状态，不演进。
 > 日期：2026-08-22
 > 状态：**已完成**（未改任何产品代码；新增只读脚本 [scripts/phase0_gate_survey.py](../scripts/phase0_gate_survey.py)）
 > 数据源：`storage/test_history.db`（21 条 execution_runs + 16 条 execution_plans + 310 条 evidence_events）+ `logs/runs/*_langchain.log`（M4a 后 9 个 run 有 planner 原始输出可对账）

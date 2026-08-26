@@ -106,6 +106,11 @@ def route_after_evaluator(state: TestState) -> str:
         if int(state.get("_direct_downgrade_count", 0) or 0) >= 1:
             logger.info("Route: agent (direct downgrade already consumed)")
             return "agent"
+        # R3（plan §11）：耗尽收口已完成（标志在进入收尾分支时即刻置位），不再回
+        # direct 重放动作；unknown 一律送 agent 补验，与 unknown 回环天然互斥。
+        if state.get("_direct_exhausted"):
+            logger.info("Route: agent (direct closeout done; unknown -> supplement)")
+            return "agent"
         return "direct"
     if _should_downgrade_guided(state):
         logger.info("Route: mode transition (guided -> explore)")

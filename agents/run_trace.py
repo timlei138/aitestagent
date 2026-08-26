@@ -64,6 +64,11 @@ def build_run_trace(
     execution_status: str,
     test_verdict: str,
     duration_seconds: float,
+    # 时间账三段拆分（agent_evolution_plan §13）：duration == 三段之和（执行段由
+    # 差值反推后取整，保证求和精确成立），口径写进 trace schema。
+    planner_elapsed_seconds: float = 0.0,
+    plan_review_wait_seconds: float = 0.0,
+    execution_elapsed_seconds: float = 0.0,
     tool_log: list[dict[str, Any]] | None,
     verification_results: list[dict[str, Any]] | None,
     token_usage: dict[str, Any] | None,
@@ -75,6 +80,8 @@ def build_run_trace(
     plan_id: str = "",
     plan_trust: str = "",
     mode_selection_reason: str = "",
+    # R1 审计：复用命中自动过审时记 "reuse_hit"（plan §9 验收 1）
+    auto_approved_reason: str = "",
     mode_transition_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """把运行期产物汇总为一份结构化 trace（纯数据转换，绝不抛异常）。"""
@@ -120,6 +127,10 @@ def build_run_trace(
             "execution_status": execution_status,
             "test_verdict": test_verdict,
             "duration_seconds": round(float(duration_seconds or 0), 2),
+            # 三段拆分（plan §13）：planner LLM 段 / plan_review 人工等待段 / 执行段
+            "planner_elapsed_seconds": round(float(planner_elapsed_seconds or 0), 2),
+            "plan_review_wait_seconds": round(float(plan_review_wait_seconds or 0), 2),
+            "execution_elapsed_seconds": round(float(execution_elapsed_seconds or 0), 2),
         },
         # 执行模式状态机（Plan §2）：仅观测透出，供 Gap Plan P2 验收「trace 中可见
         # execution_mode 且至少有一次 run 进入 direct/guided」使用。
@@ -129,6 +140,7 @@ def build_run_trace(
             "plan_id": str(plan_id or ""),
             "plan_trust": str(plan_trust or ""),
             "mode_selection_reason": str(mode_selection_reason or ""),
+            "auto_approved_reason": str(auto_approved_reason or ""),
             "mode_transition_events": list(mode_transition_events or []),
         },
         "metrics": metrics or {},

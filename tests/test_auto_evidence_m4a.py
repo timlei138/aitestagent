@@ -218,4 +218,82 @@ def test_build_contract_string_falls_back_spec_null():
     goal = {"verification": ["课程表页面成功打开"]}
     contract = build_verification_contract(goal)
     clause = contract["verifications"][0]["clauses"][0]
-    assert clause["spec"] is None  # 向后兼容：字符串 → spec:null → 手动 verify
+    assert clause["spec"] is None
+
+
+# ── 埋点（plan §6 第3条）：hit / dedup_skip / none+原因码 ─────────────────
+
+def test_match_none_reason_buckets():
+    """None 归因分桶 + 同义改写线索（「课程名称」vs「课程名」应召回）。"""
+    from agents.verification import _match_none_reason
+
+    reason, hints = _match_none_reason(
+        {"predicate": "foo_bar", "target": "x"}, _make_u(), {}
+    )
+    assert reason == "unsupported_predicate" and hints == []
+
+    # element_not_found 属「控件缺失类」；fuzzy hint 应召回页面近似控件名
+    u = _make_u(elements=[_make_element(label="课程名")])
+    reason, hints = _match_none_reason(
+        {"predicate": "element_exists", "target": "课程名称"}, u, {}
+    )
+    recalls = "".join(hints)
+    assert reason == "element_not_found"
+    assert "课程名" in recalls
+
+
+def test_match_none_reason_missing_on_page_variants():
+    from agents.verification import _match_none_reason
+
+    # 多匹配 → element_ambiguous（拿不准不写）
+    u = _make_u(elements=[_make_element(rid="row"), _make_element(rid="row")])
+    reason, hints = _match_none_reason(
+        {"predicate": "element_enabled", "target": "row"}, u, {}
+    )
+    assert reason == "element_ambiguous" and hints == []
+
+    # page_is 未到达目标页 → page_not_arrived（控件缺失类）
+    reason, hints = _match_none_reason(
+        {"predicate": "page_is", "target": "EditActivity"},
+        _make_u(),
+        {"activity": "com.x.MainActivity"},
+    )
+    assert reason == "page_not_arrived" and hints == []
+
+    # page_contains 文本不在页面上 → text_missing
+    reason, hints = _match_none_reason(
+        {"predicate": "page_contains", "target": "保存成功"}, _make_u(), {}
+    )
+    assert reason == "text_missing" and hints == []
+
+
+def test_auto_record_logs_outcome_lines(caplog):
+    """一次 auto_record_evidence 对每个 spec clause 恰打一行 outcome 日志。"""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agents.verification")
+
+    ctx = _make_ctx()
+    contract = _contract_with_spec("page_is", "TimetableActivity")
+    app = {"activity": "com.xxx.TimetableActivity"}
+
+    n1 = auto_record_evidence(ctx, contract, _make_u(), app)
+    assert n1 == 1
+    hit_lines = [r for r in caplog.records if "outcome=hit" in r.getMessage()]
+    assert len(hit_lines) == 1
+
+    caplog.clear()
+    n2 = auto_record_evidence(ctx, contract, _make_u(), app)
+    assert n2 == 0
+    dedup_lines = [
+        r for r in caplog.records if "outcome=dedup_skip" in r.getMessage()
+    ]
+    assert len(dedup_lines) == 1
+
+    caplog.clear()
+    miss_contract = _contract_with_spec("page_is", "NeverActivity")
+    n3 = auto_record_evidence(ctx, miss_contract, _make_u(), app)
+    assert n3 == 0
+    none_lines = [r for r in caplog.records if "outcome=none" in r.getMessage()]
+    assert len(none_lines) == 1
+    assert "reason=page_not_arrived" in none_lines[0].getMessage()  # 向后兼容：字符串 → spec:null → 手动 verify

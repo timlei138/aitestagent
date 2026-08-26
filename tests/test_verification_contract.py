@@ -107,10 +107,48 @@ def test_contract_ignores_undeclared_or_free_text_evidence():
     assert result["verdict"] == "inconclusive"
 
 
-def test_contract_clauses_use_all_channel_fallback():
-    """M1-3/M1-4: 删除关键词通道推断后，clause 的 channels 恒为全通道回退
-    （含 behavior_effect），由 authoritative 标志承接确定性判定（Plan §6 要点4）。
+def test_spec_clause_channels_narrow_to_spec_channel():
+    """F1 已开闸（agent_evolution_plan §3）：带 spec 的 clause 只认其确定性
+    证据通道（写读同源 _spec_channel）；vision 不再兜底 UI 树可判定的事实。
     """
+    contract = build_verification_contract(
+        {
+            "verification": [
+                {"claim": "保存按钮置灰", "spec": {"predicate": "element_disabled", "target": "保存"}},
+                {"claim": "课程表页面已打开", "spec": {"predicate": "page_contains", "target": "课程表"}},
+            ]
+        }
+    )
+    clauses = contract["verifications"][0]["clauses"]
+    assert clauses[0]["channels"] == ["element_state"]
+    # spec 只挂首 clause；其余子 clause spec:null → 全通道回退。
+    # （F3 后 ASCII 逗号不再拆——枚举逗号是一个判定点；此处改用全角逗号
+    # 验证「拆分后 spec 归属」，见 tests/test_f3_nested_clauses.py。）
+    contract2 = build_verification_contract(
+        {"verification": [{"claim": "显示A，显示B", "spec": {"predicate": "page_is", "target": "X"}}]}
+    )
+    cs = contract2["verifications"][0]["clauses"]
+    assert len(cs) == 2
+    assert cs[0]["channels"] == ["page_state"]
+    assert set(cs[1]["channels"]) == {
+        "page_state",
+        "element_state",
+        "behavior_effect",
+        "ui_text",
+        "vision_verify",
+        "click_and_check",
+    }
+    # F3：ASCII 枚举逗号不拆，整句单 clause 且继承 spec
+    contract3 = build_verification_contract(
+        {"verification": [{"claim": "显示A,显示B", "spec": {"predicate": "page_is", "target": "X"}}]}
+    )
+    cs3 = contract3["verifications"][0]["clauses"]
+    assert len(cs3) == 1
+    assert cs3[0]["channels"] == ["page_state"]
+
+
+def test_contract_clauses_use_all_channel_fallback():
+    """spec:null 的 clause 保持全通道回退不变（F1 验收2：行为完全不变）。"""
     contract = build_verification_contract({"verification": ["页面显示保存成功提示"]})
     clause = contract["verifications"][0]["clauses"][0]
     assert set(clause["channels"]) == {
@@ -965,3 +1003,45 @@ def test_before_after_failure_is_failed_triggers_failfast(monkeypatch):
     )
     # 模拟 llm_runtime.py:649 的 break 条件：failed 命中 → 会 break
     assert state.get("verdict") in {"passed", "failed"}
+
+
+def test_f1_spec_clause_rejects_foreign_channel_pass():
+    """§3 验收1：element_disabled spec 的 clause——仅注入 vision PASS → unknown；
+    注入 element_state PASS → passed。authoritative 事件不受通道过滤（M1-2）。"""
+    contract = build_verification_contract(
+        {
+            "verification": [
+                {
+                    "claim": "保存按钮置灰",
+                    "spec": {"predicate": "element_disabled", "target": "保存"},
+                }
+            ]
+        }
+    )
+    v = contract["verifications"][0]
+    cid = v["clauses"][0]["id"]
+    vision_only = evaluate_verification(
+        contract,
+        [
+            {
+                "verification_key": v["key"],
+                "clause_id": cid,
+                "channel": "vision_verify",
+                "status": "PASS",
+            }
+        ],
+    )
+    assert vision_only["verdict"] == "inconclusive"
+
+    spec_channel = evaluate_verification(
+        contract,
+        [
+            {
+                "verification_key": v["key"],
+                "clause_id": cid,
+                "channel": "element_state",
+                "status": "PASS",
+            }
+        ],
+    )
+    assert spec_channel["verdict"] == "passed"

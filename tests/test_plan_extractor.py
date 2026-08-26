@@ -542,3 +542,105 @@ def test_extract_candidate_plan_writes_semantic_task_signature(tmp_path):
     assert "点击时长" in signature["action_semantics"]
     assert "时长设置生效" in signature["verification_semantics"]
     db._conn.close()
+
+
+# ── R4①：沉淀时剥离全局 index，归一化 rid/path_contains/label ────────────
+
+def test_normalize_action_input_strips_index_keeps_label():
+    from agents.plan_extractor import _normalize_action_input
+
+    normalized = _normalize_action_input(
+        {"label": "保存", "index": 3}, {"rid": "btn_save"}
+    )
+    assert normalized == {"label": "保存"}
+    # 无 index 的输入原样保留
+    untouched = _normalize_action_input({"rid": "btn_save"}, {})
+    assert untouched == {"rid": "btn_save"}
+
+
+def test_normalize_action_input_backfills_from_resolved_locator():
+    from agents.plan_extractor import _normalize_action_input
+
+    # 只有全局 index、无任何可定位字段 → 从 resolved_locator 回填（rid 优先）
+    by_rid = _normalize_action_input({"index": 3}, {"rid": "btn_add", "path": "Frame/1"})
+    assert "index" not in by_rid
+    assert by_rid["rid"] == "btn_add"
+    # locator 无 rid 时回退 label，再退 path
+    by_label = _normalize_action_input({"index": 1}, {"label": "全选"})
+    assert by_label["label"] == "全选"
+    by_path = _normalize_action_input({"index": 1}, {"path": "RecyclerView/0/Text"})
+    assert by_path["path_contains"] == "RecyclerView/0/Text"
+
+
+def test_extract_candidate_plan_strips_global_index(tmp_path):
+    """端到端：带全局 index 的沉淀动作落库后不再含 index（R4① 验收）。"""
+    db = SqliteBackend(str(tmp_path / "plans.db"))
+    plan_id = extract_candidate_plan(
+        db,
+        app_package="com.example.app",
+        user_request="新增课程",
+        verification_contract={"status": "approved", "verifications": []},
+        action_events=[
+            {
+                "tool_name": "click",
+                "status": "OK",
+                "tool_input": {"index": 5, "repeat": 2},
+                "resolved_locator": {"rid": "btn_add"},
+                "page_before": {"package": "com.example.app", "activity": "Main"},
+                "page_after": {"package": "com.example.app", "activity": "Main"},
+            }
+        ],
+        evidence_events=[],
+    )
+    actions = db.select("plan_actions", {"plan_id": plan_id})
+    stored = json.loads(actions[0]["tool_input_json"])
+    assert "index" not in stored
+    assert stored["rid"] == "btn_add" and stored["repeat"] == 2
+    db._conn.close()
+
+
+def test_deposition_env_key_skips_permission_dialog_entry_page():
+    """R6：沉淀环境键取「目标 App 包内稳定首屏」，不再被入口弹窗污染
+    （实测 plan 9a210a84 沉淀进了权限对话框 GrantPermissionsActivity）。"""
+    from agents.plan_extractor import _deposition_environment_key
+
+    actions = [
+        {
+            "tool_name": "click",
+            "page_before": {
+                "package": "com.android.permissioncontroller",
+                "activity": ".permission.ui.GrantPermissionsActivity",
+                "screen_profile": "3040x1904",
+            },
+            "page_after": {"package": "com.example.app", "activity": ".Home"},
+        },
+        {
+            "tool_name": "launch_app",
+            "page_before": {"package": "com.example.app", "activity": ".Home"},
+            "page_after": {"package": "com.zui.calendar", "activity": ".AllInOneActivity", "screen_profile": "3040x1904"},
+        },
+        {
+            "tool_name": "click",
+            "page_before": {"package": "com.zui.calendar", "activity": ".AllInOneActivity"},
+            "page_after": {"package": "com.zui.calendar", "activity": ".Other"},
+        },
+    ]
+    key = json.loads(_deposition_environment_key(actions, "com.zui.calendar"))
+    assert key["package"] == "com.zui.calendar"
+    assert key["activity"] == ".AllInOneActivity"  # 最后一条 launch_app 落点，非权限框
+
+
+def test_deposition_env_key_fallbacks():
+    """R6 兜底链：无 launch_app → 首条目标包 page_after；全无 → 旧行为 page_before。"""
+    from agents.plan_extractor import _deposition_environment_key
+
+    # 无 launch_app：取第一条目标包 page_after
+    actions = [
+        {"tool_name": "click", "page_before": {"package": "launcher"}, "page_after": {"package": "com.t", "activity": ".A"}},
+        {"tool_name": "click", "page_after": {"package": "com.t", "activity": ".B"}},
+    ]
+    assert json.loads(_deposition_environment_key(actions, "com.t"))["activity"] == ".A"
+
+    # 目标包从未出现 → 诚实回退旧行为（actions[0].page_before）
+    legacy = [{"tool_name": "click", "page_before": {"package": "other", "activity": ".X"}}]
+    assert json.loads(_deposition_environment_key(legacy, "com.t"))["activity"] == ".X"
